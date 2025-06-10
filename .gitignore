@@ -1,0 +1,27 @@
+# Carpetas de trabajo
+adjuntos/
+extraidos/
+
+# Archivos de salida
+*.xlsx
+*.xls
+*.zip
+*.rar
+
+# Archivos temporales del sistema operativo
+*.log
+*.tmp
+*.bak
+*.swp
+Thumbs.db
+.DS_Store
+
+# Archivos de VSCode
+.vscode/
+
+# Archivos de Python compilados
+__pycache__/
+*.pyc
+
+# Archivos ocultos o de respaldo
+~$*

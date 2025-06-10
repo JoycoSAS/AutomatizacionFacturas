@@ -1,0 +1,5 @@
+pywin32
+pandas
+openpyxl
+pdfplumber
+rarfile
