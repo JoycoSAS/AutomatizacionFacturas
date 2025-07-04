@@ -1,0 +1,3 @@
+# utils/logger.py
+
+errores = []
