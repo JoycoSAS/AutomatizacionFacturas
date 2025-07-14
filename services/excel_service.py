@@ -1,3 +1,5 @@
+# services/excel_service.py
+
 import os
 import pandas as pd
 from config import ARCHIVO_EXCEL, HISTORIAL_EXCEL
@@ -5,10 +7,10 @@ from config import ARCHIVO_EXCEL, HISTORIAL_EXCEL
 
 def guardar_en_excel(datos):
     columnas = [
-        "Empresa emisora", "NIT", "Cliente", "Número de factura", "Concepto", "Subtotal",
-        "IVA 5%", "IVA 19%", "Retención de IVA", "Retención de ICA", "Total",
-        "Año", "Mes", "Día", "Tipo de contribuyente",
-        "Responsable de IVA", "Actividad económica", "Archivo"
+        "Empresa emisora", "Ciudad emisora", "NIT", "Cliente", "Número de factura", "Concepto",
+        "Subtotal", "IVA 5%", "IVA 19%", "Retención de IVA", "Retención de ICA", "Retención en la fuente",
+        "Total", "Año", "Mes", "Día", "Tipo de contribuyente",
+        "Actividad económica", "CUFE", "Archivo"
     ]
     df = pd.DataFrame(datos)[columnas]
     nuevos = 0

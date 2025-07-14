@@ -10,8 +10,8 @@ from utils.logger import errores
 
 def obtener_correos_factura():
     """
-    Obtiene correos recientes que contienen al menos un archivo .zip
-    que contenga al menos un archivo .xml válido.
+    Obtiene todos los correos que contienen al menos un archivo .zip
+    que a su vez contenga al menos un archivo .xml válido.
     """
     try:
         outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
@@ -48,7 +48,6 @@ def obtener_correos_factura():
     except Exception as e:
         errores.append(f"Error accediendo a Outlook: {e}")
         return []
-
 
 
 def guardar_adjuntos_zip(correos, carpeta_adjuntos):

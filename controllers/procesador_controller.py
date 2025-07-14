@@ -1,23 +1,27 @@
 import datetime
 import os
 import subprocess
-import psutil  
+import psutil  # Asegúrate de tener instalado el paquete psutil
+
 from services import correo_service, zip_service, factura_service, excel_service
 from config import CARPETA_ADJUNTOS, CARPETA_EXTRAIDOS
 
+
 def lanzar_outlook_si_no_esta_abierto():
-    # Verificar si Outlook ya está en ejecución
+    """
+    Verifica si Outlook está abierto. Si no lo está, intenta abrirlo en segundo plano.
+    """
     for proc in psutil.process_iter(['name']):
         if proc.info['name'] and 'OUTLOOK.EXE' in proc.info['name'].upper():
             print("✅ Outlook ya está en ejecución.")
             return
 
-    # Si no está, intentar iniciarlo oculto
     try:
         subprocess.Popen(["outlook.exe", "/hide"])
         print("📤 Outlook se inició en segundo plano.")
     except Exception as e:
         print(f"⚠️ No se pudo iniciar Outlook oculto: {e}")
+
 
 def ejecutar_proceso():
     lanzar_outlook_si_no_esta_abierto()
@@ -46,7 +50,8 @@ def ejecutar_proceso():
 
         if nuevos > 0 or errores_zip > 0:
             historial.append({
-                'Fecha': fecha, 'Hora': hora,
+                'Fecha': fecha,
+                'Hora': hora,
                 'Archivo ZIP': zipfn,
                 'Nuevos XML guardados': nuevos,
                 'Errores encontrados': errores_zip
