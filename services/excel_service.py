@@ -4,7 +4,10 @@ import os
 import pandas as pd
 from config import ARCHIVO_EXCEL, HISTORIAL_EXCEL
 
-# Para formatear la tabla en Excel
+# Guardado seguro en .xlsx (temporal -> rename atómico)
+from utils.safe_io import safe_save_pandas
+
+# Formato de tabla en Excel
 from openpyxl import load_workbook
 from openpyxl.worksheet.table import Table, TableStyleInfo
 from openpyxl.utils import get_column_letter
@@ -12,9 +15,11 @@ from openpyxl.utils import get_column_letter
 
 def guardar_en_excel(datos):
     """
-    Guarda los datos en “formato largo”: DESCRIPCIÓN = texto de líneas,
-    Concepto = tipo de medida (Subtotal, IVA 5%, …), y luego convierte
-    la hoja en una tabla de Excel con filtros y estilo.
+    Guarda los datos en formato largo:
+      - DESCRIPCIÓN = texto de líneas
+      - Concepto = (Subtotal, IVA 5%, IVA 19%, etc.)
+      - VALOR = valor de cada concepto
+    Luego convierte la hoja en una tabla con filtros/estilo.
     """
     columnas_fijas = [
         "Archivo", "Empresa emisora", "CUFE",
@@ -55,45 +60,59 @@ def guardar_en_excel(datos):
     df = pd.DataFrame(registros_transformados, columns=columnas_fijas)
     nuevos = 0
 
-    # 1) Volcar al Excel (sobrescribe o crea)
+    # 1) Volcado al Excel (crear / actualizar) con guardado seguro
     if os.path.exists(ARCHIVO_EXCEL):
-        antiguo   = pd.read_excel(ARCHIVO_EXCEL, engine='openpyxl')
+        antiguo   = pd.read_excel(ARCHIVO_EXCEL, engine="openpyxl")
         combinado = pd.concat([antiguo, df], ignore_index=True)
-        combinado = combinado.drop_duplicates(subset=['Archivo', 'Concepto'], keep='last')
+        combinado = combinado.drop_duplicates(subset=["Archivo", "Concepto"], keep="last")
         nuevos    = len(combinado) - len(antiguo)
-        final     = combinado
+        final_df  = combinado
     else:
-        nuevos = len(df)
-        final  = df
+        nuevos   = len(df)
+        final_df = df
 
-    final.to_excel(ARCHIVO_EXCEL, index=False, sheet_name="Facturas")
+    # Escribe el archivo con temporal .xlsx y rename atómico
+    safe_save_pandas(
+        final_df,
+        ARCHIVO_EXCEL,
+        sheet_name="Facturas",
+        header=True,
+        index=False,
+    )
 
-    # 2) Formatear la hoja como tabla de Excel
+    # 2) Formatear la hoja como tabla de Excel (idempotente)
     wb = load_workbook(ARCHIVO_EXCEL)
     ws = wb["Facturas"]
 
-    # Determinar rango completo de datos
     max_row = ws.max_row
     max_col = ws.max_column
     last_col = get_column_letter(max_col)
     table_ref = f"A1:{last_col}{max_row}"
 
-    # Crear la tabla
-    tabla = Table(displayName="TblFacturas", ref=table_ref)
-    # Asignar estilo y filas rayadas
-    tabla.tableStyleInfo = TableStyleInfo(
-        name="TableStyleMedium9",
-        showFirstColumn=False,
-        showLastColumn=False,
-        showRowStripes=True,
-        showColumnStripes=False
-    )
-    ws.add_table(tabla)
+    # Si la tabla ya existe, solo actualizamos el rango; si no, la creamos
+    existing = None
+    if hasattr(ws, "_tables"):
+        for t in ws._tables:
+            if t.displayName == "TblFacturas":
+                existing = t
+                break
 
-    # 3) Congelar la primera fila (encabezados)
+    if existing:
+        existing.ref = table_ref
+    else:
+        tbl = Table(displayName="TblFacturas", ref=table_ref)
+        tbl.tableStyleInfo = TableStyleInfo(
+            name="TableStyleMedium9",
+            showFirstColumn=False,
+            showLastColumn=False,
+            showRowStripes=True,
+            showColumnStripes=False,
+        )
+        ws.add_table(tbl)
+
+    # Congelar encabezados
     ws.freeze_panes = "A2"
 
-    # Guardar cambios
     wb.save(ARCHIVO_EXCEL)
 
     print(f"✅ Excel formateado y actualizado: {ARCHIVO_EXCEL}")
@@ -102,14 +121,22 @@ def guardar_en_excel(datos):
 
 def registrar_historial_por_zip(filas):
     """
-    Guarda un historial de ejecuciones en otro Excel.
+    Guarda/actualiza el historial de ejecuciones en otro Excel.
     """
     df_h = pd.DataFrame(filas)
     if os.path.exists(HISTORIAL_EXCEL):
-        antiguo = pd.read_excel(HISTORIAL_EXCEL, engine='openpyxl')
+        antiguo = pd.read_excel(HISTORIAL_EXCEL, engine="openpyxl")
         unido   = pd.concat([antiguo, df_h], ignore_index=True)
     else:
         unido = df_h
 
-    unido.to_excel(HISTORIAL_EXCEL, index=False)
+    # Guardado seguro para el historial también
+    safe_save_pandas(
+        unido,
+        HISTORIAL_EXCEL,
+        sheet_name="Historial",
+        header=True,
+        index=False,
+    )
+
     print(f"📁 Historial actualizado: {HISTORIAL_EXCEL}")
