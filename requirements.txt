@@ -4,3 +4,6 @@ openpyxl
 pdfplumber
 rarfile
 psutil
+requests
+python-dotenv
+certifi

@@ -7,7 +7,7 @@ extraidos/
 *.xls
 *.zip
 *.rar
-
+*.env
 # Archivos temporales del sistema operativo
 *.log
 *.tmp

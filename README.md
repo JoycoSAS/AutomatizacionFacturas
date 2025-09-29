@@ -60,11 +60,12 @@ pip install -r requirements.txt
 
 2. Ejecutar el script:
 
-```bash
-python main.py
-```
+Ejemplos de ejecución
+# Operación normal (rápida)
+python main_hybrid.py
 
-Esto iniciará la lectura de correos, descarga de ZIPs, extracción de XMLs y actualización de Excel.
+# Prueba masiva (hasta 2000 mensajes, 1 año hacia atrás)
+python -c "from controllers.cloud_pipeline import run_hibrido; run_hibrido(read_all=True, max_messages=2000, since_days=365)"
 
 ---
 
