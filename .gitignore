@@ -1,6 +1,7 @@
 # Carpetas de trabajo
 adjuntos/
 extraidos/
+temp_check/
 
 # Archivos de salida
 *.xlsx

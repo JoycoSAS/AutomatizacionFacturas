@@ -5,7 +5,7 @@
 # Incluye:
 #   - ensure_folder(): crea rutas recursivas
 #   - upload_small_file(): PUT simple
-#   - upload_directory(): SUBIDA RECURSIVA (FIX)
+#   - upload_directory(): SUBIDA RECURSIVA
 # -------------------------------------------
 
 import os
