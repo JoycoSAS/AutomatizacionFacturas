@@ -9,9 +9,12 @@ from pathlib import Path
 from typing import List, Dict
 from urllib.parse import quote
 
+from utils.fs_utils import borrar_pdfs_en_arbol
+
 from config import (
     DATA_DIR, ARCHIVO_EXCEL, HISTORIAL_EXCEL,
-    APROB_FOLDER_NAME, APROB_SEARCH_SINCE_DAYS, MATCH_PRIORIDAD
+    APROB_FOLDER_NAME, APROB_SEARCH_SINCE_DAYS, MATCH_PRIORIDAD,
+    TMP_DIR,  # ⬅️ importamos el alias unificado
 )
 
 # Reutilizamos tus servicios existentes
@@ -37,7 +40,6 @@ from utils.pdf_utils import extraer_texto_pdf, parse_identificadores_pdf, normal
 
 # Carpetas locales
 ADJ_HOY = os.path.join(DATA_DIR, "adjuntos", "hoy")
-TMP_DIR = os.path.join(DATA_DIR, "temp_check")
 EXT_HOY = os.path.join(DATA_DIR, "extraidos", "hoy")
 
 USE_DATE_SUBFOLDERS = False
@@ -117,11 +119,13 @@ def run_desde_aprobadas(max_aprobados: int = 50, max_zip_buscar: int = 300):
     3) Busca en Inbox el correo con ZIP cuyo XML haga match.
     4) Si hay match, ejecuta tu pipeline normal (XML -> Excel -> SharePoint)
     """
+
+    # Asegurar carpetas locales SOLO aquí (para evitar borrar lo que no es)
     os.makedirs(ADJ_HOY, exist_ok=True)
     os.makedirs(TMP_DIR, exist_ok=True)
     os.makedirs(EXT_HOY, exist_ok=True)
 
-    # 0) Ubicar carpeta de aprobadas (directa bajo Inbox; si no, búsqueda global)
+    # 0) Ubicar carpeta de aprobadas
     folder_id = get_folder_id_by_name("Inbox", APROB_FOLDER_NAME) or \
                 find_folder_id_anywhere(APROB_FOLDER_NAME)
 
@@ -183,7 +187,7 @@ def run_desde_aprobadas(max_aprobados: int = 50, max_zip_buscar: int = 300):
             for z in zips:
                 zname   = z.get("name") or f"{z['id']}.zip"
 
-                # ✅ Descargar ZIP por id (no dependemos de contentBytes en colección)
+                # ✅ Descargar ZIP por id
                 tmp_zip = os.path.join(TMP_DIR, f"peek_{zname}")
                 if not descargar_adjunto_por_id(imsg["id"], z["id"], tmp_zip):
                     continue
@@ -267,6 +271,13 @@ def run_desde_aprobadas(max_aprobados: int = 50, max_zip_buscar: int = 300):
             upload_small_file(HISTORIAL_EXCEL, f"{sp_excel}/historial_ejecuciones.xlsx", mode="replace")
 
         print("🎉 Proceso por aprobadas finalizado para:", found_zip_name)
+
+    # --- Limpieza de PDFs temporales (AL FINAL DEL PROCESO) ---
+    try:
+        n = borrar_pdfs_en_arbol(TMP_DIR)
+        print(f"🧹 Limpieza temp_check: borrados {n} PDF(s).")
+    except Exception:
+        print("⚠️ Limpieza temp_check: no se pudo completar (continuo).")
 
 
 # --------------------
