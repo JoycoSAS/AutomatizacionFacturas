@@ -26,7 +26,7 @@ STORE_NAME = "auxiliar.infraestructura@joyco.com.co"
 APROB_FOLDER_NAME = "Facturas aprobadas"   # nombre de la carpeta donde PA reenvía el PDF aprobado
 
 # Ventana de búsqueda de correos con ZIP para intentar el match (en días hacia atrás)
-APROB_SEARCH_SINCE_DAYS = 60
+APROB_SEARCH_SINCE_DAYS = 6
 
 # Clave de matching (estricto por CUFE; si no hay CUFE en PDF, usa (Número + Fecha))
 MATCH_PRIORIDAD = ["CUFE", "NUMERO_FECHA"]

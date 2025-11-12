@@ -41,6 +41,10 @@ def run_hibrido(read_all: bool = False, max_messages: int = 200, since_days: int
       4) Sube a SharePoint: ZIPs, extraídos y Excels
       5) Limpia PDFs temporales (temp_check) al final
     """
+    # Default de ventana de búsqueda si no te pasan since_days
+    if since_days is None:
+        since_days = 5  # ← ajustable cuando llames a run_hibrido(...)
+
     # Asegurar carpetas locales
     os.makedirs(ADJ_HOY, exist_ok=True)
     os.makedirs(TMP_DIR, exist_ok=True)  # /data/temp_check
@@ -81,6 +85,12 @@ def run_hibrido(read_all: bool = False, max_messages: int = 200, since_days: int
     total_nuevos = 0
     for zip_name, carpeta in resultados:
         ruta = os.path.join(EXT_HOY, carpeta)
+
+        # ⚠️ Skip si esta carpeta ya fue procesada en una corrida anterior
+        done_marker = os.path.join(ruta, ".done")
+        if os.path.exists(done_marker):
+            continue
+
         regs, errores_zip = procesar_xml_en_carpeta(ruta)
 
         nuevos = guardar_en_excel(regs) if regs else 0
@@ -127,6 +137,18 @@ def run_hibrido(read_all: bool = False, max_messages: int = 200, since_days: int
     upload_small_file(ARCHIVO_EXCEL, f"{sp_excel}/facturas.xlsx", mode="replace")
     if os.path.exists(HISTORIAL_EXCEL):
         upload_small_file(HISTORIAL_EXCEL, f"{sp_excel}/historial_ejecuciones.xlsx", mode="replace")
+
+    # ✅ Crear marcadores .done para todas las carpetas extraídas que participaron en esta corrida
+    for zip_name, carpeta in resultados:
+        ruta = os.path.join(EXT_HOY, carpeta)
+        if not os.path.isdir(ruta):
+            continue
+        marker = os.path.join(ruta, ".done")
+        try:
+            with open(marker, "w", encoding="utf-8") as f:
+                f.write("ok")
+        except Exception:
+            pass
 
     print("🎉 Flujo híbrido finalizado.")
 
