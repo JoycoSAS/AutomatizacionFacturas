@@ -1,11 +1,8 @@
 # services/m365/sp_graph.py
 # -------------------------------------------
-# Cliente mínimo para subir archivos/carpetas
-# a SharePoint/OneDrive via Microsoft Graph.
-# Incluye:
-#   - ensure_folder(): crea rutas recursivas
-#   - upload_small_file(): PUT simple
-#   - upload_directory(): SUBIDA RECURSIVA
+# Cliente mínimo para subir/descargar archivos y
+# gestionar carpetas en SharePoint/OneDrive (Graph).
+# Mantiene lo que ya tenías y añade descarga.
 # -------------------------------------------
 
 import os
@@ -27,7 +24,6 @@ SP_FOLDER = os.getenv("SP_FOLDER") or ""  # ruta base dentro del drive, e.g. 'SO
 TIMEOUT   = (15, 60)  # (connect, read)
 
 _SESSION = requests.Session()
-
 
 # ----------------------------
 # Helpers HTTP / Autenticación
@@ -69,7 +65,6 @@ def _req(call, max_retries: int = 4):
         print(f"[Graph ERROR] {r.status_code} {r.request.method} {r.url} -> {body}")
         r.raise_for_status()
 
-
 # -----------------
 # Carpetas remotas
 # -----------------
@@ -82,14 +77,12 @@ def ensure_folder(rel_path: str):
     if not rel_path:
         return
 
-    # Normaliza y divide en segmentos
     rel_path = rel_path.replace("\\", "/").strip("/")
     parts = [p for p in rel_path.split("/") if p]
     current = ""
     for seg in parts:
         current = f"{current}/{seg}" if current else seg
 
-        # 1) ¿existe este nivel? (evitamos _req para manejar 404 nosotros)
         get_url = f"{GRAPH}/drives/{DRIVE_ID}/root:/{quote(current)}"
         r = _SESSION.get(get_url, headers=_h(), timeout=TIMEOUT)
 
@@ -97,7 +90,6 @@ def ensure_folder(rel_path: str):
             continue  # existe → avanzar
 
         if r.status_code == 404:
-            # 2) crear bajo su padre inmediato
             parent = "/".join(current.split("/")[:-1]).strip("/")
             if parent:
                 post_url = f"{GRAPH}/drives/{DRIVE_ID}/root:/{quote(parent)}:/children"
@@ -117,7 +109,6 @@ def ensure_folder(rel_path: str):
             ))
             continue
 
-        # Si no es 200 ni 404, delega para que lance con detalle
         _req(lambda: _SESSION.get(get_url, headers=_h(), timeout=TIMEOUT))
 
 
@@ -127,7 +118,6 @@ def _exists(rel_path: str) -> bool:
     url = f"{GRAPH}/drives/{DRIVE_ID}/root:/{quote(rel_path)}"
     r = _SESSION.get(url, headers=_h(), timeout=TIMEOUT)
     return r.status_code == 200
-
 
 # -------------
 # Subida archivos
@@ -149,20 +139,15 @@ def upload_small_file(local_path: str, dest_rel_path: str, mode: str = "replace"
     with open(local_path, "rb") as f:
         data = f.read()
 
-    # Nota: ampliamos timeout de lectura para archivos algo más grandes
     r = _req(lambda: _SESSION.put(put_url, headers=_h(), data=data, timeout=(TIMEOUT[0], 300)))
     try:
         return r.json()
     except Exception:
         return {"ok": True, "dest": dest_rel_path}
 
-
 def upload_directory(local_dir: str, dest_rel_dir: str, mode: str = "replace"):
     """
-    ⬆️ **SUBIDA RECURSIVA** de todo el contenido de `local_dir` a `dest_rel_dir` en SharePoint.
-       - Preserva estructura de subcarpetas.
-       - Crea directorios remotos según corresponda.
-       - mode: "replace" (sobrescribe) o "skip" (no reemplaza si existe).
+    ⬆️ SUBIDA RECURSIVA de todo el contenido de `local_dir` a `dest_rel_dir` en SharePoint.
     """
     local_dir = Path(local_dir)
     dest_rel_dir = dest_rel_dir.replace("\\", "/").strip("/")
@@ -172,29 +157,42 @@ def upload_directory(local_dir: str, dest_rel_dir: str, mode: str = "replace"):
         print(f"[WARN] Carpeta local no existe: {local_dir}")
         return
 
-    # Asegura la carpeta remota raíz
     ensure_folder(dest_rel_dir)
 
-    # Recorre local_dir de forma recursiva
     for root, dirs, files in os.walk(local_dir):
         root_p = Path(root)
-        # Parte relativa desde local_dir ('' para raíz)
         rel = root_p.relative_to(local_dir)
-        # Build de ruta SP manteniendo estructura
-        if str(rel) == ".":
-            rel_sp = dest_rel_dir
-        else:
-            rel_sp = f"{dest_rel_dir}/{str(rel).replace('\\', '/')}"
+        rel_sp = dest_rel_dir if str(rel) == "." else f"{dest_rel_dir}/{str(rel).replace('\\', '/')}"
 
-        # Asegura la subcarpeta remota correspondiente
         ensure_folder(rel_sp)
 
-        # Sube archivos de este nivel
         for fname in files:
             local_path = root_p / fname
             server_rel_path = f"{rel_sp}/{fname}".replace("\\", "/")
-
-            # Log por archivo (útil para ver XML/PDF que se suben)
             print(f"   ⬆️  {local_path.name} -> {server_rel_path}")
-
             upload_small_file(str(local_path), server_rel_path, mode=mode)
+
+# -------------
+# Descarga archivo
+# -------------
+def download_small_file(sp_relative_path: str, local_path: str) -> bool:
+    """
+    Descarga un archivo de SharePoint por ruta relativa (la misma que usas al subir).
+    Ej: 'SOPORTES/Temporal Vehiculos/Prueba de Facturas Daniel/excel/Aprobaciones_Facturas.xlsx'
+    """
+    try:
+        # 🔕 Silenciar warning si desactivamos verificación SSL
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+        sp_path = sp_relative_path.strip().replace("\\", "/").strip("/")
+        url = f"{GRAPH}/drives/{DRIVE_ID}/root:/{quote(sp_path)}:/content"
+        # ⚠️ verify=False SOLO en descarga, para sortear el certificado interno
+        r = _req(lambda: _SESSION.get(url, headers=_h(), timeout=(TIMEOUT[0], 300), verify=False))
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        with open(local_path, "wb") as f:
+            f.write(r.content)
+        return True
+    except Exception as e:
+        print(f"[SP] Error descargando {sp_relative_path}: {e}")
+        return False

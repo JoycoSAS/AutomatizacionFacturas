@@ -2,13 +2,11 @@
 import os
 import io
 import re
-import base64
 import zipfile
 import datetime
 import time
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional
-from urllib.parse import quote
+from typing import List, Dict, Tuple
 
 from utils.fs_utils import borrar_pdfs_en_arbol
 
@@ -16,6 +14,8 @@ from config import (
     DATA_DIR, ARCHIVO_EXCEL, HISTORIAL_EXCEL,
     APROB_FOLDER_NAME, APROB_SEARCH_SINCE_DAYS, MATCH_PRIORIDAD,
     TMP_DIR,
+    # Umbrales de corte desde config.py
+    AUTO_STOP_MIN_PROCESADOS, AUTO_STOP_SIN_MATCH_CONSEC, AUTO_STOP_SIN_NUEVOS_CONSEC,
 )
 
 # Servicios existentes
@@ -39,6 +39,8 @@ from services.m365.mail_graph import (
 # PDF utils
 from utils.pdf_utils import extraer_texto_pdf, parse_identificadores_pdf, normalizar_fecha
 
+# NUEVO: sincronización con aprobaciones (Power Automate)
+from services.aprobaciones_service import sincronizar_aprobaciones_en_facturas
 
 # Carpetas locales
 ADJ_HOY = os.path.join(DATA_DIR, "adjuntos", "hoy")
@@ -49,42 +51,11 @@ UPLOAD_MODE = "skip"
 
 
 # ------------------------
-# Matching PDF vs XML/ZIP
+# Helpers internos
 # ------------------------
-def _match_campos(dict_pdf: Dict[str, str], dict_xml: Dict[str, str]) -> bool:
-    pr = MATCH_PRIORIDAD or ["CUFE", "NUMERO_FECHA"]
-    pdf_cufe = (dict_pdf.get("CUFE") or "").strip()
-    xml_cufe = (dict_xml.get("CUFE") or "").strip()
-    pdf_num  = (dict_pdf.get("NUMERO") or "").strip()
-    xml_num  = (dict_xml.get("NUMERO") or "").strip()
-    pdf_fec  = dict_pdf.get("FECHA")
-    xml_fec  = dict_xml.get("FECHA")
-
-    for regla in pr:
-        if regla == "CUFE":
-            if pdf_cufe and xml_cufe and (pdf_cufe == xml_cufe):
-                return True
-        elif regla == "NUMERO_FECHA":
-            if pdf_num and xml_num and pdf_fec and xml_fec:
-                if (pdf_num == xml_num) and (pdf_fec == xml_fec):
-                    return True
-    return False
-
-
-def _peek_ident_xml_from_zip_bytes(zip_bytes: bytes) -> List[Dict[str, str]]:
-    out: List[Dict[str, str]] = []
-    with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zf:
-        for m in zf.infolist():
-            if not m.filename.lower().endswith(".xml"):
-                continue
-            try:
-                xml_data = zf.read(m)
-                ident = _parse_ident_from_xml_bytes(xml_data)
-                ident["xml_name"] = Path(m.filename).name
-                out.append(ident)
-            except Exception as e:
-                print(f"[ZIP] No se pudo leer {m.filename}: {e}")
-    return out
+def __re(pattern: str, text: str):
+    import re as _re
+    return _re.search(pattern, text, flags=_re.IGNORECASE)
 
 
 def _parse_ident_from_xml_bytes(xml_bytes: bytes) -> Dict[str, str]:
@@ -106,23 +77,26 @@ def _parse_ident_from_xml_bytes(xml_bytes: bytes) -> Dict[str, str]:
     return ident
 
 
-def __re(pattern: str, text: str):
-    import re as _re
-    return _re.search(pattern, text, flags=_re.IGNORECASE)
+def _peek_ident_xml_from_zip_bytes(zip_bytes: bytes) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zf:
+        for m in zf.infolist():
+            if not m.filename.lower().endswith(".xml"):
+                continue
+            try:
+                xml_data = zf.read(m)
+                ident = _parse_ident_from_xml_bytes(xml_data)
+                ident["xml_name"] = Path(m.filename).name
+                out.append(ident)
+            except Exception as e:
+                print(f"[ZIP] No se pudo leer {m.filename}: {e}")
+    return out
 
 
 # ----------------------------------------------------
-# Prefetch/Índice de ZIPs: una sola vez por ejecución
+# Prefetch/Índice de ZIPs (una sola vez por ejecución)
 # ----------------------------------------------------
-def _build_zip_index(
-    since_days: int,
-    max_zip_buscar: int
-) -> Tuple[Dict[str, Tuple[str, bytes]], Dict[Tuple[str, str], Tuple[str, bytes]]]:
-    """
-    Descarga una sola vez los ZIPs candidatos y construye dos índices:
-      - por CUFE
-      - por (NUMERO, FECHA)
-    """
+def _build_zip_index(since_days: int, max_zip_buscar: int) -> Tuple[Dict[str, Tuple[str, bytes]], Dict[Tuple[str, str], Tuple[str, bytes]]]:
     idx_cufe: Dict[str, Tuple[str, bytes]] = {}
     idx_nf: Dict[Tuple[str, str], Tuple[str, bytes]] = {}
 
@@ -186,6 +160,7 @@ def run_desde_aprobadas(max_aprobados: int = 50, max_zip_buscar: int = 150, sinc
     """
     Flujo principal: busca coincidencias por CUFE o NUMERO+FECHA,
     y si no hay match, usa fallback por nombre del archivo PDF/ZIP.
+    Aplica cortes automáticos configurables desde config.py para ahorrar tiempo.
     """
     if since_days is None:
         since_days = APROB_SEARCH_SINCE_DAYS
@@ -194,8 +169,7 @@ def run_desde_aprobadas(max_aprobados: int = 50, max_zip_buscar: int = 150, sinc
     os.makedirs(TMP_DIR, exist_ok=True)
     os.makedirs(EXT_HOY, exist_ok=True)
 
-    folder_id = get_folder_id_by_name("Inbox", APROB_FOLDER_NAME) or \
-                find_folder_id_anywhere(APROB_FOLDER_NAME)
+    folder_id = get_folder_id_by_name("Inbox", APROB_FOLDER_NAME) or find_folder_id_anywhere(APROB_FOLDER_NAME)
     if not folder_id:
         print(f"[APROB] No se encontró la carpeta: {APROB_FOLDER_NAME!r}")
         return
@@ -212,6 +186,11 @@ def run_desde_aprobadas(max_aprobados: int = 50, max_zip_buscar: int = 150, sinc
 
     t0_total = time.time()
     resumen: List[Tuple[str, float, str, int]] = []
+
+    # Contadores para cortes automáticos
+    procesados = 0
+    sin_match_consec = 0
+    sin_nuevos_consec = 0
 
     # -------- LOOP PRINCIPAL --------
     for msg in msgs:
@@ -255,7 +234,7 @@ def run_desde_aprobadas(max_aprobados: int = 50, max_zip_buscar: int = 150, sinc
                 found_zip_name, found_zip_bytes = idx_nf[(num, fec)]
                 found_match = True
 
-        # --- C) Fallback por nombre del archivo (corregido) ---
+        # --- C) Fallback por nombre del archivo ---
         if not found_match:
             pdf_base = Path(pdf_name).stem.lower()
             pdf_clean = re.sub(r"[^a-z0-9]", "", pdf_base)
@@ -268,10 +247,18 @@ def run_desde_aprobadas(max_aprobados: int = 50, max_zip_buscar: int = 150, sinc
                     print(f"🔄 Emparejado por nombre: {pdf_name} ↔ {zn}")
                     break
 
+        # --- Resultado de matching y cortes (sin match) ---
         if not found_match or not found_zip_name or not found_zip_bytes:
             print(f"❌ No se encontró ZIP que coincida para PDF {pdf_name}.")
             resumen.append((pdf_name, time.time() - t0, "sin match", 0))
-            continue
+
+            sin_match_consec += 1
+            sin_nuevos_consec = 0
+            procesados += 1
+            if (procesados >= AUTO_STOP_MIN_PROCESADOS) and (sin_match_consec >= AUTO_STOP_SIN_MATCH_CONSEC):
+                print("🛑 Deteniendo flujo: varios PDFs consecutivos sin match (optimización de tiempo).")
+                break
+            continue  # siguiente mensaje
 
         # --- Guardar ZIP local ---
         zip_local_path = Path(ADJ_HOY) / found_zip_name
@@ -300,7 +287,7 @@ def run_desde_aprobadas(max_aprobados: int = 50, max_zip_buscar: int = 150, sinc
             if nuevos > 0 or errores_zip > 0:
                 historial_rows.append({
                     "Fecha": fecha_local,
-                    "Hora": hora_local,
+                    "Hora":  hora_local,
                     "Archivo ZIP": zip_name,
                     "Nuevos XML guardados": nuevos,
                     "Errores encontrados": errores_zip
@@ -309,6 +296,14 @@ def run_desde_aprobadas(max_aprobados: int = 50, max_zip_buscar: int = 150, sinc
         print(f"✅ Excel local actualizado (+{total_nuevos}): {ARCHIVO_EXCEL}")
         if historial_rows:
             registrar_historial_por_zip(historial_rows)
+
+        # === NUEVO: Enriquecer con Radicado/Proyecto desde Aprobaciones ===
+        try:
+            enriquecidas = sincronizar_aprobaciones_en_facturas()
+            if enriquecidas > 0:
+                print(f"🔗 Enriquecidas {enriquecidas} fila(s) con Radicado/Proyecto desde aprobaciones.")
+        except Exception as e:
+            print(f"[APROB] Error al sincronizar aprobaciones: {e}")
 
         # --- Subida a SharePoint ---
         print("☁️  Subiendo a SharePoint (desde aprobadas)...")
@@ -323,19 +318,24 @@ def run_desde_aprobadas(max_aprobados: int = 50, max_zip_buscar: int = 150, sinc
         ensure_folder(sp_adj); ensure_folder(sp_ext); ensure_folder(sp_excel)
         upload_small_file(str(zip_local_path), f"{sp_adj}/{found_zip_name}", mode="skip")
         upload_directory(EXT_HOY, sp_ext, mode="skip")
-        upload_small_file(ARCHIVO_EXCEL, f"{sp_excel}/facturas.xlsx", mode="replace")
+        upload_small_file(ARCHIVO_EXCEL,   f"{sp_excel}/facturas.xlsx",                 mode="replace")
         if os.path.exists(HISTORIAL_EXCEL):
             upload_small_file(HISTORIAL_EXCEL, f"{sp_excel}/historial_ejecuciones.xlsx", mode="replace")
 
-        for zip_name, carpeta in resultados:
-            if zip_name != found_zip_name:
-                continue
-            ruta = os.path.join(EXT_HOY, carpeta)
-            with open(os.path.join(ruta, ".done"), "w", encoding="utf-8") as f:
-                f.write("ok")
-
         print("🎉 Proceso por aprobadas finalizado para:", found_zip_name)
         resumen.append((pdf_name, time.time() - t0, "match", total_nuevos))
+
+        # --- Resultado de matching y cortes (match sin nuevos) ---
+        sin_match_consec = 0
+        if total_nuevos == 0:
+            sin_nuevos_consec += 1
+        else:
+            sin_nuevos_consec = 0
+
+        procesados += 1
+        if (procesados >= AUTO_STOP_MIN_PROCESADOS) and (sin_nuevos_consec >= AUTO_STOP_SIN_NUEVOS_CONSEC):
+            print("🛑 Deteniendo flujo: varios PDFs con match pero sin nuevos registros (optimización de tiempo).")
+            break
 
     # --- Limpieza final ---
     try:
