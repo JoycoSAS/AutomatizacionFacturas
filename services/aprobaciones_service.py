@@ -43,6 +43,8 @@ def _extract_numero_from_pa(value: str) -> str:
     En el Excel de PA, la columna NumeroFactura puede venir como:
       '2025-11-12T07:11:4; FEC756'
       '2025-11-19T15:24:; FE 94381'
+      '2025-11-19T21:48:; 11G-658848'
+      '2025-11-19T21:48:; 1FE8291'
       'FEC756'
       'FE94381'
       etc.
@@ -54,20 +56,32 @@ def _extract_numero_from_pa(value: str) -> str:
         return ""
     s = str(value).strip()
 
-    # 1) Caso explícito 'Factura: XXXX'
+    # 0) Caso explícito 'Factura: XXXX'
     m = re.search(r"Factura:\s*([A-Za-z0-9\-\/\.]{3,})", s, flags=re.IGNORECASE)
     if m:
         return m.group(1)
 
-    # 2) Patrón tipo 'FE 94381', 'FE-94381', 'DISL 1595', etc. al final del texto
+    # Trabajamos sobre la "cola" después del último ';'
+    tail = re.split(r"[;]", s)[-1].strip() or s
+
+    # 1) Patrón tipo 'FE 94381', 'FE-94381', 'DISL1595', etc. al final del texto
     #    (letras + espacios/guiones opcionales + dígitos)
-    m = re.search(r"([A-Za-z]{1,10}[\s\-]*\d{3,})\s*$", s)
+    m = re.search(r"([A-Za-z]{1,10}[\s\-]*\d{3,})\s*$", tail)
     if m:
         return m.group(1)
 
-    # 3) Fallback: último token alfanumérico (comportamiento anterior)
-    m = re.search(r"([A-Za-z0-9\-\/\.]{3,})\s*$", s)
-    return m.group(1) if m else s
+    # 2) Caso tipo '1FE8291' → ignorar dígitos iniciales y quedarnos con LETRAS+NUM
+    m = re.search(r"\d+([A-Za-z]{1,10}[\s\-]*\d{3,})\s*$", tail)
+    if m:
+        return m.group(1)
+
+    # 3) Fallback: último token alfanumérico razonable en la cola
+    m = re.search(r"([A-Za-z0-9\-\/\.]{3,})\s*$", tail)
+    if m:
+        return m.group(1)
+
+    # 4) Último recurso: el propio tail completo
+    return tail
 
 
 def _find_col_idx(ws, wanted_names):
@@ -97,7 +111,7 @@ def _ensure_column(ws, header_name: str) -> int:
 
 
 # ------------------------------------------
-# Nuevo: reordenar columnas y ordenar filas
+# Reordenar columnas y ordenar filas
 # ------------------------------------------
 
 def _reordenar_y_ordenar_facturas(ws) -> None:
@@ -109,7 +123,6 @@ def _reordenar_y_ordenar_facturas(ws) -> None:
 
     Además, ordena las filas por Radicado (numérico si se puede, si no, alfabético).
     """
-    # Leer todas las filas (incluyendo encabezado)
     rows = list(ws.iter_rows(values_only=True))
     if not rows:
         return
@@ -117,7 +130,7 @@ def _reordenar_y_ordenar_facturas(ws) -> None:
     headers = list(rows[0])
     data = list(rows[1:])
 
-    # Construir orden deseado de columnas
+    # Orden deseado de columnas
     preferidas = ["Radicado", "ProyectoProceso"]
     orden = []
 
@@ -154,18 +167,20 @@ def _reordenar_y_ordenar_facturas(ws) -> None:
             if v is None:
                 return (2, "")
             s = str(v).strip()
-            # Intentar numérico primero
             try:
-                return (0, int(s))
+                return (0, int(s))   # numérico
             except Exception:
-                return (1, s)
+                return (1, s)        # texto
+
         nuevas_filas.sort(key=_key)
 
-    # Limpiar hoja y escribir de nuevo
+    # Limpiar hoja y reescribir
     ws.delete_rows(1, ws.max_row)
+
     # Encabezados
     for c, h in enumerate(orden, start=1):
         ws.cell(row=1, column=c, value=h)
+
     # Datos
     for r_idx, row in enumerate(nuevas_filas, start=2):
         for c_idx, val in enumerate(row, start=1):

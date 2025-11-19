@@ -20,10 +20,11 @@ load_dotenv()
 
 GRAPH     = "https://graph.microsoft.com/v1.0"
 DRIVE_ID  = os.getenv("SP_DRIVE_ID")
-SP_FOLDER = os.getenv("SP_FOLDER") or ""  # ruta base dentro del drive, e.g. 'SOPORTES/Temporal Vehiculos/Prueba de Facturas Daniel'
+SP_FOLDER = os.getenv("SP_FOLDER") or ""  # ruta base dentro del drive
 TIMEOUT   = (15, 60)  # (connect, read)
 
 _SESSION = requests.Session()
+
 
 # ----------------------------
 # Helpers HTTP / Autenticación
@@ -57,13 +58,13 @@ def _req(call, max_retries: int = 4):
             time.sleep(wait)
             continue
 
-        # Trazabilidad del error
         try:
             body = r.json()
         except Exception:
             body = r.text
         print(f"[Graph ERROR] {r.status_code} {r.request.method} {r.url} -> {body}")
         r.raise_for_status()
+
 
 # -----------------
 # Carpetas remotas
@@ -99,13 +100,13 @@ def ensure_folder(rel_path: str):
             payload = {
                 "name": seg,
                 "folder": {},
-                "@microsoft.graph.conflictBehavior": "rename"
+                "@microsoft.graph.conflictBehavior": "rename",
             }
             _req(lambda: _SESSION.post(
                 post_url,
                 headers=_h("application/json"),
                 data=json.dumps(payload),
-                timeout=TIMEOUT
+                timeout=TIMEOUT,
             ))
             continue
 
@@ -118,6 +119,7 @@ def _exists(rel_path: str) -> bool:
     url = f"{GRAPH}/drives/{DRIVE_ID}/root:/{quote(rel_path)}"
     r = _SESSION.get(url, headers=_h(), timeout=TIMEOUT)
     return r.status_code == 200
+
 
 # -------------
 # Subida archivos
@@ -139,11 +141,17 @@ def upload_small_file(local_path: str, dest_rel_path: str, mode: str = "replace"
     with open(local_path, "rb") as f:
         data = f.read()
 
-    r = _req(lambda: _SESSION.put(put_url, headers=_h(), data=data, timeout=(TIMEOUT[0], 300)))
+    r = _req(lambda: _SESSION.put(
+        put_url,
+        headers=_h(),
+        data=data,
+        timeout=(TIMEOUT[0], 300),
+    ))
     try:
         return r.json()
     except Exception:
         return {"ok": True, "dest": dest_rel_path}
+
 
 def upload_directory(local_dir: str, dest_rel_dir: str, mode: str = "replace"):
     """
@@ -172,6 +180,7 @@ def upload_directory(local_dir: str, dest_rel_dir: str, mode: str = "replace"):
             print(f"   ⬆️  {local_path.name} -> {server_rel_path}")
             upload_small_file(str(local_path), server_rel_path, mode=mode)
 
+
 # -------------
 # Descarga archivo
 # -------------
@@ -181,14 +190,17 @@ def download_small_file(sp_relative_path: str, local_path: str) -> bool:
     Ej: 'SOPORTES/Temporal Vehiculos/Prueba de Facturas Daniel/excel/Aprobaciones_Facturas.xlsx'
     """
     try:
-        # 🔕 Silenciar warning si desactivamos verificación SSL
         import urllib3
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
         sp_path = sp_relative_path.strip().replace("\\", "/").strip("/")
         url = f"{GRAPH}/drives/{DRIVE_ID}/root:/{quote(sp_path)}:/content"
-        # ⚠️ verify=False SOLO en descarga, para sortear el certificado interno
-        r = _req(lambda: _SESSION.get(url, headers=_h(), timeout=(TIMEOUT[0], 300), verify=False))
+        r = _req(lambda: _SESSION.get(
+            url,
+            headers=_h(),
+            timeout=(TIMEOUT[0], 300),
+            verify=False,   # ⚠️ según tu entorno
+        ))
         os.makedirs(os.path.dirname(local_path), exist_ok=True)
         with open(local_path, "wb") as f:
             f.write(r.content)

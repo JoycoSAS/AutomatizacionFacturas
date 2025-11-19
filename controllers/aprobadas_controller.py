@@ -19,7 +19,11 @@ from config import (
 )
 
 # Servicios existentes
-from services.excel_service import guardar_en_excel, registrar_historial_por_zip
+from services.excel_service import (
+    guardar_en_excel,
+    registrar_historial_por_zip,
+    obtener_cufes_existentes,   # 🔧 NUEVO: índice de CUFEs ya registrados
+)
 from services.factura_service import procesar_xml_en_carpeta
 from services.zip_service import extraer_por_zip
 
@@ -33,13 +37,14 @@ from services.m365.mail_graph import (
     get_folder_id_by_name, find_folder_id_anywhere,
     listar_mensajes_en_carpeta, listar_adjuntos_pdf,
     listar_mensajes_zip_inbox, listar_adjuntos_zip,
-    descargar_adjunto_por_id
+    descargar_adjunto_por_id,
+    marcar_mensaje_como_leido,   # 🔧 NUEVO
 )
 
 # PDF utils
 from utils.pdf_utils import extraer_texto_pdf, parse_identificadores_pdf, normalizar_fecha
 
-# NUEVO: sincronización con aprobaciones (Power Automate)
+# Sincronización con aprobaciones (Power Automate)
 from services.aprobaciones_service import sincronizar_aprobaciones_en_facturas
 
 # Carpetas locales
@@ -96,7 +101,10 @@ def _peek_ident_xml_from_zip_bytes(zip_bytes: bytes) -> List[Dict[str, str]]:
 # ----------------------------------------------------
 # Prefetch/Índice de ZIPs (una sola vez por ejecución)
 # ----------------------------------------------------
-def _build_zip_index(since_days: int, max_zip_buscar: int) -> Tuple[Dict[str, Tuple[str, bytes]], Dict[Tuple[str, str], Tuple[str, bytes]]]:
+def _build_zip_index(
+    since_days: int,
+    max_zip_buscar: int
+) -> Tuple[Dict[str, Tuple[str, bytes]], Dict[Tuple[str, str], Tuple[str, bytes]]]:
     idx_cufe: Dict[str, Tuple[str, bytes]] = {}
     idx_nf: Dict[Tuple[str, str], Tuple[str, bytes]] = {}
 
@@ -156,11 +164,21 @@ def _build_zip_index(since_days: int, max_zip_buscar: int) -> Tuple[Dict[str, Tu
 # -------------------------
 # Flujo desde "Aprobadas"
 # -------------------------
-def run_desde_aprobadas(max_aprobados: int = 50, max_zip_buscar: int = 150, since_days: int | None = None):
+def run_desde_aprobadas(
+    max_aprobados: int = 50,
+    max_zip_buscar: int = 150,
+    since_days: int | None = None
+):
     """
     Flujo principal: busca coincidencias por CUFE o NUMERO+FECHA,
     y si no hay match, usa fallback por nombre del archivo PDF/ZIP.
-    Aplica cortes automáticos configurables desde config.py para ahorrar tiempo.
+
+    Optimizaciones:
+      - Usa índice de CUFEs ya existentes en facturas.xlsx para NO reprocesar facturas.
+      - Marca como leído el mensaje solo cuando:
+          * hubo match y se procesó el ZIP, o
+          * la factura ya estaba registrada en Excel.
+      - Mantiene todos los ZIPs en ADJ_HOY (no se limpian).
     """
     if since_days is None:
         since_days = APROB_SEARCH_SINCE_DAYS
@@ -174,13 +192,18 @@ def run_desde_aprobadas(max_aprobados: int = 50, max_zip_buscar: int = 150, sinc
         print(f"[APROB] No se encontró la carpeta: {APROB_FOLDER_NAME!r}")
         return
 
-    print(f"📬 Leyendo carpeta de aprobadas: {APROB_FOLDER_NAME}")
+    print(f"📬 Leyendo carpeta de aprobadas (solo NO leídos): {APROB_FOLDER_NAME}")
     msgs = listar_mensajes_en_carpeta(folder_id, top=max_aprobados)
     if not msgs:
-        print("ℹ️ No hay mensajes con aprobaciones recientes.")
+        print("ℹ️ No hay mensajes no leídos con aprobaciones recientes.")
         return
 
     idx_cufe, idx_nf = _build_zip_index(since_days=since_days, max_zip_buscar=max_zip_buscar)
+
+    # 🔧 Índice local de facturas ya registradas (por CUFE)
+    cufes_existentes = obtener_cufes_existentes()
+    print(f"ℹ️ CUFEs ya registrados en facturas.xlsx: {len(cufes_existentes)}")
+
     fecha_local = datetime.datetime.now().strftime("%Y-%m-%d")
     hora_local  = datetime.datetime.now().strftime("%H:%M:%S")
 
@@ -217,12 +240,34 @@ def run_desde_aprobadas(max_aprobados: int = 50, max_zip_buscar: int = 150, sinc
         if not ident_pdf.get("FECHA"):
             ident_pdf.setdefault("FECHA", _fecha_from_subject(subj))
 
+        # 🔧 1) Corte ultra-rápido: si el CUFE ya está en facturas.xlsx, NO buscamos ZIP
+        cufe_pdf = (ident_pdf.get("CUFE") or "").strip()
+        if cufe_pdf and cufe_pdf in cufes_existentes:
+            print(f"🔁 Factura ya registrada (CUFE en Excel). Se omite búsqueda de ZIP para {pdf_name}.")
+            resumen.append((pdf_name, time.time() - t0, "ya registrado", 0))
+
+            # Contadores tipo "match sin nuevos"
+            sin_match_consec = 0
+            sin_nuevos_consec += 1
+            procesados += 1
+
+            # Marcamos como leído: ya sabemos que está registrada al 100%
+            try:
+                marcar_mensaje_como_leido(msg_id)
+            except Exception as e:
+                print(f"[APROB] No se pudo marcar como leído el mensaje: {e}")
+
+            if (procesados >= AUTO_STOP_MIN_PROCESADOS) and (sin_nuevos_consec >= AUTO_STOP_SIN_NUEVOS_CONSEC):
+                print("🛑 Deteniendo flujo: varios PDFs ya registrados/sin nuevos (optimización de tiempo).")
+                break
+            continue  # siguiente mensaje
+
         found_match = False
         found_zip_name = None
         found_zip_bytes = None
 
         # --- A) Por CUFE ---
-        cufe = (ident_pdf.get("CUFE") or "").strip()
+        cufe = cufe_pdf
         if cufe and cufe in idx_cufe:
             found_zip_name, found_zip_bytes = idx_cufe[cufe]
             found_match = True
@@ -255,6 +300,7 @@ def run_desde_aprobadas(max_aprobados: int = 50, max_zip_buscar: int = 150, sinc
             sin_match_consec += 1
             sin_nuevos_consec = 0
             procesados += 1
+            # 🔴 IMPORTANTE: NO marcar como leído aquí para poder reintentar
             if (procesados >= AUTO_STOP_MIN_PROCESADOS) and (sin_match_consec >= AUTO_STOP_SIN_MATCH_CONSEC):
                 print("🛑 Deteniendo flujo: varios PDFs consecutivos sin match (optimización de tiempo).")
                 break
@@ -272,12 +318,20 @@ def run_desde_aprobadas(max_aprobados: int = 50, max_zip_buscar: int = 150, sinc
 
         historial_rows = []
         total_nuevos = 0
+        carpeta_obj = None
+        ruta_obj = None
+
         for zip_name, carpeta in resultados:
             if zip_name != found_zip_name:
                 continue
+
             ruta = os.path.join(EXT_HOY, carpeta)
             done_marker = os.path.join(ruta, ".done")
+            carpeta_obj = carpeta
+            ruta_obj = ruta
+
             if os.path.exists(done_marker):
+                # Ya se procesó este ZIP en otra ejecución
                 continue
 
             regs, errores_zip = procesar_xml_en_carpeta(ruta)
@@ -297,7 +351,8 @@ def run_desde_aprobadas(max_aprobados: int = 50, max_zip_buscar: int = 150, sinc
         if historial_rows:
             registrar_historial_por_zip(historial_rows)
 
-        # === NUEVO: Enriquecer con Radicado/Proyecto desde Aprobaciones ===
+        # === Sincronizar Radicado/Proyecto desde Aprobaciones ===
+        enriquecidas = 0
         try:
             enriquecidas = sincronizar_aprobaciones_en_facturas()
             if enriquecidas > 0:
@@ -308,22 +363,46 @@ def run_desde_aprobadas(max_aprobados: int = 50, max_zip_buscar: int = 150, sinc
         # --- Subida a SharePoint ---
         print("☁️  Subiendo a SharePoint (desde aprobadas)...")
         if USE_DATE_SUBFOLDERS:
-            sp_adj = f"{BASE_SP}/adjuntos/{fecha_local}"
-            sp_ext = f"{BASE_SP}/extraidos/{fecha_local}"
+            sp_adj_root = f"{BASE_SP}/adjuntos/{fecha_local}"
+            sp_ext_root = f"{BASE_SP}/extraidos/{fecha_local}"
         else:
-            sp_adj = f"{BASE_SP}/adjuntos"
-            sp_ext = f"{BASE_SP}/extraidos"
+            sp_adj_root = f"{BASE_SP}/adjuntos"
+            sp_ext_root = f"{BASE_SP}/extraidos"
         sp_excel = f"{BASE_SP}/excel"
 
-        ensure_folder(sp_adj); ensure_folder(sp_ext); ensure_folder(sp_excel)
-        upload_small_file(str(zip_local_path), f"{sp_adj}/{found_zip_name}", mode="skip")
-        upload_directory(EXT_HOY, sp_ext, mode="skip")
-        upload_small_file(ARCHIVO_EXCEL,   f"{sp_excel}/facturas.xlsx",                 mode="replace")
-        if os.path.exists(HISTORIAL_EXCEL):
+        ensure_folder(sp_adj_root)
+        ensure_folder(sp_ext_root)
+        ensure_folder(sp_excel)
+
+        # ZIP del correo actual
+        upload_small_file(str(zip_local_path), f"{sp_adj_root}/{found_zip_name}", mode="skip")
+
+        # 🔧 Solo subir la carpeta extraída correspondiente a este ZIP
+        if carpeta_obj and ruta_obj and os.path.exists(ruta_obj):
+            upload_directory(ruta_obj, f"{sp_ext_root}/{carpeta_obj}", mode="skip")
+        else:
+            # Fallback viejo (por si algo raro pasa)
+            upload_directory(EXT_HOY, sp_ext_root, mode="skip")
+
+        # 🔧 Subir Excel solo si hubo cambios (nuevos registros o filas enriquecidas)
+        hubo_cambios_excel = (total_nuevos > 0) or (enriquecidas > 0)
+        if hubo_cambios_excel:
+            upload_small_file(ARCHIVO_EXCEL, f"{sp_excel}/facturas.xlsx", mode="replace")
+        else:
+            print("ℹ️ Excel sin cambios; no se sube facturas.xlsx en esta iteración.")
+
+        # Historial solo si se actualizó algo
+        if historial_rows and os.path.exists(HISTORIAL_EXCEL):
             upload_small_file(HISTORIAL_EXCEL, f"{sp_excel}/historial_ejecuciones.xlsx", mode="replace")
 
         print("🎉 Proceso por aprobadas finalizado para:", found_zip_name)
         resumen.append((pdf_name, time.time() - t0, "match", total_nuevos))
+
+        # Marcar mensaje como leído: ya procesado con éxito
+        try:
+            marcar_mensaje_como_leido(msg_id)
+        except Exception as e:
+            print(f"[APROB] No se pudo marcar como leído el mensaje: {e}")
 
         # --- Resultado de matching y cortes (match sin nuevos) ---
         sin_match_consec = 0
@@ -331,13 +410,16 @@ def run_desde_aprobadas(max_aprobados: int = 50, max_zip_buscar: int = 150, sinc
             sin_nuevos_consec += 1
         else:
             sin_nuevos_consec = 0
+            # Si hubo nuevos, añadimos el CUFE actual al índice en memoria
+            if cufe_pdf:
+                cufes_existentes.add(cufe_pdf)
 
         procesados += 1
         if (procesados >= AUTO_STOP_MIN_PROCESADOS) and (sin_nuevos_consec >= AUTO_STOP_SIN_NUEVOS_CONSEC):
             print("🛑 Deteniendo flujo: varios PDFs con match pero sin nuevos registros (optimización de tiempo).")
             break
 
-    # --- Limpieza final ---
+    # --- Limpieza final (solo PDFs temporales) ---
     try:
         n = borrar_pdfs_en_arbol(TMP_DIR)
         print(f"🧹 Limpieza temp_check: borrados {n} PDF(s).")

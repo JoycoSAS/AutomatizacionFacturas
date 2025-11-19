@@ -38,13 +38,18 @@ _SESSION.headers.update({
 # ----------------------------
 # Helpers HTTP / Autenticación
 # ----------------------------
-def _h():
-    """Headers con Bearer actual. (No cachea token entre requests.)"""
-    return {"Authorization": f"Bearer {get_access_token()}"}
+def _h(content_type: str | None = None):
+    """Headers con Bearer actual, opcional Content-Type."""
+    h = {"Authorization": f"Bearer {get_access_token()}"}
+    if content_type:
+        h["Content-Type"] = content_type
+    return h
+
 
 def _user_segment() -> str:
     """Siempre usar /users/{mailbox}; evita /me. Codificamos solo el UPN."""
     return f"users/{quote(MAILBOX)}"
+
 
 def _get(url, **kwargs):
     """GET simple con diagnóstico si HTTP >= 400 (no se usa para parseos frágiles)."""
@@ -57,6 +62,7 @@ def _get(url, **kwargs):
         r.raise_for_status()
     return r
 
+
 def _get_json_with_retries(url: str, retries: int = 2, timeout=TIMEOUT):
     """
     GET + parse JSON con reintentos si la respuesta viene truncada/no-JSON.
@@ -68,18 +74,15 @@ def _get_json_with_retries(url: str, retries: int = 2, timeout=TIMEOUT):
             r = _SESSION.get(url, headers=_h(), timeout=timeout)
             if not r.ok:
                 print(f"[Graph] HTTP {r.status_code} en {url}")
-                # Intentamos leer JSON por si hay un error detallado de Graph
                 try:
                     err = r.json()
                     print("[Graph] Error detallado:", err)
                 except Exception:
                     pass
-                # No levantamos excepción: devolvemos None para que el llamador decida
             else:
                 try:
                     return r.json()
                 except Exception as e:
-                    # Respuesta no JSON (truncada / HTML / binario / etc.)
                     print(
                         f"[Graph] Respuesta no-JSON (posible problema de CONEXIÓN a Microsoft Graph/Azure): {e}"
                     )
@@ -92,7 +95,6 @@ def _get_json_with_retries(url: str, retries: int = 2, timeout=TIMEOUT):
                 f"(posible inestabilidad de conexión o servicio en Azure): {e}"
             )
 
-        # Si llegamos aquí, reintentamos si quedan intentos
         if attempt < retries:
             print(f"[Graph] Reintentando ({attempt + 1}/{retries}) en {delay:.1f}s…")
             time.sleep(delay)
@@ -110,6 +112,7 @@ def _categorias_ok(msg, required_categories=None):
     cats = set([c.lower() for c in (msg.get("categories") or [])])
     return all(c.lower() in cats for c in required_categories)
 
+
 def _listar_mensajes(max_messages=200, since_days=None):
     """
     Lista mensajes del buzón (ordenados desc).
@@ -125,13 +128,13 @@ def _listar_mensajes(max_messages=200, since_days=None):
     # Filtro por fecha (UTC)
     if since_days is not None and since_days > 0:
         dt = datetime.now(timezone.utc) - timedelta(days=int(since_days))
-        # ISO 8601 con 'Z'
         iso = dt.isoformat().replace("+00:00", "Z")
         params["$filter"] = f"receivedDateTime ge {iso}"
 
     url = base + "?" + "&".join([f"{k}={quote(v)}" for k, v in params.items()])
     data = _get_json_with_retries(url, retries=2, timeout=TIMEOUT)
     return (data or {}).get("value", [])
+
 
 def _listar_adjuntos(msg_id: str):
     """
@@ -143,6 +146,7 @@ def _listar_adjuntos(msg_id: str):
     data = _get_json_with_retries(url, retries=2, timeout=(15, 120))
     return (data or {}).get("value", [])
 
+
 def _listar_adjuntos_zip(msg_id: str):
     items = _listar_adjuntos(msg_id)
     out = []
@@ -152,6 +156,7 @@ def _listar_adjuntos_zip(msg_id: str):
         if name.lower().endswith(".zip") or "zip" in cty:
             out.append(a)
     return out
+
 
 def _descargar_adjunto(msg_id: str, att_id: str, dest_path: str):
     """
@@ -182,13 +187,22 @@ def _descargar_adjunto(msg_id: str, att_id: str, dest_path: str):
         print(f"[FS] No se pudo escribir el adjunto en {dest_path}: {e}")
         return False
 
-def descargar_zips_validos(temp_check_dir, destino_dir, read_all=False, max_messages=200,
-                           since_days=None, required_categories=None):
+
+def descargar_zips_validos(
+    temp_check_dir,
+    destino_dir,
+    read_all=False,
+    max_messages=200,
+    since_days=None,
+    required_categories=None,
+):
     """
     Barre mensajes recientes, descarga ZIPs con contentBytes y que contengan XML,
     y los mueve a destino si no existen ya.
     """
-    import zipfile, os
+    import zipfile
+    import os
+
     os.makedirs(temp_check_dir, exist_ok=True)
     os.makedirs(destino_dir, exist_ok=True)
 
@@ -232,7 +246,6 @@ def descargar_zips_validos(temp_check_dir, destino_dir, read_all=False, max_mess
                 os.replace(tmp_path, dest_path)
                 descargados.append(name)
             else:
-                # Ya existía uno con ese nombre en destino → descartar el temporal
                 try:
                     os.remove(tmp_path)
                 except Exception:
@@ -264,6 +277,7 @@ def get_folder_id_by_name(root_display: str, name: str) -> str | None:
             return item["id"]
     return None
 
+
 def find_folder_id_anywhere(name: str) -> str | None:
     """Búsqueda global por displayName en todo el buzón."""
     url = f"{GRAPH}/{_user_segment()}/mailFolders?$top=1000&$select=id,displayName"
@@ -275,18 +289,26 @@ def find_folder_id_anywhere(name: str) -> str | None:
             return f["id"]
     return None
 
+
 def listar_mensajes_en_carpeta(folder_id: str, top: int = 200):
-    """Lista mensajes (desc) de una carpeta específica (por id)."""
+    """
+    Lista mensajes (desc) de una carpeta específica (por id).
+
+    🔧 Solo devuelve mensajes NO leídos (isRead = false) para evitar
+    reprocesar aprobaciones ya tratadas.
+    """
     fid = quote(folder_id, safe="")
     url = f"{GRAPH}/{_user_segment()}/mailFolders/{fid}/messages"
     params = {
-        "$select": "id,subject,hasAttachments,receivedDateTime,conversationId",
+        "$select": "id,subject,hasAttachments,receivedDateTime,conversationId,isRead",
         "$orderby": "receivedDateTime desc",
-        "$top": str(min(top, 500))
+        "$top": str(min(top, 500)),
+        "$filter": "isRead eq false",
     }
     q = "&".join([f"{k}={quote(v)}" for k, v in params.items()])
     data = _get_json_with_retries(f"{url}?{q}", retries=2, timeout=TIMEOUT)
     return (data or {}).get("value", [])
+
 
 def listar_adjuntos_pdf(msg_id: str):
     """Lista SOLO los PDFs; descarga de archivo se hace con _descargar_adjunto()."""
@@ -298,6 +320,7 @@ def listar_adjuntos_pdf(msg_id: str):
         if name.endswith(".pdf") or "pdf" in cty:
             pdfs.append(a)
     return pdfs
+
 
 def guardar_adjunto_base64(att_json: dict, dest_path: str) -> bool:
     """
@@ -315,6 +338,7 @@ def guardar_adjunto_base64(att_json: dict, dest_path: str) -> bool:
         f.write(data)
     return True
 
+
 def listar_mensajes_zip_inbox(top: int = 300, since_days: int | None = None):
     """
     Lista mensajes del Inbox (desc) con adjuntos; opcionalmente filtra por fecha
@@ -324,10 +348,9 @@ def listar_mensajes_zip_inbox(top: int = 300, since_days: int | None = None):
     params = {
         "$select": "id,subject,hasAttachments,receivedDateTime",
         "$orderby": "receivedDateTime desc",
-        "$top": str(min(top, 500))
+        "$top": str(min(top, 500)),
     }
 
-    # Filtro por fecha (UTC)
     if since_days is not None and since_days > 0:
         dt = datetime.now(timezone.utc) - timedelta(days=int(since_days))
         iso = dt.isoformat().replace("+00:00", "Z")
@@ -338,10 +361,41 @@ def listar_mensajes_zip_inbox(top: int = 300, since_days: int | None = None):
     values = (data or {}).get("value", [])
     return [m for m in values if m.get("hasAttachments")]
 
+
 def listar_adjuntos_zip(msg_id: str):
     """Lista SOLO los ZIPs; descarga con _descargar_adjunto()."""
     return _listar_adjuntos_zip(msg_id)
 
+
 # API pública para descargar por id (útil desde controladores)
 def descargar_adjunto_por_id(msg_id: str, att_id: str, dest_path: str) -> bool:
     return _descargar_adjunto(msg_id, att_id, dest_path)
+
+
+# 🔧 NUEVO: marcar un mensaje como leído
+def marcar_mensaje_como_leido(msg_id: str) -> bool:
+    """
+    Marca un mensaje como leído (isRead=true).
+    Se usa solo cuando YA se procesó con éxito la factura asociada.
+    """
+    try:
+        mid = quote(msg_id, safe="")
+        url = f"{GRAPH}/{_user_segment()}/messages/{mid}"
+        payload = {"isRead": True}
+        r = _SESSION.patch(
+            url,
+            headers=_h("application/json"),
+            json=payload,
+            timeout=TIMEOUT,
+        )
+        if r.status_code >= 400:
+            try:
+                body = r.json()
+            except Exception:
+                body = r.text
+            print(f"[Graph] No se pudo marcar como leído ({r.status_code}): {body}")
+            return False
+        return True
+    except Exception as e:
+        print(f"[Graph] Error al marcar como leído: {e}")
+        return False

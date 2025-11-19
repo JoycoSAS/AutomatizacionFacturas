@@ -13,6 +13,37 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 from openpyxl.utils import get_column_letter
 
 
+def obtener_cufes_existentes() -> set:
+    """
+    Devuelve un set con todos los CUFEs ya registrados en facturas.xlsx.
+    Si el archivo no existe o no tiene la columna, devuelve set().
+
+    Se usa para evitar reprocesar facturas ya registradas desde el flujo
+    de 'Facturas aprobadas'.
+    """
+    if not os.path.exists(ARCHIVO_EXCEL):
+        return set()
+
+    try:
+        df = pd.read_excel(ARCHIVO_EXCEL, engine="openpyxl")
+    except Exception as e:
+        print(f"[Excel] No se pudo leer facturas.xlsx para índice de CUFEs: {e}")
+        return set()
+
+    if "CUFE" not in df.columns:
+        return set()
+
+    cufes: set[str] = set()
+    for v in df["CUFE"]:
+        if pd.isna(v):
+            continue
+        s = str(v).strip()
+        if s:
+            cufes.add(s)
+
+    return cufes
+
+
 def guardar_en_excel(datos):
     """
     Guarda los datos en formato largo:
