@@ -2,12 +2,21 @@
 """
 Sincroniza datos de Aprobaciones (Radicado, Proyecto) desde el Excel de PA en SharePoint
 hacia el Excel local `facturas.xlsx`, cruzando por "Número de factura".
+
+Además:
+- Asegura que las columnas 'Radicado' y 'ProyectoProceso' queden como primeras columnas.
+- Ordena todas las filas por 'Radicado' (numérico ascendente).
+- Reconstruye la tabla de Excel (TblFacturas) para evitar archivos dañados.
 """
 
 import os
 import re
 import unicodedata
+
+import pandas as pd
 from openpyxl import load_workbook
+from openpyxl.worksheet.table import Table, TableStyleInfo
+from openpyxl.utils import get_column_letter
 
 from config import (
     ARCHIVO_EXCEL, TMP_DIR,
@@ -16,21 +25,25 @@ from config import (
     FACT_COL_NUMERO, FACT_COL_RAD, FACT_COL_PROY
 )
 from services.m365.sp_graph import download_small_file
+from utils.safe_io import safe_save_pandas
 
 
 # ---------------------------
 # Helpers de normalización
 # ---------------------------
 
-def _norm(s: str) -> str:
+def _norm(s) -> str:
     """
-    Normaliza un número de factura para poder compararlo:
+    Normaliza un texto (número de factura, encabezado, etc.) para compararlo:
+    - convierte a str
     - quita espacios iniciales/finales
     - elimina acentos
     - deja solo [a-z0-9]
     - pasa a minúsculas
     """
-    s = (s or "").strip()
+    if s is None:
+        s = ""
+    s = str(s).strip()
     s = "".join(
         c for c in unicodedata.normalize("NFKD", s)
         if not unicodedata.combining(c)
@@ -41,10 +54,8 @@ def _norm(s: str) -> str:
 def _extract_numero_from_pa(value: str) -> str:
     """
     En el Excel de PA, la columna NumeroFactura puede venir como:
-      '2025-11-12T07:11:4; FEC756'
+      '2025-11-12T07:11:4; FE-21394'
       '2025-11-19T15:24:; FE 94381'
-      '2025-11-19T21:48:; 11G-658848'
-      '2025-11-19T21:48:; 1FE8291'
       'FEC756'
       'FE94381'
       etc.
@@ -56,43 +67,44 @@ def _extract_numero_from_pa(value: str) -> str:
         return ""
     s = str(value).strip()
 
-    # 0) Caso explícito 'Factura: XXXX'
+    # 1) Caso explícito 'Factura: XXXX'
     m = re.search(r"Factura:\s*([A-Za-z0-9\-\/\.]{3,})", s, flags=re.IGNORECASE)
     if m:
         return m.group(1)
 
-    # Trabajamos sobre la "cola" después del último ';'
-    tail = re.split(r"[;]", s)[-1].strip() or s
-
-    # 1) Patrón tipo 'FE 94381', 'FE-94381', 'DISL1595', etc. al final del texto
-    #    (letras + espacios/guiones opcionales + dígitos)
-    m = re.search(r"([A-Za-z]{1,10}[\s\-]*\d{3,})\s*$", tail)
+    # 2) Patrón tipo 'FE 94381', 'FE-94381', 'DISL 1595' al final del texto
+    m = re.search(r"([A-Za-z]{1,10}[\s\-]*\d{3,})\s*$", s)
     if m:
         return m.group(1)
 
-    # 2) Caso tipo '1FE8291' → ignorar dígitos iniciales y quedarnos con LETRAS+NUM
-    m = re.search(r"\d+([A-Za-z]{1,10}[\s\-]*\d{3,})\s*$", tail)
-    if m:
-        return m.group(1)
+    # 3) Fallback: último token alfanumérico
+    m = re.search(r"([A-Za-z0-9\-\/\.]{3,})\s*$", s)
+    return m.group(1) if m else s
 
-    # 3) Fallback: último token alfanumérico razonable en la cola
-    m = re.search(r"([A-Za-z0-9\-\/\.]{3,})\s*$", tail)
-    if m:
-        return m.group(1)
 
-    # 4) Último recurso: el propio tail completo
-    return tail
+def _flatten_names(names):
+    """
+    Acepta una lista que puede contener strings o listas/tuplas de strings
+    y devuelve un generador plano de nombres.
+    """
+    for n in names:
+        if isinstance(n, (list, tuple, set)):
+            for sub in n:
+                yield sub
+        else:
+            yield n
 
 
 def _find_col_idx(ws, wanted_names):
     """
     Busca el índice de columna (1-based) en la primera fila de la hoja.
-    ws: Worksheet (no tupla). Evita el error de 'tuple has no attribute max_column'.
+    - `wanted_names` puede contener strings o listas de alias.
+    Usa _norm para comparar (tolerante a espacios, mayúsculas, acentos, etc.).
     """
-    wanted = {_norm(x) for x in wanted_names}
+    wanted = {_norm(x) for x in _flatten_names(wanted_names)}
     for c in range(1, ws.max_column + 1):
         h = ws.cell(row=1, column=c).value
-        if _norm(str(h)) in wanted:
+        if _norm(h) in wanted:
             return c
     return None
 
@@ -100,10 +112,11 @@ def _find_col_idx(ws, wanted_names):
 def _ensure_column(ws, header_name: str) -> int:
     """
     Devuelve el índice de la columna 'header_name'; si no existe, la crea al final.
+    Usa _norm para comparar encabezados.
     """
     hdrs = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
     for i, h in enumerate(hdrs, start=1):
-        if _norm(str(h)) == _norm(header_name):
+        if _norm(h) == _norm(header_name):
             return i
     new_idx = ws.max_column + 1
     ws.cell(row=1, column=new_idx, value=header_name)
@@ -111,80 +124,86 @@ def _ensure_column(ws, header_name: str) -> int:
 
 
 # ------------------------------------------
-# Reordenar columnas y ordenar filas
+# Post-proceso: ordenar y formatear con pandas
 # ------------------------------------------
 
-def _reordenar_y_ordenar_facturas(ws) -> None:
+def _ordenar_y_formatear_por_radicado() -> None:
     """
-    Reordena las columnas de la hoja 'Facturas' para que queden así:
-      1. Radicado
-      2. ProyectoProceso
-      3. El resto de columnas en el orden original
-
-    Además, ordena las filas por Radicado (numérico si se puede, si no, alfabético).
+    - Lee facturas.xlsx con pandas
+    - Mueve 'Radicado' y 'ProyectoProceso' al inicio (si existen)
+    - Ordena por 'Radicado' numérico ascendente
+    - Guarda con safe_save_pandas
+    - Reconstruye la tabla TblFacturas en la hoja 'Facturas'
     """
-    rows = list(ws.iter_rows(values_only=True))
-    if not rows:
+    if not os.path.exists(ARCHIVO_EXCEL):
         return
 
-    headers = list(rows[0])
-    data = list(rows[1:])
+    # Leer con pandas
+    df = pd.read_excel(ARCHIVO_EXCEL, sheet_name="Facturas", engine="openpyxl")
 
-    # Orden deseado de columnas
-    preferidas = ["Radicado", "ProyectoProceso"]
-    orden = []
+    cols = list(df.columns)
 
-    for col in preferidas:
-        if col in headers:
-            orden.append(col)
+    # 1) Reordenar columnas (Radicado, ProyectoProceso primero)
+    prioridad = []
+    for c in ["Radicado", "ProyectoProceso"]:
+        if c in cols:
+            prioridad.append(c)
 
-    for h in headers:
-        if h not in orden:
-            orden.append(h)
+    resto = [c for c in cols if c not in prioridad]
+    if prioridad:
+        df = df[prioridad + resto]
 
-    # Mapeo header -> índice original
-    idx_map = {h: i for i, h in enumerate(headers)}
-
-    # Reconstruir filas según el nuevo orden
-    nuevas_filas = []
-    for row in data:
-        nueva = []
-        for col in orden:
-            orig_idx = idx_map.get(col)
-            val = row[orig_idx] if orig_idx is not None and orig_idx < len(row) else None
-            nueva.append(val)
-        nuevas_filas.append(nueva)
-
-    # Ordenar por Radicado (si existe)
-    try:
-        rad_idx = orden.index("Radicado")
-    except ValueError:
-        rad_idx = None
-
-    if rad_idx is not None:
-        def _key(r):
-            v = r[rad_idx]
-            if v is None:
-                return (2, "")
-            s = str(v).strip()
+    # 2) Ordenar por Radicado de forma numérica
+    if "Radicado" in df.columns:
+        def _rad_to_int(x):
+            if pd.isna(x):
+                return 10**12  # los vacíos al final
             try:
-                return (0, int(s))   # numérico
+                return int(str(x).strip())
             except Exception:
-                return (1, s)        # texto
+                return 10**12
 
-        nuevas_filas.sort(key=_key)
+        df = df.sort_values(
+            by="Radicado",
+            key=lambda s: s.map(_rad_to_int),
+            kind="mergesort"   # estable: mantiene el orden de conceptos por factura
+        ).reset_index(drop=True)
 
-    # Limpiar hoja y reescribir
-    ws.delete_rows(1, ws.max_row)
+    # 3) Guardar de forma segura
+    safe_save_pandas(
+        df,
+        ARCHIVO_EXCEL,
+        sheet_name="Facturas",
+        header=True,
+        index=False,
+    )
 
-    # Encabezados
-    for c, h in enumerate(orden, start=1):
-        ws.cell(row=1, column=c, value=h)
+    # 4) Reconstruir la tabla TblFacturas
+    wb = load_workbook(ARCHIVO_EXCEL)
+    ws = wb["Facturas"]
 
-    # Datos
-    for r_idx, row in enumerate(nuevas_filas, start=2):
-        for c_idx, val in enumerate(row, start=1):
-            ws.cell(row=r_idx, column=c_idx, value=val)
+    # Eliminar cualquier tabla previa para evitar archivos corruptos
+    if hasattr(ws, "_tables") and ws._tables:
+        ws._tables = []
+
+    max_row = ws.max_row
+    max_col = ws.max_column
+    last_col = get_column_letter(max_col)
+    table_ref = f"A1:{last_col}{max_row}"
+
+    tbl = Table(displayName="TblFacturas", ref=table_ref)
+    tbl.tableStyleInfo = TableStyleInfo(
+        name="TableStyleMedium9",
+        showFirstColumn=False,
+        showLastColumn=False,
+        showRowStripes=True,
+        showColumnStripes=False,
+    )
+    ws.add_table(tbl)
+
+    ws.freeze_panes = "A2"
+
+    wb.save(ARCHIVO_EXCEL)
 
 
 # -------------------------------------
@@ -196,19 +215,25 @@ def sincronizar_aprobaciones_en_facturas() -> int:
     Descarga el Excel de Aprobaciones de SP a /data/temp_check,
     cruza por Número de factura y completa 'Radicado' y 'ProyectoProceso'
     en facturas.xlsx (solo si esas celdas están vacías).
-    Luego reordena columnas y ordena por Radicado.
+
+    Luego:
+      - Reordena columnas para que Radicado/ProyectoProceso sean las primeras.
+      - Ordena todas las filas por Radicado (numérico).
+      - Reconstruye la tabla TblFacturas.
+
     Devuelve la cantidad de filas actualizadas.
     """
     if not os.path.exists(ARCHIVO_EXCEL):
         return 0
 
+    # 1) Descargar Excel de Aprobaciones
     local_pa = os.path.join(TMP_DIR, "Aprobaciones_Facturas.xlsx")
     ok = download_small_file(APROBACIONES_SP_RELATIVE_PATH, local_pa)
     if not ok or not os.path.exists(local_pa):
         print("[APROB] No se pudo descargar el Excel de aprobaciones; se omite cruce.")
         return 0
 
-    # --- Lee aprobaciones: mapa numero->(radicado, proyecto)
+    # 2) Leer aprobaciones (PA) con openpyxl
     wb_a = load_workbook(local_pa, data_only=True, read_only=True)
     ws_a = wb_a[APROBACIONES_SHEET_NAME] if APROBACIONES_SHEET_NAME in wb_a.sheetnames else wb_a.active
 
@@ -220,6 +245,7 @@ def sincronizar_aprobaciones_en_facturas() -> int:
         print("[APROB] No se localizaron columnas esperadas en Aprobaciones.")
         return 0
 
+    # mapa: numero_normalizado -> (radicado, proyecto)
     mapa = {}
     for r in ws_a.iter_rows(min_row=2, values_only=True):
         raw = r[col_num_a - 1]
@@ -231,7 +257,7 @@ def sincronizar_aprobaciones_en_facturas() -> int:
             continue
         mapa[clave] = (r[col_rad_a - 1], r[col_proy_a - 1])
 
-    # --- Actualiza facturas
+    # 3) Actualizar facturas.xlsx con openpyxl (solo completa celdas vacías)
     wb_f = load_workbook(ARCHIVO_EXCEL)
     ws_f = wb_f["Facturas"] if "Facturas" in wb_f.sheetnames else wb_f.active
 
@@ -246,7 +272,7 @@ def sincronizar_aprobaciones_en_facturas() -> int:
     actualizadas = 0
     for row in range(2, ws_f.max_row + 1):
         num_val = ws_f.cell(row=row, column=col_num_f).value
-        clave = _norm(str(num_val)) if num_val is not None else ""
+        clave = _norm(num_val) if num_val is not None else ""
         if not clave:
             continue
 
@@ -262,8 +288,9 @@ def sincronizar_aprobaciones_en_facturas() -> int:
             if wrote:
                 actualizadas += 1
 
-    # --- Reordenar columnas y ordenar por Radicado ---
-    _reordenar_y_ordenar_facturas(ws_f)
-
     wb_f.save(ARCHIVO_EXCEL)
+
+    # 4) Reordenar columnas, ordenar por Radicado y reconstruir tabla con pandas
+    _ordenar_y_formatear_por_radicado()
+
     return actualizadas

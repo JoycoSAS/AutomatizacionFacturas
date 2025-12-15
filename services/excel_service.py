@@ -50,7 +50,16 @@ def guardar_en_excel(datos):
       - DESCRIPCIÓN = texto de líneas
       - Concepto = (Subtotal, IVA 5%, IVA 19%, etc.)
       - VALOR = valor de cada concepto
+
     Luego convierte la hoja en una tabla con filtros/estilo.
+
+    ⚠️ Para evitar que el archivo se corrompa, en cada guardado se eliminan
+    las tablas existentes de la hoja y se crea una nueva tabla TblFacturas.
+
+    Además:
+    - Si existe la columna 'Radicado', se fuerza a que sea la PRIMERA columna.
+    - Y se ordenan todas las filas por 'Radicado' ascendente (numérico cuando
+      se puede, y los vacíos al final), y luego por 'Número de factura'.
     """
     columnas_fijas = [
         "Archivo", "Empresa emisora", "CUFE",
@@ -93,14 +102,49 @@ def guardar_en_excel(datos):
 
     # 1) Volcado al Excel (crear / actualizar) con guardado seguro
     if os.path.exists(ARCHIVO_EXCEL):
-        antiguo   = pd.read_excel(ARCHIVO_EXCEL, engine="openpyxl")
+        antiguo = pd.read_excel(ARCHIVO_EXCEL, engine="openpyxl")
+
+        # Unimos manteniendo TODAS las columnas que ya existan (incluyendo Radicado/ProyectoProceso)
         combinado = pd.concat([antiguo, df], ignore_index=True)
+
+        # Eliminamos duplicados por Archivo+Concepto como antes
         combinado = combinado.drop_duplicates(subset=["Archivo", "Concepto"], keep="last")
         nuevos    = len(combinado) - len(antiguo)
         final_df  = combinado
     else:
         nuevos   = len(df)
         final_df = df
+
+    # --- NUEVO: mover Radicado a primera columna y ordenar por Radicado ---
+    if "Radicado" in final_df.columns:
+        # 1) Reordenar columnas: Radicado primero
+        cols = list(final_df.columns)
+        cols = ["Radicado"] + [c for c in cols if c != "Radicado"]
+        final_df = final_df[cols]
+
+        # 2) Ordenar por Radicado (numérico cuando se puede) y luego por Número de factura
+        def _radicado_sort_key(v):
+            if pd.isna(v):
+                return float("inf")
+            s = str(v).strip()
+            if not s:
+                return float("inf")
+            try:
+                return int(s)
+            except Exception:
+                # Si no es numérico, lo mandamos después de los números pero manteniendo orden estable
+                return float("inf")
+
+        # Columna auxiliar para ordenar
+        final_df["__rad_sort__"] = final_df["Radicado"].apply(_radicado_sort_key)
+
+        # Si no existe la columna de Número de factura, sólo ordenamos por radicado
+        sort_cols = ["__rad_sort__"]
+        if "Número de factura" in final_df.columns:
+            sort_cols.append("Número de factura")
+
+        final_df = final_df.sort_values(sort_cols, kind="mergesort").drop(columns="__rad_sort__")
+        final_df = final_df.reset_index(drop=True)
 
     # Escribe el archivo con temporal .xlsx y rename atómico
     safe_save_pandas(
@@ -111,7 +155,7 @@ def guardar_en_excel(datos):
         index=False,
     )
 
-    # 2) Formatear la hoja como tabla de Excel (idempotente)
+    # 2) Formatear la hoja como tabla de Excel (reconstruyendo la tabla)
     wb = load_workbook(ARCHIVO_EXCEL)
     ws = wb["Facturas"]
 
@@ -120,26 +164,20 @@ def guardar_en_excel(datos):
     last_col = get_column_letter(max_col)
     table_ref = f"A1:{last_col}{max_row}"
 
-    # Si la tabla ya existe, solo actualizamos el rango; si no, la creamos
-    existing = None
-    if hasattr(ws, "_tables"):
-        for t in ws._tables:
-            if t.displayName == "TblFacturas":
-                existing = t
-                break
+    # Eliminar cualquier tabla existente (evita corrupción)
+    if hasattr(ws, "_tables") and ws._tables:
+        ws._tables = []
 
-    if existing:
-        existing.ref = table_ref
-    else:
-        tbl = Table(displayName="TblFacturas", ref=table_ref)
-        tbl.tableStyleInfo = TableStyleInfo(
-            name="TableStyleMedium9",
-            showFirstColumn=False,
-            showLastColumn=False,
-            showRowStripes=True,
-            showColumnStripes=False,
-        )
-        ws.add_table(tbl)
+    # Crear nueva tabla con el rango completo
+    tbl = Table(displayName="TblFacturas", ref=table_ref)
+    tbl.tableStyleInfo = TableStyleInfo(
+        name="TableStyleMedium9",
+        showFirstColumn=False,
+        showLastColumn=False,
+        showRowStripes=True,
+        showColumnStripes=False,
+    )
+    ws.add_table(tbl)
 
     # Congelar encabezados
     ws.freeze_panes = "A2"
