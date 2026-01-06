@@ -24,11 +24,13 @@ PDF_FALLBACK_ENABLED = True
 _CTRL_REGEX = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")  # quita controles ilegales XML 1.0
 _AMP_FIX = re.compile(r"&(?!(?:[a-zA-Z]+|#\d+|#x[0-9A-Fa-f]+);)")  # & que no inicia entidad
 
+
 def _clean_xml_text(txt: str) -> str:
     """Limpia controles y ampersands sueltos para que ET pueda parsear."""
     txt = _CTRL_REGEX.sub("", txt)
     txt = _AMP_FIX.sub("&amp;", txt)
     return txt
+
 
 def _safe_parse_xml(path: str) -> ET.Element:
     """
@@ -59,7 +61,6 @@ def _extract_inner_invoice(path: str) -> str | None:
       - <ExternalReference>/<URI> apuntando a un XML vecino
     """
     try:
-        # parse tolerante también para el "envoltorio"
         root = _safe_parse_xml(path)
 
         # 1) Binario base64
@@ -86,7 +87,6 @@ def _extract_inner_invoice(path: str) -> str | None:
         uri = root.find('.//{*}Attachment//{*}ExternalReference//{*}URI')
         if uri is not None and uri.text:
             maybe = uri.text.strip()
-            # Si no parece URL absoluta, probar como archivo vecino
             if not re.match(r'^[a-z]+://', maybe, flags=re.I):
                 carpeta = os.path.dirname(path)
                 destino = os.path.join(carpeta, os.path.basename(maybe))
@@ -147,8 +147,7 @@ def _extraer_descripciones_completas(root: ET.Element) -> str:
 
 def _extraer_actividad_de_pdf(xml_path: str) -> str:
     """
-    ÚLTIMO recurso (opcional) para detectar CIIU desde el PDF
-    vecino. No se usa para ningún otro dato.
+    ÚLTIMO recurso (opcional) para detectar CIIU desde el PDF vecino.
     """
     if not PDF_FALLBACK_ENABLED:
         return ""
@@ -172,22 +171,19 @@ def _extraer_actividad_de_pdf(xml_path: str) -> str:
 
 def leer_datos_xml(path: str) -> dict | None:
     """
-    Lee una factura UBL. Si es AttachedDocument intenta extraer el Invoice
-    embebido. Si no hay Invoice embebido, NO crea fila (evita “fila mínima”).
+    Lee una factura UBL. Si es AttachedDocument intenta extraer el Invoice embebido.
+    Si no hay Invoice embebido, NO crea fila (evita “fila mínima”).
     Ahora es tolerante a XML con caracteres ilegales o & sin escapar.
     """
     try:
         inner_xml = _extract_inner_invoice(path)
         if inner_xml:
-            # El XML interno también puede venir sucio: limpiamos si es necesario
             try:
                 root = ET.fromstring(inner_xml)
             except ET.ParseError:
                 root = ET.fromstring(_clean_xml_text(inner_xml))
         else:
-            # Parse tolerante del archivo principal
             root = _safe_parse_xml(path)
-            # Si es AttachedDocument y no conseguimos Invoice interno -> nada
             local = root.tag.split('}')[-1] if '}' in root.tag else root.tag
             if local == 'AttachedDocument':
                 errores.append(
@@ -206,7 +202,6 @@ def leer_datos_xml(path: str) -> dict | None:
         'cac': 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2'
     }
 
-    # — Datos básicos —
     emisor = obtener_texto(
         root, './/cac:AccountingSupplierParty/cac:Party/cac:PartyName/cbc:Name', ns
     )
@@ -237,7 +232,6 @@ def leer_datos_xml(path: str) -> dict | None:
     fecha_text = obtener_texto(root, './cbc:IssueDate', ns)
     cufe = obtener_texto(root, './/cbc:UUID', ns)
 
-    # — Ciudad emisora —
     ciudad_nombre = obtener_texto(
         root,
         './/cac:AccountingSupplierParty//cac:PhysicalLocation//cac:Address//cbc:CityName',
@@ -249,7 +243,6 @@ def leer_datos_xml(path: str) -> dict | None:
         ns
     )
 
-    # — Totales —
     subtotal = convertir_a_numero(
         obtener_texto(root, './/cac:LegalMonetaryTotal/cbc:LineExtensionAmount', ns)
     )
@@ -257,7 +250,6 @@ def leer_datos_xml(path: str) -> dict | None:
         obtener_texto(root, './/cac:LegalMonetaryTotal/cbc:PayableAmount', ns)
     )
 
-    # — Actividad económica —
     act_eco_el = root.find('.//{*}IndustryClassificationCode')
     actividad_economica = (
         act_eco_el.text.strip()
@@ -272,7 +264,6 @@ def leer_datos_xml(path: str) -> dict | None:
     if not actividad_economica:
         actividad_economica = _extraer_actividad_de_pdf(path)
 
-    # — IVA discriminado —
     iva_5 = iva_19 = 0.0
     for tax in root.findall('./cac:TaxTotal/cac:TaxSubtotal', ns):
         amt = convertir_a_numero(obtener_texto(tax, './cbc:TaxAmount', ns))
@@ -286,7 +277,6 @@ def leer_datos_xml(path: str) -> dict | None:
         except Exception:
             continue
 
-    # — Retenciones —
     reteiva = reteica = rete_fuente = 0.0
     for tax in root.findall('./cac:WithholdingTaxTotal/cac:TaxSubtotal', ns):
         amt = convertir_a_numero(obtener_texto(tax, './cbc:TaxAmount', ns))
@@ -304,7 +294,6 @@ def leer_datos_xml(path: str) -> dict | None:
         elif tax_id == '07' or 'ica' in tax_name:
             reteica += amt
 
-    # Guardar retenciones negativas y ajustar total neto
     reteiva = -abs(reteiva)
     reteica = -abs(reteica)
     rete_fuente = -abs(rete_fuente)

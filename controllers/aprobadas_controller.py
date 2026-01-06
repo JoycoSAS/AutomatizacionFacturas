@@ -22,7 +22,7 @@ from config import (
 from services.excel_service import (
     guardar_en_excel,
     registrar_historial_por_zip,
-    obtener_cufes_existentes,   # 🔧 NUEVO: índice de CUFEs ya registrados
+    obtener_cufes_existentes,
 )
 from services.factura_service import procesar_xml_en_carpeta
 from services.zip_service import extraer_por_zip
@@ -38,11 +38,14 @@ from services.m365.mail_graph import (
     listar_mensajes_en_carpeta, listar_adjuntos_pdf,
     listar_mensajes_zip_inbox, listar_adjuntos_zip,
     descargar_adjunto_por_id,
-    marcar_mensaje_como_leido,   # 🔧 NUEVO
+    marcar_mensaje_como_leido,
 )
 
 # PDF utils
 from utils.pdf_utils import extraer_texto_pdf, parse_identificadores_pdf, normalizar_fecha
+
+# ✅ NUEVO: normalización fuerte de números (igual que aprobaciones_service)
+from utils.normalizacion_facturas import claves_normalizadas_factura
 
 # Sincronización con aprobaciones (Power Automate)
 from services.aprobaciones_service import sincronizar_aprobaciones_en_facturas
@@ -63,13 +66,27 @@ def __re(pattern: str, text: str):
     return _re.search(pattern, text, flags=_re.IGNORECASE)
 
 
+def _norm_cufe(s: str) -> str:
+    """
+    Normaliza CUFE/UUID para matching:
+    - trim
+    - lowercase
+    - deja solo [0-9a-f]
+    """
+    if not s:
+        return ""
+    s = str(s).strip().lower()
+    s = re.sub(r"[^0-9a-f]", "", s)
+    return s
+
+
 def _parse_ident_from_xml_bytes(xml_bytes: bytes) -> Dict[str, str]:
     text = xml_bytes.decode("utf-8", errors="ignore")
     ident: Dict[str, str] = {}
 
     m = __re(r"<(?:cbc:|)UUID[^>]*>([^<]{20,})</", text)
     if m:
-        ident["CUFE"] = m.group(1).strip()
+        ident["CUFE"] = _norm_cufe(m.group(1).strip())
 
     m = __re(r"<(?:cbc:|)ID[^>]*>([^<]{3,})</", text)
     if m:
@@ -105,6 +122,13 @@ def _build_zip_index(
     since_days: int,
     max_zip_buscar: int
 ) -> Tuple[Dict[str, Tuple[str, bytes]], Dict[Tuple[str, str], Tuple[str, bytes]]]:
+    """
+    Construye 2 índices:
+      - idx_cufe: cufe_normalizado -> (zip_name, zip_bytes)
+      - idx_nf  : (clave_numero_normalizada, fecha_norm) -> (zip_name, zip_bytes)
+
+    ✅ CLAVE: idx_nf guarda MUCHAS claves por cada factura, usando claves_normalizadas_factura.
+    """
     idx_cufe: Dict[str, Tuple[str, bytes]] = {}
     idx_nf: Dict[Tuple[str, str], Tuple[str, bytes]] = {}
 
@@ -147,17 +171,26 @@ def _build_zip_index(
 
             idents_xml = _peek_ident_xml_from_zip_bytes(zip_bytes)
             for ident_xml in idents_xml:
-                cufe = (ident_xml.get("CUFE") or "").strip()
+                cufe = _norm_cufe(ident_xml.get("CUFE") or "")
                 num  = (ident_xml.get("NUMERO") or "").strip()
                 fec  = (ident_xml.get("FECHA") or "").strip()
 
+                # Normalizar fecha a YYYY-MM-DD si es posible
+                if fec:
+                    fec = normalizar_fecha(fec) or fec
+
+                # --- Índice por CUFE ---
                 if cufe and cufe not in idx_cufe:
                     idx_cufe[cufe] = (zname, zip_bytes)
 
-                if num and fec and (num, fec) not in idx_nf:
-                    idx_nf[(num, fec)] = (zname, zip_bytes)
+                # --- Índice por NUMERO+FECHA (con múltiples claves) ---
+                if num and fec:
+                    for k in claves_normalizadas_factura(num):
+                        key = (k, fec)
+                        if key not in idx_nf:
+                            idx_nf[key] = (zname, zip_bytes)
 
-    print(f"✅ Índice listo: {len(idx_cufe)} por CUFE, {len(idx_nf)} por NUMERO+FECHA")
+    print(f"✅ Índice listo: {len(idx_cufe)} por CUFE, {len(idx_nf)} por NUMERO+FECHA (multi-clave)")
     return idx_cufe, idx_nf
 
 
@@ -172,13 +205,6 @@ def run_desde_aprobadas(
     """
     Flujo principal: busca coincidencias por CUFE o NUMERO+FECHA,
     y si no hay match, usa fallback por nombre del archivo PDF/ZIP.
-
-    Optimizaciones:
-      - Usa índice de CUFEs ya existentes en facturas.xlsx para NO reprocesar facturas.
-      - Marca como leído el mensaje solo cuando:
-          * hubo match y se procesó el ZIP, o
-          * la factura ya estaba registrada en Excel.
-      - Mantiene todos los ZIPs en ADJ_HOY (no se limpian).
     """
     if since_days is None:
         since_days = APROB_SEARCH_SINCE_DAYS
@@ -200,7 +226,7 @@ def run_desde_aprobadas(
 
     idx_cufe, idx_nf = _build_zip_index(since_days=since_days, max_zip_buscar=max_zip_buscar)
 
-    # 🔧 Índice local de facturas ya registradas (por CUFE)
+    # Índice local de facturas ya registradas (por CUFE)
     cufes_existentes = obtener_cufes_existentes()
     print(f"ℹ️ CUFEs ya registrados en facturas.xlsx: {len(cufes_existentes)}")
 
@@ -215,7 +241,6 @@ def run_desde_aprobadas(
     sin_match_consec = 0
     sin_nuevos_consec = 0
 
-    # -------- LOOP PRINCIPAL --------
     for msg in msgs:
         t0 = time.time()
         msg_id = msg["id"]
@@ -235,23 +260,27 @@ def run_desde_aprobadas(
 
         texto     = extraer_texto_pdf(pdf_tmp)
         ident_pdf = parse_identificadores_pdf(texto)
+
         if not ident_pdf.get("NUMERO"):
             ident_pdf.setdefault("NUMERO", _numero_from_subject(subj))
         if not ident_pdf.get("FECHA"):
             ident_pdf.setdefault("FECHA", _fecha_from_subject(subj))
 
-        # 🔧 1) Corte ultra-rápido: si el CUFE ya está en facturas.xlsx, NO buscamos ZIP
-        cufe_pdf = (ident_pdf.get("CUFE") or "").strip()
-        if cufe_pdf and cufe_pdf in cufes_existentes:
+        # Normalizar CUFE/FECHA para match
+        cufe_pdf = _norm_cufe(ident_pdf.get("CUFE") or "")
+        fecha_pdf = (ident_pdf.get("FECHA") or "").strip()
+        if fecha_pdf:
+            fecha_pdf = normalizar_fecha(fecha_pdf) or fecha_pdf
+
+        # Corte rápido: si CUFE ya está en Excel, no buscar ZIP
+        if cufe_pdf and cufe_pdf in { _norm_cufe(x) for x in cufes_existentes }:
             print(f"🔁 Factura ya registrada (CUFE en Excel). Se omite búsqueda de ZIP para {pdf_name}.")
             resumen.append((pdf_name, time.time() - t0, "ya registrado", 0))
 
-            # Contadores tipo "match sin nuevos"
             sin_match_consec = 0
             sin_nuevos_consec += 1
             procesados += 1
 
-            # Marcamos como leído: ya sabemos que está registrada al 100%
             try:
                 marcar_mensaje_como_leido(msg_id)
             except Exception as e:
@@ -260,30 +289,40 @@ def run_desde_aprobadas(
             if (procesados >= AUTO_STOP_MIN_PROCESADOS) and (sin_nuevos_consec >= AUTO_STOP_SIN_NUEVOS_CONSEC):
                 print("🛑 Deteniendo flujo: varios PDFs ya registrados/sin nuevos (optimización de tiempo).")
                 break
-            continue  # siguiente mensaje
+            continue
 
         found_match = False
         found_zip_name = None
         found_zip_bytes = None
 
-        # --- A) Por CUFE ---
-        cufe = cufe_pdf
-        if cufe and cufe in idx_cufe:
-            found_zip_name, found_zip_bytes = idx_cufe[cufe]
+        # --- A) Por CUFE (normalizado) ---
+        if cufe_pdf and cufe_pdf in idx_cufe:
+            found_zip_name, found_zip_bytes = idx_cufe[cufe_pdf]
             found_match = True
         else:
-            # --- B) Por NUMERO+FECHA ---
-            num = (ident_pdf.get("NUMERO") or "").strip()
-            fec = (ident_pdf.get("FECHA") or "").strip()
-            if num and fec and (num, fec) in idx_nf:
-                found_zip_name, found_zip_bytes = idx_nf[(num, fec)]
-                found_match = True
+            # --- B) Por NUMERO+FECHA (normalización fuerte multi-candidatos) ---
+            num_pdf = (ident_pdf.get("NUMERO") or "").strip()
+            if num_pdf and fecha_pdf:
+                claves_pdf = claves_normalizadas_factura(num_pdf)
+                for k in claves_pdf:
+                    key = (k, fecha_pdf)
+                    if key in idx_nf:
+                        found_zip_name, found_zip_bytes = idx_nf[key]
+                        found_match = True
+                        break
 
         # --- C) Fallback por nombre del archivo ---
         if not found_match:
             pdf_base = Path(pdf_name).stem.lower()
             pdf_clean = re.sub(r"[^a-z0-9]", "", pdf_base)
+
+            # evitar recorrer duplicados:
+            vistos = set()
             for zn, zbytes in list(idx_cufe.values()) + list(idx_nf.values()):
+                if zn in vistos:
+                    continue
+                vistos.add(zn)
+
                 zbase = Path(zn).stem.lower()
                 zclean = re.sub(r"[^a-z0-9]", "", zbase)
                 if pdf_clean == zclean or pdf_clean in zclean or zclean in pdf_clean:
@@ -292,7 +331,7 @@ def run_desde_aprobadas(
                     print(f"🔄 Emparejado por nombre: {pdf_name} ↔ {zn}")
                     break
 
-        # --- Resultado de matching y cortes (sin match) ---
+        # --- sin match ---
         if not found_match or not found_zip_name or not found_zip_bytes:
             print(f"❌ No se encontró ZIP que coincida para PDF {pdf_name}.")
             resumen.append((pdf_name, time.time() - t0, "sin match", 0))
@@ -300,11 +339,11 @@ def run_desde_aprobadas(
             sin_match_consec += 1
             sin_nuevos_consec = 0
             procesados += 1
-            # 🔴 IMPORTANTE: NO marcar como leído aquí para poder reintentar
+
             if (procesados >= AUTO_STOP_MIN_PROCESADOS) and (sin_match_consec >= AUTO_STOP_SIN_MATCH_CONSEC):
                 print("🛑 Deteniendo flujo: varios PDFs consecutivos sin match (optimización de tiempo).")
                 break
-            continue  # siguiente mensaje
+            continue
 
         # --- Guardar ZIP local ---
         zip_local_path = Path(ADJ_HOY) / found_zip_name
@@ -331,7 +370,6 @@ def run_desde_aprobadas(
             ruta_obj = ruta
 
             if os.path.exists(done_marker):
-                # Ya se procesó este ZIP en otra ejecución
                 continue
 
             regs, errores_zip = procesar_xml_en_carpeta(ruta)
@@ -374,43 +412,36 @@ def run_desde_aprobadas(
         ensure_folder(sp_ext_root)
         ensure_folder(sp_excel)
 
-        # ZIP del correo actual
         upload_small_file(str(zip_local_path), f"{sp_adj_root}/{found_zip_name}", mode="skip")
 
-        # 🔧 Solo subir la carpeta extraída correspondiente a este ZIP
         if carpeta_obj and ruta_obj and os.path.exists(ruta_obj):
             upload_directory(ruta_obj, f"{sp_ext_root}/{carpeta_obj}", mode="skip")
         else:
-            # Fallback viejo (por si algo raro pasa)
             upload_directory(EXT_HOY, sp_ext_root, mode="skip")
 
-        # 🔧 Subir Excel solo si hubo cambios (nuevos registros o filas enriquecidas)
         hubo_cambios_excel = (total_nuevos > 0) or (enriquecidas > 0)
         if hubo_cambios_excel:
             upload_small_file(ARCHIVO_EXCEL, f"{sp_excel}/facturas.xlsx", mode="replace")
         else:
             print("ℹ️ Excel sin cambios; no se sube facturas.xlsx en esta iteración.")
 
-        # Historial solo si se actualizó algo
         if historial_rows and os.path.exists(HISTORIAL_EXCEL):
             upload_small_file(HISTORIAL_EXCEL, f"{sp_excel}/historial_ejecuciones.xlsx", mode="replace")
 
         print("🎉 Proceso por aprobadas finalizado para:", found_zip_name)
         resumen.append((pdf_name, time.time() - t0, "match", total_nuevos))
 
-        # Marcar mensaje como leído: ya procesado con éxito
         try:
             marcar_mensaje_como_leido(msg_id)
         except Exception as e:
             print(f"[APROB] No se pudo marcar como leído el mensaje: {e}")
 
-        # --- Resultado de matching y cortes (match sin nuevos) ---
         sin_match_consec = 0
         if total_nuevos == 0:
             sin_nuevos_consec += 1
         else:
             sin_nuevos_consec = 0
-            # Si hubo nuevos, añadimos el CUFE actual al índice en memoria
+            # si hubo nuevos, agrega CUFE al set en memoria
             if cufe_pdf:
                 cufes_existentes.add(cufe_pdf)
 
@@ -419,7 +450,7 @@ def run_desde_aprobadas(
             print("🛑 Deteniendo flujo: varios PDFs con match pero sin nuevos registros (optimización de tiempo).")
             break
 
-    # --- Limpieza final (solo PDFs temporales) ---
+    # Limpieza final (solo PDFs temporales)
     try:
         n = borrar_pdfs_en_arbol(TMP_DIR)
         print(f"🧹 Limpieza temp_check: borrados {n} PDF(s).")

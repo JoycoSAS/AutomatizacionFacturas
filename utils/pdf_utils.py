@@ -1,4 +1,4 @@
-# services/utils/pdf_utils.py
+# utils/pdf_utils.py
 import re
 from typing import Optional, Dict
 
@@ -10,7 +10,7 @@ def extraer_texto_pdf(local_pdf_path: str) -> str:
     Si falla, retorna cadena vacía (no rompemos el flujo).
     """
     try:
-        from pdfminer.high_level import extract_text  # nombre estándar del paquete
+        from pdfminer.high_level import extract_text
     except Exception as e:
         print(f"[PDF] pdfminer.six no está instalado o no se pudo importar: {e}")
         return ""
@@ -42,11 +42,15 @@ def _normalize_text(s: str) -> str:
     """
     Normaliza el texto extraído del PDF:
     - Reemplaza ligaduras (ﬀ, ﬁ, etc.) por sus equivalentes ASCII.
-    - Devuelve la cadena normalizada.
+    - Unifica espacios.
     """
     if not s:
         return ""
-    return s.translate(_LIGATURE_MAP)
+    s = s.translate(_LIGATURE_MAP)
+    # Unificar saltos y múltiples espacios
+    s = re.sub(r"[ \t\r\f\v]+", " ", s)
+    s = re.sub(r"\n+", "\n", s)
+    return s
 
 
 def _clean_hex_chunks(s: str) -> str:
@@ -58,21 +62,109 @@ def _clean_hex_chunks(s: str) -> str:
     return s.lower()
 
 
-# --- Regex base ---
+# --- Regex CUFE ---
 _RE_CUFE_SIMPLE = re.compile(
     r"(CUFE|CUFD|UUID)\s*[:=]?\s*([A-Za-z0-9\-]{20,})",
-    re.IGNORECASE,
-)
-
-# Variantes comunes para número (mejorado para Factura Electrónica)
-_RE_NUM = re.compile(
-    r"(?:Factura\s*(?:Electr[oó]nica\s*de\s*Venta)?\s*[:#]?\s*|N[o°\.]?\s*|N[úu]mero\s*[:#]?\s*)([A-Za-z0-9\-\/\.]{3,})",
     re.IGNORECASE,
 )
 
 # Fechas típicas
 _RE_FEC1 = re.compile(r"(\d{4}[-/]\d{2}[-/]\d{2})")
 _RE_FEC2 = re.compile(r"(\d{2}[-/]\d{2}[-/]\d{4})")
+
+
+# --------------------------------------------------------
+# NUEVO: extracción robusta de "Número de factura"
+# --------------------------------------------------------
+
+# Prefijos comunes reales de tus facturas (ajústalo si quieres)
+# (Incluye FPP por tu caso; incluye FE/FV/FVE/FEC/FETR que vi en tus ejemplos)
+_FACT_PREFIXES = r"(?:FPP|FE|FVE|FV|FEC|FETR|FET|FC|FD|NC|ND)"
+
+# 1) Patrón fuerte: prefijo + separador opcional + dígitos
+# Soporta:
+#   FPP - 428790
+#   FPP-428790
+#   FPP 428790
+#   N° FPP - 428790
+#   Factura: FPP - 428790
+_RE_NUM_STRONG = re.compile(
+    rf"(?:Factura\s*[:#]?\s*|Factura\s+No\.?\s*[:#]?\s*|N[o°º\.]?\s*[:#]?\s*|N[úu]mero\s*[:#]?\s*)?"
+    rf"({_FACT_PREFIXES})\s*[-–—]?\s*(\d{{3,12}})",
+    re.IGNORECASE,
+)
+
+# 2) Patrón alterno: a veces viene todo pegado (FPP428790)
+_RE_NUM_GLUE = re.compile(
+    rf"\b({_FACT_PREFIXES})(\d{{3,12}})\b",
+    re.IGNORECASE,
+)
+
+# 3) Fallback general (tu idea original) pero más limitado:
+# Evitamos capturar palabras largas sin números.
+_RE_NUM_FALLBACK = re.compile(
+    r"(?:Factura\s*(?:Electr[oó]nica\s*de\s*Venta)?\s*[:#]?\s*|"
+    r"Factura\s+No\.?\s*[:#]?\s*|"
+    r"N[o°º\.]?\s*[:#]?\s*|"
+    r"N[úu]mero\s*[:#]?\s*)"
+    r"([A-Za-z]{1,10}[\s\-]*\d{3,12}|[A-Za-z0-9\-\/\.]{3,40})",
+    re.IGNORECASE,
+)
+
+
+def _pick_best_numero(texto: str) -> Optional[str]:
+    """
+    Devuelve el mejor candidato de número de factura, priorizando:
+    - Prefijos conocidos (FPP/FE/FVE/...)
+    - Prefijos pegados
+    - Fallback general con filtros
+    """
+    if not texto:
+        return None
+
+    # A) Patrones fuertes (prefijo + dígitos)
+    m = _RE_NUM_STRONG.search(texto)
+    if m:
+        pref = m.group(1).upper()
+        num = m.group(2)
+        return f"{pref}-{num}"  # normalizamos con guion (interno)
+
+    # B) Prefijo pegado
+    m = _RE_NUM_GLUE.search(texto)
+    if m:
+        pref = m.group(1).upper()
+        num = m.group(2)
+        return f"{pref}-{num}"
+
+    # C) Fallback general con filtros duros
+    for match in _RE_NUM_FALLBACK.finditer(texto):
+        raw = (match.group(1) or "").strip()
+
+        # Normalizar separadores raros
+        raw_clean = re.sub(r"\s+", " ", raw).strip()
+
+        # Filtros anti-basura (lo que te estaba pasando con "SULTORES")
+        up = raw_clean.upper()
+        if any(bad in up for bad in ["NIT", "PANADERIA", "JOYCO", "COLOMBIA", "DIAN"]):
+            continue
+
+        # Debe tener al menos 1 dígito; si no, lo ignoramos
+        if not re.search(r"\d", raw_clean):
+            continue
+
+        # Evitar palabras muy largas (típico de texto pegado) si casi no hay dígitos
+        digits = re.findall(r"\d", raw_clean)
+        if len(digits) < 3:
+            continue
+
+        # Si viene tipo "FPP - 428790" o "FE 22076" lo unificamos
+        m2 = re.match(rf"\b({_FACT_PREFIXES})\s*[-–—]?\s*(\d{{3,12}})\b", raw_clean, flags=re.I)
+        if m2:
+            return f"{m2.group(1).upper()}-{m2.group(2)}"
+
+        return raw_clean
+
+    return None
 
 
 def normalizar_fecha(fecha_str: str) -> Optional[str]:
@@ -101,7 +193,6 @@ def parse_identificadores_pdf(texto: str) -> Dict[str, str]:
     Retorna dict con llaves posibles: {"CUFE": "...", "NUMERO": "...", "FECHA": "YYYY-MM-DD"}
     """
     out: Dict[str, str] = {}
-
     texto = _normalize_text(texto or "")
 
     # --- 1) CUFE / UUID robusto ---
@@ -131,14 +222,10 @@ def parse_identificadores_pdf(texto: str) -> Dict[str, str]:
         if m:
             out["CUFE"] = m.group(1)
 
-    # --- 4) Número de factura ---
-    for match in _RE_NUM.finditer(texto):
-        num = match.group(1).strip()
-        if "NIT" in num.upper() or "PANADERIA" in num.upper() or "JOYCO" in num.upper():
-            continue
-        if 3 <= len(num) <= 40:
-            out.setdefault("NUMERO", num)
-            break
+    # --- 4) Número de factura (NUEVO robusto) ---
+    numero = _pick_best_numero(texto)
+    if numero:
+        out["NUMERO"] = numero
 
     # --- 5) Fecha ---
     m1 = _RE_FEC1.search(texto)
