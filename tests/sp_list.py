@@ -1,25 +1,46 @@
 import os
 from urllib.parse import quote
-from services.m365.sp_graph import _SESSION, _h, GRAPH, DRIVE_ID, SP_FOLDER
 
-def ls(path):
+from services.m365.sp_graph import _SESSION, _h, GRAPH
+
+DRIVE_ID = os.getenv("SP_DRIVE_ID")
+SP_FOLDER = os.getenv("SP_FOLDER")
+
+if not DRIVE_ID:
+    raise SystemExit("❌ Falta SP_DRIVE_ID en el .env")
+if not SP_FOLDER:
+    raise SystemExit("❌ Falta SP_FOLDER en el .env")
+
+
+def ls(path: str):
     url = f"{GRAPH}/drives/{DRIVE_ID}/root:/{quote(path)}:/children"
-    r = _SESSION.get(url, headers=_h(), timeout=(15,60))
+    r = _SESSION.get(url, headers=_h(), timeout=(15, 60))
+
     if r.status_code == 404:
-        print("No existe:", path)
+        print(f"❌ No existe: {path}")
         return
+
     r.raise_for_status()
     items = r.json().get("value", [])
-    print(f"[{path}]")
+
+    print(f"\n📂 [{path}] ({len(items)} items)")
     for it in items:
-        mark = "/" if "folder" in it else ""
-        print(" -", it["name"] + mark)
+        if "folder" in it:
+            print(f"  📁 {it['name']}/")
+        else:
+            print(f"  📄 {it['name']}")
+
 
 if __name__ == "__main__":
-    base = SP_FOLDER
-    ls(base)
-    ls(f"{base}/excel")
-    from datetime import datetime
-    today = datetime.now().strftime("%Y-%m-%d")
-    ls(f"{base}/adjuntos/{today}")
-    ls(f"{base}/extraidos/{today}")
+    # 1️⃣ Listar carpeta base
+    ls(SP_FOLDER)
+
+    # 2️⃣ Listar TODO lo que haya dentro automáticamente
+    url = f"{GRAPH}/drives/{DRIVE_ID}/root:/{quote(SP_FOLDER)}:/children"
+    r = _SESSION.get(url, headers=_h(), timeout=(15, 60))
+    r.raise_for_status()
+
+    for item in r.json().get("value", []):
+        if "folder" in item:
+            sub = f"{SP_FOLDER}/{item['name']}"
+            ls(sub)
