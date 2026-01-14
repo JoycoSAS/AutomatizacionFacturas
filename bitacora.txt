@@ -1,0 +1,186 @@
+1) Qué hace el sistema hoy (resultado final) 14/01/2026
+
+Automatiza el procesamiento de facturas desde correo:
+
+Lee correos (Outlook/M365) de una carpeta específica: “Facturas aprobadas”.
+
+Hace “match” del PDF aprobado contra ZIPs (por CUFE y si no, por Número + Fecha).
+
+Extrae el ZIP, procesa XMLs, genera registros.
+
+Actualiza Excel local facturas.xlsx y historial_ejecuciones.xlsx.
+
+Descarga desde SharePoint el Excel de aprobaciones (Aprobaciones_Facturas.xlsx) y cruza para llenar Radicado y ProyectoProceso.
+
+Sube a SharePoint todo lo necesario (zips, extraídos, excels) en la ruta correcta dentro de autoFacturas.
+
+2) Dónde queda todo (local y nube)
+Local (carpeta data/)
+
+data/facturas.xlsx ✅ base principal consolidada
+
+data/historial_ejecuciones.xlsx ✅ historial de corridas
+
+data/adjuntos/ ✅ zips guardados
+
+data/extraidos/ ✅ PDFs/XML extraídos (por zip)
+
+data/temp_check/ ✅ temporales/limpieza
+
+SharePoint (destino final correcto)
+
+Todo queda dentro de:
+
+Innovacion/08. Pruebas proyectos/autoFacturas/
+
+con subcarpetas típicas:
+
+autoFacturas/adjuntos/ (ZIPs)
+
+autoFacturas/extraidos/ (carpetas por ZIP con pdf/xml)
+
+autoFacturas/excel/ (facturas.xlsx + historial_ejecuciones.xlsx)
+
+autoFacturas/Aprobaciones_Facturas.xlsx (excel de PA, si lo dejan ahí)
+
+3) Flujo de funcionamiento (paso a paso)
+A) Entrada
+
+Power Automate (o el proceso actual) deja el PDF aprobado en la carpeta de correo: Facturas aprobadas.
+
+B) Ejecución (main_aprobadas.py)
+
+main_aprobadas.py inicia el flujo “aprobadas”.
+
+Lee correos no leídos en esa carpeta.
+
+Prefetch: busca ZIPs recientes (ventana de días) para armar un índice rápido.
+
+Por cada PDF aprobado:
+
+extrae datos del PDF: CUFE, Número factura, Fecha
+
+encuentra el ZIP correcto por prioridad:
+
+CUFE
+
+Número + Fecha
+
+C) Procesamiento de ZIP
+
+Descarga/extrae ZIP → guarda en data/adjuntos y extrae en data/extraidos/<zipname>/.
+
+Procesa XMLs → genera filas para facturas.xlsx.
+
+D) Cruce con aprobaciones (Radicado / Proyecto)
+
+Descarga de SharePoint el Excel: Aprobaciones_Facturas.xlsx.
+
+Cruza por columna NumeroFactura contra Número de factura en facturas.xlsx.
+
+Si encuentra match, llena:
+
+Radicado
+
+ProyectoProceso
+
+E) Guardado seguro
+
+Guarda excels con escritura segura (temporal + rename atómico).
+
+F) Subida a SharePoint
+
+Sube a SharePoint en:
+.../autoFacturas/adjuntos, .../autoFacturas/extraidos, .../autoFacturas/excel
+
+4) Conexiones y cómo se autentica
+Microsoft Graph API (M365)
+
+Se usa para:
+
+SharePoint: listar carpetas, crear carpetas, subir archivos, descargar archivos.
+
+Correo: leer carpeta aprobadas, (marcar leído intenta pero puede fallar si no hay permisos).
+
+Autenticación:
+
+App de Entra ID (Azure AD) con:
+
+TENANT_ID
+
+CLIENT_ID
+
+CLIENT_SECRET
+
+Scope: https://graph.microsoft.com/.default
+
+5) Archivos clave del proyecto (los “importantes”)
+Entradas / flujo
+
+main_aprobadas.py → dispara el flujo
+
+controllers/aprobadas_controller.py → lógica principal de aprobadas (match, proceso, subida, etc.)
+
+Procesamiento de Excel
+
+services/excel_service.py → escribir/actualizar facturas.xlsx, historial, columnas, etc.
+
+utils/safe_io.py → guardado seguro del Excel (ya corregido para WindowsPath/Path)
+
+SharePoint / Graph
+
+services/m365/sp_graph.py → subir/descargar, ensure_folder, upload_directory, etc.
+
+Configuración del sistema
+
+.env → credenciales y destino SharePoint
+
+config.py → rutas locales + parámetros del cruce + nombre columnas
+
+6) Variables y parámetros que gobiernan el comportamiento
+En config.py
+
+APROB_FOLDER_NAME = carpeta del correo
+
+APROB_SEARCH_SINCE_DAYS = ventana para buscar ZIPs
+
+MATCH_PRIORIDAD = orden de match (CUFE, Número+Fecha)
+
+APROBACIONES_SP_RELATIVE_PATH = ruta del Excel de aprobaciones en SP
+
+nombres de columnas (PA vs Facturas)
+
+En .env
+
+SP_DRIVE_ID = drive “Documentos”
+
+SP_FOLDER = carpeta base destino (ahora apunta a autoFacturas)
+
+credenciales Graph
+
+SSL_VERIFY=true (recomendado)
+
+7) Estado actual: qué está funcionando confirmado
+
+✅ Lista y navega la ruta en SharePoint
+✅ Crea carpetas necesarias
+✅ Sube ZIPs, extraídos y excels a la nube
+✅ Guarda localmente toda la estructura
+✅ Cruce de Radicado y ProyectoProceso funcionando (confirmado por tu captura)
+✅ Guardado seguro ya no revienta con Path/WindowsPath
+
+8) Puntos sensibles (para no romper en futuras mejoras)
+
+Permisos de Graph para correo: a veces no deja “marcar leído” (403). No afecta el core, pero puede duplicar procesamiento si vuelves a correr sin control adicional.
+
+Ruta del Excel de aprobaciones: si lo mueven en SP, el cruce deja de llenar columnas.
+
+Nombres de columnas: si PA cambia encabezados, el cruce falla silenciosamente.
+
+SP_FOLDER: es la llave para que todo quede bajo autoFacturas.
+
+9) Métricas / tiempos (lo que ya viste)
+
+Un PDF + match + zip + parse + excel + subida: ~ 10 a 15s (dependiendo tamaño y red).
+
+Lo más costoso: lectura/parse de PDF + subida a SP.
