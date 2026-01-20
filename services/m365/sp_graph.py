@@ -19,6 +19,7 @@ TIMEOUT = (15, 60)
 
 _SESSION = requests.Session()
 
+
 def sp_join(*parts: str) -> str:
     cleaned = []
     for p in parts:
@@ -27,11 +28,13 @@ def sp_join(*parts: str) -> str:
         cleaned.append(str(p).replace("\\", "/").strip("/"))
     return "/".join([p for p in cleaned if p])
 
+
 def _h(ct: str | None = None) -> dict:
     h = {"Authorization": f"Bearer {get_access_token()}"}
     if ct:
         h["Content-Type"] = ct
     return h
+
 
 def _req(call, max_retries: int = 4):
     attempt = 0
@@ -56,6 +59,18 @@ def _req(call, max_retries: int = 4):
             body = r.text
         print(f"[Graph ERROR] {r.status_code} {r.request.method} {r.url} -> {body}")
         r.raise_for_status()
+
+
+def get_item_by_path(rel_path: str) -> dict:
+    """
+    Devuelve el DriveItem JSON (incluye id) de un archivo/carpeta dada su ruta relativa en el drive.
+    Ej: "Innovacion/08. Pruebas proyectos/autoFacturas/excel/facturas.xlsx"
+    """
+    rel_path = rel_path.replace("\\", "/").strip("/")
+    url = f"{GRAPH}/drives/{DRIVE_ID}/root:/{quote(rel_path)}"
+    r = _req(lambda: _SESSION.get(url, headers=_h(), timeout=TIMEOUT, verify=SSL_VERIFY))
+    return r.json()
+
 
 def ensure_folder(rel_path: str):
     if not rel_path:
@@ -86,11 +101,13 @@ def ensure_folder(rel_path: str):
 
         _req(lambda: _SESSION.get(get_url, headers=_h(), timeout=TIMEOUT, verify=SSL_VERIFY))
 
+
 def _exists(rel_path: str) -> bool:
     rel_path = rel_path.replace("\\", "/").strip("/")
     url = f"{GRAPH}/drives/{DRIVE_ID}/root:/{quote(rel_path)}"
     r = _SESSION.get(url, headers=_h(), timeout=TIMEOUT, verify=SSL_VERIFY)
     return r.status_code == 200
+
 
 def upload_small_file(local_path: str, dest_rel_path: str, mode: str = "replace"):
     dest_rel_path = dest_rel_path.replace("\\", "/").strip("/")
@@ -112,6 +129,7 @@ def upload_small_file(local_path: str, dest_rel_path: str, mode: str = "replace"
         return r.json()
     except Exception:
         return {"ok": True, "dest": dest_rel_path}
+
 
 def upload_directory(local_dir: str, dest_rel_dir: str, mode: str = "replace"):
     local_dir = Path(local_dir)
@@ -136,6 +154,7 @@ def upload_directory(local_dir: str, dest_rel_dir: str, mode: str = "replace"):
             server_rel_path = f"{rel_sp}/{fname}".replace("\\", "/")
             print(f"   ⬆️  {local_path.name} -> {server_rel_path}")
             upload_small_file(str(local_path), server_rel_path, mode=mode)
+
 
 def download_small_file(sp_relative_path: str, local_path: str) -> bool:
     try:

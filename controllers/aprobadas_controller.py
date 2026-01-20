@@ -14,25 +14,22 @@ from config import (
     DATA_DIR, ARCHIVO_EXCEL, HISTORIAL_EXCEL,
     APROB_FOLDER_NAME, APROB_SEARCH_SINCE_DAYS, MATCH_PRIORIDAD,
     TMP_DIR,
-    # Umbrales de corte desde config.py
     AUTO_STOP_MIN_PROCESADOS, AUTO_STOP_SIN_MATCH_CONSEC, AUTO_STOP_SIN_NUEVOS_CONSEC,
 )
 
-# Servicios existentes
 from services.excel_service import (
     guardar_en_excel,
     registrar_historial_por_zip,
     obtener_cufes_existentes,
+    obtener_filas_por_archivos,
 )
 from services.factura_service import procesar_xml_en_carpeta
 from services.zip_service import extraer_por_zip
 
-# SharePoint
 from services.m365.sp_graph import (
     upload_directory, upload_small_file, ensure_folder, SP_FOLDER as BASE_SP
 )
 
-# Microsoft Graph (correo)
 from services.m365.mail_graph import (
     get_folder_id_by_name, find_folder_id_anywhere,
     listar_mensajes_en_carpeta, listar_adjuntos_pdf,
@@ -41,16 +38,14 @@ from services.m365.mail_graph import (
     marcar_mensaje_como_leido,
 )
 
-# PDF utils
 from utils.pdf_utils import extraer_texto_pdf, parse_identificadores_pdf, normalizar_fecha
-
-# ✅ NUEVO: normalización fuerte de números (igual que aprobaciones_service)
 from utils.normalizacion_facturas import claves_normalizadas_factura
 
-# Sincronización con aprobaciones (Power Automate)
 from services.aprobaciones_service import sincronizar_aprobaciones_en_facturas
 
-# Carpetas locales
+# ✅ Workbook API
+from services.m365.excel_workbook_graph import ExcelWorkbookGraph
+
 ADJ_HOY = os.path.join(DATA_DIR, "adjuntos", "hoy")
 EXT_HOY = os.path.join(DATA_DIR, "extraidos", "hoy")
 
@@ -58,21 +53,12 @@ USE_DATE_SUBFOLDERS = False
 UPLOAD_MODE = "skip"
 
 
-# ------------------------
-# Helpers internos
-# ------------------------
 def __re(pattern: str, text: str):
     import re as _re
     return _re.search(pattern, text, flags=_re.IGNORECASE)
 
 
 def _norm_cufe(s: str) -> str:
-    """
-    Normaliza CUFE/UUID para matching:
-    - trim
-    - lowercase
-    - deja solo [0-9a-f]
-    """
     if not s:
         return ""
     s = str(s).strip().lower()
@@ -115,20 +101,10 @@ def _peek_ident_xml_from_zip_bytes(zip_bytes: bytes) -> List[Dict[str, str]]:
     return out
 
 
-# ----------------------------------------------------
-# Prefetch/Índice de ZIPs (una sola vez por ejecución)
-# ----------------------------------------------------
 def _build_zip_index(
     since_days: int,
     max_zip_buscar: int
 ) -> Tuple[Dict[str, Tuple[str, bytes]], Dict[Tuple[str, str], Tuple[str, bytes]]]:
-    """
-    Construye 2 índices:
-      - idx_cufe: cufe_normalizado -> (zip_name, zip_bytes)
-      - idx_nf  : (clave_numero_normalizada, fecha_norm) -> (zip_name, zip_bytes)
-
-    ✅ CLAVE: idx_nf guarda MUCHAS claves por cada factura, usando claves_normalizadas_factura.
-    """
     idx_cufe: Dict[str, Tuple[str, bytes]] = {}
     idx_nf: Dict[Tuple[str, str], Tuple[str, bytes]] = {}
 
@@ -175,15 +151,12 @@ def _build_zip_index(
                 num  = (ident_xml.get("NUMERO") or "").strip()
                 fec  = (ident_xml.get("FECHA") or "").strip()
 
-                # Normalizar fecha a YYYY-MM-DD si es posible
                 if fec:
                     fec = normalizar_fecha(fec) or fec
 
-                # --- Índice por CUFE ---
                 if cufe and cufe not in idx_cufe:
                     idx_cufe[cufe] = (zname, zip_bytes)
 
-                # --- Índice por NUMERO+FECHA (con múltiples claves) ---
                 if num and fec:
                     for k in claves_normalizadas_factura(num):
                         key = (k, fec)
@@ -194,18 +167,11 @@ def _build_zip_index(
     return idx_cufe, idx_nf
 
 
-# -------------------------
-# Flujo desde "Aprobadas"
-# -------------------------
 def run_desde_aprobadas(
     max_aprobados: int = 50,
     max_zip_buscar: int = 150,
     since_days: int | None = None
 ):
-    """
-    Flujo principal: busca coincidencias por CUFE o NUMERO+FECHA,
-    y si no hay match, usa fallback por nombre del archivo PDF/ZIP.
-    """
     if since_days is None:
         since_days = APROB_SEARCH_SINCE_DAYS
 
@@ -226,7 +192,6 @@ def run_desde_aprobadas(
 
     idx_cufe, idx_nf = _build_zip_index(since_days=since_days, max_zip_buscar=max_zip_buscar)
 
-    # Índice local de facturas ya registradas (por CUFE)
     cufes_existentes = obtener_cufes_existentes()
     print(f"ℹ️ CUFEs ya registrados en facturas.xlsx: {len(cufes_existentes)}")
 
@@ -236,7 +201,6 @@ def run_desde_aprobadas(
     t0_total = time.time()
     resumen: List[Tuple[str, float, str, int]] = []
 
-    # Contadores para cortes automáticos
     procesados = 0
     sin_match_consec = 0
     sin_nuevos_consec = 0
@@ -266,13 +230,11 @@ def run_desde_aprobadas(
         if not ident_pdf.get("FECHA"):
             ident_pdf.setdefault("FECHA", _fecha_from_subject(subj))
 
-        # Normalizar CUFE/FECHA para match
         cufe_pdf = _norm_cufe(ident_pdf.get("CUFE") or "")
         fecha_pdf = (ident_pdf.get("FECHA") or "").strip()
         if fecha_pdf:
             fecha_pdf = normalizar_fecha(fecha_pdf) or fecha_pdf
 
-        # Corte rápido: si CUFE ya está en Excel, no buscar ZIP
         if cufe_pdf and cufe_pdf in { _norm_cufe(x) for x in cufes_existentes }:
             print(f"🔁 Factura ya registrada (CUFE en Excel). Se omite búsqueda de ZIP para {pdf_name}.")
             resumen.append((pdf_name, time.time() - t0, "ya registrado", 0))
@@ -295,12 +257,10 @@ def run_desde_aprobadas(
         found_zip_name = None
         found_zip_bytes = None
 
-        # --- A) Por CUFE (normalizado) ---
         if cufe_pdf and cufe_pdf in idx_cufe:
             found_zip_name, found_zip_bytes = idx_cufe[cufe_pdf]
             found_match = True
         else:
-            # --- B) Por NUMERO+FECHA (normalización fuerte multi-candidatos) ---
             num_pdf = (ident_pdf.get("NUMERO") or "").strip()
             if num_pdf and fecha_pdf:
                 claves_pdf = claves_normalizadas_factura(num_pdf)
@@ -311,12 +271,10 @@ def run_desde_aprobadas(
                         found_match = True
                         break
 
-        # --- C) Fallback por nombre del archivo ---
         if not found_match:
             pdf_base = Path(pdf_name).stem.lower()
             pdf_clean = re.sub(r"[^a-z0-9]", "", pdf_base)
 
-            # evitar recorrer duplicados:
             vistos = set()
             for zn, zbytes in list(idx_cufe.values()) + list(idx_nf.values()):
                 if zn in vistos:
@@ -331,7 +289,6 @@ def run_desde_aprobadas(
                     print(f"🔄 Emparejado por nombre: {pdf_name} ↔ {zn}")
                     break
 
-        # --- sin match ---
         if not found_match or not found_zip_name or not found_zip_bytes:
             print(f"❌ No se encontró ZIP que coincida para PDF {pdf_name}.")
             resumen.append((pdf_name, time.time() - t0, "sin match", 0))
@@ -345,12 +302,10 @@ def run_desde_aprobadas(
                 break
             continue
 
-        # --- Guardar ZIP local ---
         zip_local_path = Path(ADJ_HOY) / found_zip_name
         with open(zip_local_path, "wb") as f:
             f.write(found_zip_bytes)
 
-        # --- Procesamiento normal ---
         print(f"🗜️  Extrayendo {found_zip_name} ...")
         resultados = extraer_por_zip(ADJ_HOY, EXT_HOY)
         print("🧾 Procesando XMLs...")
@@ -389,7 +344,6 @@ def run_desde_aprobadas(
         if historial_rows:
             registrar_historial_por_zip(historial_rows)
 
-        # === Sincronizar Radicado/Proyecto desde Aprobaciones ===
         enriquecidas = 0
         try:
             enriquecidas = sincronizar_aprobaciones_en_facturas()
@@ -398,7 +352,6 @@ def run_desde_aprobadas(
         except Exception as e:
             print(f"[APROB] Error al sincronizar aprobaciones: {e}")
 
-        # --- Subida a SharePoint ---
         print("☁️  Subiendo a SharePoint (desde aprobadas)...")
         if USE_DATE_SUBFOLDERS:
             sp_adj_root = f"{BASE_SP}/adjuntos/{fecha_local}"
@@ -419,12 +372,36 @@ def run_desde_aprobadas(
         else:
             upload_directory(EXT_HOY, sp_ext_root, mode="skip")
 
+        # ✅ Workbook API: append sin reemplazar el archivo
         hubo_cambios_excel = (total_nuevos > 0) or (enriquecidas > 0)
-        if hubo_cambios_excel:
-            upload_small_file(ARCHIVO_EXCEL, f"{sp_excel}/facturas.xlsx", mode="replace")
-        else:
-            print("ℹ️ Excel sin cambios; no se sube facturas.xlsx en esta iteración.")
+        if hubo_cambios_excel and sp_excel:
+            try:
+                # Tomamos nombres XML reales de la carpeta extraída para saber qué filas mandar
+                archivos_xml = set()
+                if ruta_obj and os.path.isdir(ruta_obj):
+                    for fn in os.listdir(ruta_obj):
+                        if fn.lower().endswith(".xml"):
+                            archivos_xml.add(fn)
 
+                if archivos_xml:
+                    filas = obtener_filas_por_archivos(archivos_xml)
+                    sp_facturas_path = f"{sp_excel}/facturas.xlsx".strip("/")
+
+                    xl = ExcelWorkbookGraph(sp_facturas_path)
+                    insertadas = xl.append_rows_dedup(
+                        table_name="TblFacturas",
+                        rows_dicts=filas,
+                        key_cols=("Archivo", "Concepto"),
+                    )
+                    print(f"✅ SharePoint facturas.xlsx actualizado (Workbook API): +{insertadas} fila(s) nuevas.")
+                else:
+                    print("ℹ️ No se detectaron XMLs en la carpeta extraída; no se actualiza tabla en nube.")
+            except Exception as e:
+                print(f"⚠️ Workbook API falló (no se cae el flujo): {e}")
+        else:
+            print("ℹ️ Excel sin cambios; no se actualiza facturas.xlsx en nube.")
+
+        # Historial se sube normal (siempre es seguro)
         if historial_rows and os.path.exists(HISTORIAL_EXCEL):
             upload_small_file(HISTORIAL_EXCEL, f"{sp_excel}/historial_ejecuciones.xlsx", mode="replace")
 
@@ -441,7 +418,6 @@ def run_desde_aprobadas(
             sin_nuevos_consec += 1
         else:
             sin_nuevos_consec = 0
-            # si hubo nuevos, agrega CUFE al set en memoria
             if cufe_pdf:
                 cufes_existentes.add(cufe_pdf)
 
@@ -450,7 +426,6 @@ def run_desde_aprobadas(
             print("🛑 Deteniendo flujo: varios PDFs con match pero sin nuevos registros (optimización de tiempo).")
             break
 
-    # Limpieza final (solo PDFs temporales)
     try:
         n = borrar_pdfs_en_arbol(TMP_DIR)
         print(f"🧹 Limpieza temp_check: borrados {n} PDF(s).")
@@ -465,9 +440,6 @@ def run_desde_aprobadas(
     print("=============================================")
 
 
-# --------------------
-# Helpers desde asunto
-# --------------------
 def _numero_from_subject(subj: str) -> str | None:
     m = re.search(r"(?:Factura|#|N[o°\.]?)[^\d]*([A-Za-z0-9\-\/\.]{3,})", subj, flags=re.IGNORECASE)
     return m.group(1).strip() if m else None

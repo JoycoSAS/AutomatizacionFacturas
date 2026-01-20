@@ -1,12 +1,13 @@
 # services/excel_service.py
-
 import os
+import re
 from typing import Any, Dict, List, Set
 
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.worksheet.table import Table, TableStyleInfo
 from openpyxl.utils import get_column_letter
+from openpyxl.styles import Alignment
 
 from config import ARCHIVO_EXCEL, HISTORIAL_EXCEL
 from utils.safe_io import safe_save_pandas
@@ -20,30 +21,29 @@ def _read_facturas_df() -> pd.DataFrame:
         return pd.DataFrame()
 
     try:
-        # Preferimos hoja "Facturas" porque tu archivo la usa.
         return pd.read_excel(ARCHIVO_EXCEL, sheet_name="Facturas", engine="openpyxl")
     except Exception:
-        # Fallback: por si la hoja cambia o el archivo viene sin nombre fijo.
         return pd.read_excel(ARCHIVO_EXCEL, engine="openpyxl")
 
 
 def _rebuild_table_facturas() -> None:
     """
-    Reconstruye la tabla de Excel (TblFacturas) para evitar corrupción, y congela encabezado.
+    Reconstruye la tabla de Excel (TblFacturas) para evitar corrupción,
+    congela encabezado y aplica ajustes visuales básicos.
     """
     wb = load_workbook(ARCHIVO_EXCEL)
     ws = wb["Facturas"] if "Facturas" in wb.sheetnames else wb.active
 
-    # Rango completo
     max_row = ws.max_row
     max_col = ws.max_column
     last_col = get_column_letter(max_col)
     table_ref = f"A1:{last_col}{max_row}"
 
-    # Eliminar cualquier tabla existente (evita corrupción)
+    # Eliminar tablas existentes
     if hasattr(ws, "_tables") and ws._tables:
         ws._tables = []
 
+    # Crear tabla nueva
     tbl = Table(displayName="TblFacturas", ref=table_ref)
     tbl.tableStyleInfo = TableStyleInfo(
         name="TableStyleMedium9",
@@ -55,13 +55,35 @@ def _rebuild_table_facturas() -> None:
     ws.add_table(tbl)
 
     ws.freeze_panes = "A2"
+
+    # ===== Ajuste visual =====
+    DEFAULT_ROW_HEIGHT = 15
+
+    # Fijar altura de filas de datos (Excel Online deja de crecer si no hay saltos de línea)
+    for r in range(2, max_row + 1):
+        ws.row_dimensions[r].height = DEFAULT_ROW_HEIGHT
+
+    # Ubicar columna DESCRIPCIÓN por encabezado
+    header_map = {}
+    for c in range(1, max_col + 1):
+        v = ws.cell(row=1, column=c).value
+        if v is not None:
+            header_map[str(v).strip().upper()] = c
+
+    desc_col = header_map.get("DESCRIPCIÓN")
+    if desc_col:
+        col_letter = get_column_letter(desc_col)
+        ws.column_dimensions[col_letter].width = 45  # ajusta si quieres
+
+        # sin wrap + alineación arriba
+        align = Alignment(wrap_text=False, vertical="top")
+        for r in range(2, max_row + 1):
+            ws.cell(row=r, column=desc_col).alignment = align
+
     wb.save(ARCHIVO_EXCEL)
 
 
 def _radicado_sort_key(v: Any) -> int:
-    """
-    Ordena Radicado como número. Vacíos/no numéricos van al final.
-    """
     if pd.isna(v):
         return 10**12
     s = str(v).strip()
@@ -74,13 +96,6 @@ def _radicado_sort_key(v: Any) -> int:
 
 
 def obtener_cufes_existentes() -> Set[str]:
-    """
-    Devuelve un set con todos los CUFEs ya registrados en facturas.xlsx.
-    Si el archivo no existe o no tiene la columna, devuelve set().
-
-    Se usa para evitar reprocesar facturas ya registradas desde el flujo
-    de 'Facturas aprobadas'.
-    """
     if not os.path.exists(ARCHIVO_EXCEL):
         return set()
 
@@ -104,26 +119,34 @@ def obtener_cufes_existentes() -> Set[str]:
     return cufes
 
 
+def _limpiar_descripcion(s: Any) -> str:
+    """
+    Quita saltos de línea reales que hacen que Excel Online agrande la fila.
+    Mantiene el estilo que tú quieres: separado por '; ' en la misma celda.
+    """
+    if s is None or (isinstance(s, float) and pd.isna(s)):
+        return ""
+    txt = str(s)
+
+    # Normalizar saltos de línea a un separador único
+    txt = txt.replace("\r\n", "\n").replace("\r", "\n")
+    txt = txt.replace("\n", "; ")
+
+    # Colapsar espacios
+    txt = re.sub(r"[ \t]+", " ", txt).strip()
+
+    # Evitar separadores repetidos
+    txt = re.sub(r"(;\s*){2,}", "; ", txt).strip(" ;")
+
+    return txt
+
+
 def guardar_en_excel(datos: List[Dict[str, Any]]) -> int:
     """
-    Guarda los datos en formato largo:
-      - DESCRIPCIÓN = texto de líneas
-      - Concepto = (Subtotal, IVA 5%, IVA 19%, etc.)
-      - VALOR = valor de cada concepto
-
-    Luego convierte la hoja en una tabla con filtros/estilo.
-
-    ⚠️ Para evitar que el archivo se corrompa, en cada guardado se eliminan
-    las tablas existentes de la hoja y se crea una nueva tabla TblFacturas.
-
-    MEJORA:
-    - Si existen las columnas 'Radicado' y/o 'ProyectoProceso' (ya sea porque
-      el archivo venía así o porque se sincronizan luego), se conservan.
-    - Se reordenan al inicio: Radicado, ProyectoProceso, ...
-    - Se ordenan todas las filas por 'Radicado' ascendente (numérico cuando
-      se puede y vacíos al final) manteniendo un orden estable.
+    Guarda datos (formato largo): una fila por concepto (Subtotal/IVA/Ret/Total).
+    Dedupe: Archivo + Concepto
+    Rebuild de tabla: TblFacturas
     """
-    # Columnas mínimas que generamos desde XML (formato largo)
     columnas_fijas = [
         "Archivo", "Empresa emisora", "CUFE",
         "Ciudad emisora", "Código ciudad", "NIT",
@@ -149,7 +172,7 @@ def guardar_en_excel(datos: List[Dict[str, Any]]) -> int:
             "Día":                   d.get("Día", ""),
             "Tipo de contribuyente": d.get("Tipo de contribuyente", ""),
             "Actividad económica":   d.get("Actividad económica", ""),
-            "DESCRIPCIÓN":           d.get("DescripcionLineas", ""),
+            "DESCRIPCIÓN":           _limpiar_descripcion(d.get("DescripcionLineas", "")),
         }
 
         for medida in [
@@ -165,15 +188,9 @@ def guardar_en_excel(datos: List[Dict[str, Any]]) -> int:
     df_nuevo = pd.DataFrame(registros_transformados, columns=columnas_fijas)
     nuevos = 0
 
-    # 1) Cargar existente y combinar (conservando columnas extra como Radicado/ProyectoProceso)
     if os.path.exists(ARCHIVO_EXCEL):
         antiguo = _read_facturas_df()
-
-        # concat conserva todas las columnas presentes en cualquiera de los dos
         combinado = pd.concat([antiguo, df_nuevo], ignore_index=True)
-
-        # Dedupe igual que antes: Archivo + Concepto
-        # (cada factura genera varias filas, una por concepto)
         combinado = combinado.drop_duplicates(subset=["Archivo", "Concepto"], keep="last")
 
         nuevos = len(combinado) - len(antiguo)
@@ -182,24 +199,19 @@ def guardar_en_excel(datos: List[Dict[str, Any]]) -> int:
         nuevos = len(df_nuevo)
         final_df = df_nuevo
 
-    # 2) Reordenar columnas: Radicado, ProyectoProceso primero si existen
+    # Prioridad de columnas si existen
     prioridad = [c for c in ["Radicado", "ProyectoProceso"] if c in final_df.columns]
     if prioridad:
         resto = [c for c in final_df.columns if c not in prioridad]
         final_df = final_df[prioridad + resto]
 
-    # 3) Ordenar por Radicado (estable). Si no existe, no tocamos el orden.
+    # Orden por radicado si existe
     if "Radicado" in final_df.columns:
         final_df["__rad_sort__"] = final_df["Radicado"].apply(_radicado_sort_key)
 
-        # orden estable para no “revolver” las filas dentro del mismo radicado
         sort_cols = ["__rad_sort__"]
-
-        # si existe número de factura, ayuda a estabilidad
         if "Número de factura" in final_df.columns:
             sort_cols.append("Número de factura")
-
-        # si existe Concepto, mantiene el “bloque” (Subtotal/IVA/Ret/Total) consistente
         if "Concepto" in final_df.columns:
             sort_cols.append("Concepto")
 
@@ -209,7 +221,7 @@ def guardar_en_excel(datos: List[Dict[str, Any]]) -> int:
                     .reset_index(drop=True)
         )
 
-    # 4) Guardar de forma segura (temp -> rename)
+    # Guardado seguro
     safe_save_pandas(
         final_df,
         ARCHIVO_EXCEL,
@@ -218,7 +230,7 @@ def guardar_en_excel(datos: List[Dict[str, Any]]) -> int:
         index=False,
     )
 
-    # 5) Reconstruir tabla (evita corrupción y mantiene filtros)
+    # Tabla + formato
     _rebuild_table_facturas()
 
     print(f"✅ Excel formateado y actualizado: {ARCHIVO_EXCEL}")
@@ -226,9 +238,6 @@ def guardar_en_excel(datos: List[Dict[str, Any]]) -> int:
 
 
 def registrar_historial_por_zip(filas: List[Dict[str, Any]]) -> None:
-    """
-    Guarda/actualiza el historial de ejecuciones en otro Excel.
-    """
     df_h = pd.DataFrame(filas)
 
     if os.path.exists(HISTORIAL_EXCEL):
@@ -249,3 +258,27 @@ def registrar_historial_por_zip(filas: List[Dict[str, Any]]) -> None:
     )
 
     print(f"📁 Historial actualizado: {HISTORIAL_EXCEL}")
+
+
+def obtener_filas_por_archivos(archivos: Set[str]) -> List[Dict[str, Any]]:
+    """
+    Devuelve filas (dicts) desde facturas.xlsx filtradas por columna 'Archivo'.
+    Se usa para mandar SOLO lo nuevo a SharePoint Workbook API.
+    """
+    if not archivos:
+        return []
+
+    df = _read_facturas_df()
+    if df.empty or "Archivo" not in df.columns:
+        return []
+
+    archivos_norm = {str(a).strip() for a in archivos if str(a).strip()}
+    if not archivos_norm:
+        return []
+
+    df2 = df[df["Archivo"].astype(str).str.strip().isin(archivos_norm)].copy()
+    if df2.empty:
+        return []
+
+    df2 = df2.fillna("")
+    return df2.to_dict(orient="records")

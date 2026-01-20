@@ -5,17 +5,11 @@ import datetime
 from config import DATA_DIR, ARCHIVO_EXCEL, HISTORIAL_EXCEL, TMP_DIR
 from utils.fs_utils import borrar_pdfs_en_arbol
 
-# 1) Correo (Graph) -> descarga a temp y mueve sólo ZIPs con XML
 from services.m365.mail_graph import descargar_zips_validos
-
-# 2) ZIP -> extracción (tu servicio existente)
 from services.zip_service import extraer_por_zip
-
-# 3) XML -> parseo + Excel local (tus servicios existentes)
 from services.factura_service import procesar_xml_en_carpeta
-from services.excel_service import guardar_en_excel, registrar_historial_por_zip
+from services.excel_service import guardar_en_excel, registrar_historial_por_zip, obtener_filas_por_archivos
 
-# 4) SharePoint (Graph) -> subir directorios/archivos
 from services.m365.sp_graph import (
     upload_directory,
     upload_small_file,
@@ -23,34 +17,23 @@ from services.m365.sp_graph import (
     SP_FOLDER as BASE_SP
 )
 
-# --- carpetas locales del flujo híbrido ---
+from services.m365.excel_workbook_graph import ExcelWorkbookGraph
+
 ADJ_HOY = os.path.join(DATA_DIR, "adjuntos", "hoy")
 EXT_HOY = os.path.join(DATA_DIR, "extraidos", "hoy")
 
-# --- opciones de organización en SharePoint ---
 USE_DATE_SUBFOLDERS = False
-UPLOAD_MODE = "skip"   # "replace" para sobrescribir; "skip" para no reemplazar
+UPLOAD_MODE = "skip"
 
 
 def run_hibrido(read_all: bool = False, max_messages: int = 200, since_days: int | None = None):
-    """
-    Flujo híbrido:
-      1) Lee correo ONLINE (Graph) y descarga a temp_check; sólo mueve ZIPs válidos a adjuntos/hoy
-      2) Extrae ZIPs -> extraidos/hoy/<carpeta>
-      3) Parsea XMLs -> actualiza Excel local
-      4) Sube a SharePoint: ZIPs, extraídos y Excels
-      5) Limpia PDFs temporales (temp_check) al final
-    """
-    # Default de ventana de búsqueda si no te pasan since_days
     if since_days is None:
-        since_days = 5  # ← ajustable cuando llames a run_hibrido(...)
+        since_days = 5
 
-    # Asegurar carpetas locales
     os.makedirs(ADJ_HOY, exist_ok=True)
-    os.makedirs(TMP_DIR, exist_ok=True)  # /data/temp_check
+    os.makedirs(TMP_DIR, exist_ok=True)
     os.makedirs(EXT_HOY, exist_ok=True)
 
-    # 1) Descarga selectiva de adjuntos
     print("🔗 Conectando al correo online y descargando ZIPs (peek en temp_check)…")
     zips = descargar_zips_validos(
         temp_check_dir=TMP_DIR,
@@ -62,7 +45,6 @@ def run_hibrido(read_all: bool = False, max_messages: int = 200, since_days: int
     print(f"📥 Descargados {len(zips)} ZIP(s) válidos a {ADJ_HOY}")
 
     if not zips:
-        # Limpieza por si quedaron PDFs de ‘peek’ previos
         try:
             n = borrar_pdfs_en_arbol(TMP_DIR)
             print(f"🧹 Limpieza temp_check: borrados {n} PDF(s).")
@@ -71,11 +53,9 @@ def run_hibrido(read_all: bool = False, max_messages: int = 200, since_days: int
         print("ℹ️ No hay ZIPs válidos nuevos. Fin.")
         return
 
-    # 2) Extraer por ZIP (uno por carpeta)
     print("🗜️  Extrayendo ZIPs por carpeta…")
-    resultados = extraer_por_zip(ADJ_HOY, EXT_HOY)  # -> [(zip_name, carpeta_destino), …]
+    resultados = extraer_por_zip(ADJ_HOY, EXT_HOY)
 
-    # 3) Procesar XMLs de cada carpeta extraída
     print("🧾 Procesando XMLs…")
     historial_rows = []
     ahora = datetime.datetime.now()
@@ -83,18 +63,29 @@ def run_hibrido(read_all: bool = False, max_messages: int = 200, since_days: int
     hora = ahora.strftime("%H:%M:%S")
 
     total_nuevos = 0
+
+    # Para Workbook API: acumulamos XML procesados en esta corrida
+    archivos_xml_corrida = set()
+
     for zip_name, carpeta in resultados:
         ruta = os.path.join(EXT_HOY, carpeta)
 
-        # ⚠️ Skip si esta carpeta ya fue procesada en una corrida anterior
         done_marker = os.path.join(ruta, ".done")
         if os.path.exists(done_marker):
             continue
 
         regs, errores_zip = procesar_xml_en_carpeta(ruta)
-
         nuevos = guardar_en_excel(regs) if regs else 0
         total_nuevos += nuevos
+
+        # registrar nombres xml del folder (más fiable que depender de regs)
+        try:
+            if os.path.isdir(ruta):
+                for fn in os.listdir(ruta):
+                    if fn.lower().endswith(".xml"):
+                        archivos_xml_corrida.add(fn)
+        except Exception:
+            pass
 
         if nuevos > 0 or errores_zip > 0:
             historial_rows.append({
@@ -110,7 +101,6 @@ def run_hibrido(read_all: bool = False, max_messages: int = 200, since_days: int
         registrar_historial_por_zip(historial_rows)
         print(f"📁 Historial actualizado: {HISTORIAL_EXCEL}")
 
-    # 4) Subir a SharePoint
     print("☁️  Subiendo a SharePoint…")
     print(f"[DEBUG] SP_FOLDER efectivo: {BASE_SP!r}")
 
@@ -133,12 +123,29 @@ def run_hibrido(read_all: bool = False, max_messages: int = 200, since_days: int
     print("   ⬆️  Extraídos…")
     upload_directory(EXT_HOY, sp_ext, mode=UPLOAD_MODE)
 
-    print("   ⬆️  Excels…")
-    upload_small_file(ARCHIVO_EXCEL, f"{sp_excel}/facturas.xlsx", mode="replace")
+    # ✅ Workbook API para facturas.xlsx (sin reemplazar)
+    print("   ⬆️  facturas.xlsx (Workbook API, sin reemplazar)…")
+    if total_nuevos > 0 and archivos_xml_corrida:
+        try:
+            filas = obtener_filas_por_archivos(archivos_xml_corrida)
+            sp_facturas_path = f"{sp_excel}/facturas.xlsx".strip("/")
+
+            xl = ExcelWorkbookGraph(sp_facturas_path)
+            insertadas = xl.append_rows_dedup(
+                table_name="TblFacturas",
+                rows_dicts=filas,
+                key_cols=("Archivo", "Concepto"),
+            )
+            print(f"✅ SharePoint facturas.xlsx actualizado: +{insertadas} fila(s) nuevas.")
+        except Exception as e:
+            print(f"⚠️ Workbook API falló (no se cae el flujo): {e}")
+    else:
+        print("ℹ️ No hay nuevos registros o no se detectaron XMLs; no se actualiza tabla en nube.")
+
+    # Historial se sube normal
     if os.path.exists(HISTORIAL_EXCEL):
         upload_small_file(HISTORIAL_EXCEL, f"{sp_excel}/historial_ejecuciones.xlsx", mode="replace")
 
-    # ✅ Crear marcadores .done para todas las carpetas extraídas que participaron en esta corrida
     for zip_name, carpeta in resultados:
         ruta = os.path.join(EXT_HOY, carpeta)
         if not os.path.isdir(ruta):
@@ -152,7 +159,6 @@ def run_hibrido(read_all: bool = False, max_messages: int = 200, since_days: int
 
     print("🎉 Flujo híbrido finalizado.")
 
-    # 5) Limpieza de PDFs temporales (AL FINAL DEL PROCESO)
     try:
         n = borrar_pdfs_en_arbol(TMP_DIR)
         print(f"🧹 Limpieza temp_check: borrados {n} PDF(s).")
