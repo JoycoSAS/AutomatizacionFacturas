@@ -5,6 +5,7 @@ import re
 import base64
 import xml.etree.ElementTree as ET
 from html import unescape
+from decimal import Decimal
 
 import PyPDF2  # pip install PyPDF2
 
@@ -169,27 +170,95 @@ def _extraer_actividad_de_pdf(xml_path: str) -> str:
     return ""
 
 
+# ----------------------------
+# NUEVO: Helpers CustomFields (Hughes y similares)
+# ----------------------------
+def _dec_from_str(s: str | None) -> Decimal:
+    if not s:
+        return Decimal("0")
+    s = str(s).strip()
+    if not s:
+        return Decimal("0")
+    # soporta "-11697.48" o "336302.51"
+    # (si algún proveedor manda con coma, lo toleramos)
+    s = s.replace(",", ".")
+    try:
+        return Decimal(s)
+    except Exception:
+        return Decimal("0")
+
+
+def _find_customfield(xml_text: str, name: str) -> str | None:
+    """
+    Busca <CustomField Name="X" Value="Y" />
+    """
+    m = re.search(
+        rf'<CustomField\s+Name="{re.escape(name)}"\s+Value="([^"]*)"\s*/?>',
+        xml_text,
+        flags=re.IGNORECASE
+    )
+    return m.group(1).strip() if m else None
+
+
+def _find_customfieldrow_valor_por_desc(xml_text: str, contains_text: str) -> str | None:
+    """
+    Busca un bloque CustomFieldRow donde haya un campo "Descripcion" que contenga contains_text
+    y retorna el Value del campo "Valor".
+    """
+    # match flexible: dentro del CustomFieldRow buscamos Name="Descripcion"...Value="...contains..."
+    # y luego en el mismo row buscamos Name="Valor"...Value="X"
+    pat = (
+        r'<CustomFieldRow\b[^>]*>.*?'
+        r'Name="Descripcion"\s+Value="([^"]*)"\s*/>.*?'
+        r'Name="Valor"\s+Value="([^"]+)"\s*/>.*?'
+        r'</CustomFieldRow>'
+    )
+    for m in re.finditer(pat, xml_text, flags=re.IGNORECASE | re.DOTALL):
+        desc = (m.group(1) or "").lower()
+        val = (m.group(2) or "").strip()
+        if contains_text.lower() in desc:
+            return val
+    return None
+
+
 def leer_datos_xml(path: str) -> dict | None:
     """
     Lee una factura UBL. Si es AttachedDocument intenta extraer el Invoice embebido.
     Si no hay Invoice embebido, NO crea fila (evita “fila mínima”).
     Ahora es tolerante a XML con caracteres ilegales o & sin escapar.
+
+    ✅ MEJORA: si vienen CustomFields (Hughes) para Ajuste/Valor a pagar:
+      - Retención en la fuente = Ajuste_Notas_Credito (si aplica)
+      - Total = Valor_Total_Pagar (si existe)
     """
+    xml_text_for_regex = ""  # texto del invoice para detectar CustomFields
+
     try:
         inner_xml = _extract_inner_invoice(path)
         if inner_xml:
+            xml_text_for_regex = inner_xml
             try:
                 root = ET.fromstring(inner_xml)
             except ET.ParseError:
                 root = ET.fromstring(_clean_xml_text(inner_xml))
         else:
-            root = _safe_parse_xml(path)
+            # si no hay invoice embebido, usamos el XML original del archivo
+            with open(path, "rb") as f:
+                raw = f.read()
+            try:
+                xml_text_for_regex = raw.decode("utf-8-sig", errors="replace")
+            except Exception:
+                xml_text_for_regex = raw.decode(errors="replace")
+            xml_text_for_regex = _clean_xml_text(xml_text_for_regex)
+
+            root = ET.fromstring(xml_text_for_regex)
             local = root.tag.split('}')[-1] if '}' in root.tag else root.tag
             if local == 'AttachedDocument':
                 errores.append(
                     f"AttachedDocument sin Invoice embebido: {os.path.basename(path)}"
                 )
                 return None
+
     except ET.ParseError as e:
         errores.append(f"XML mal formado '{path}': {e}")
         return None
@@ -246,7 +315,8 @@ def leer_datos_xml(path: str) -> dict | None:
     subtotal = convertir_a_numero(
         obtener_texto(root, './/cac:LegalMonetaryTotal/cbc:LineExtensionAmount', ns)
     )
-    total = convertir_a_numero(
+
+    total_base = convertir_a_numero(
         obtener_texto(root, './/cac:LegalMonetaryTotal/cbc:PayableAmount', ns)
     )
 
@@ -294,10 +364,41 @@ def leer_datos_xml(path: str) -> dict | None:
         elif tax_id == '07' or 'ica' in tax_name:
             reteica += amt
 
+    # normalizar retenciones a negativas (si venían positivas)
     reteiva = -abs(reteiva)
     reteica = -abs(reteica)
     rete_fuente = -abs(rete_fuente)
-    total += reteiva + reteica + rete_fuente
+
+    # Total calculado normal (UBL)
+    total_calc = total_base + reteiva + reteica + rete_fuente
+
+    # ----------------------------------------------------------------
+    # ✅ MEJORA: Hughes / CustomFields
+    # Si existe Ajuste_Notas_Credito (o fila de "Retefuente") y/o Valor_Total_Pagar,
+    # priorizamos esos valores para que cuadre con el PDF.
+    # ----------------------------------------------------------------
+    try:
+        # 1) Ajuste/Retefuente desde CustomFieldRow (más específico)
+        ajuste_retefuente = _find_customfieldrow_valor_por_desc(xml_text_for_regex, "retefuente")
+        # 2) Ajuste genérico desde CustomField
+        ajuste_notas = _find_customfield(xml_text_for_regex, "Ajuste_Notas_Credito")
+        ajuste = ajuste_retefuente or ajuste_notas
+
+        # 3) Total a pagar desde CustomField
+        valor_total_pagar = _find_customfield(xml_text_for_regex, "Valor_Total_Pagar")
+
+        if ajuste:
+            aj = float(_dec_from_str(ajuste))  # puede venir negativo
+            # si no venía rete_fuente por UBL, o preferimos el custom, lo aplicamos:
+            rete_fuente = aj
+            # y recalculamos total si no viene un total a pagar explícito
+            total_calc = total_base + reteiva + reteica + rete_fuente
+
+        if valor_total_pagar:
+            total_calc = float(_dec_from_str(valor_total_pagar))
+
+    except Exception as e:
+        errores.append(f"Error aplicando CustomFields (ajustes) en {os.path.basename(path)}: {e}")
 
     return {
         "Archivo":                os.path.basename(path),
@@ -320,7 +421,7 @@ def leer_datos_xml(path: str) -> dict | None:
         "Retención de IVA":       reteiva,
         "Retención de ICA":       reteica,
         "Retención en la fuente": rete_fuente,
-        "Total":                  total
+        "Total":                  total_calc
     }
 
 

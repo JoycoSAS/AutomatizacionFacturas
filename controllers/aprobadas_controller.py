@@ -9,12 +9,14 @@ from pathlib import Path
 from typing import List, Dict, Tuple
 
 from utils.fs_utils import borrar_pdfs_en_arbol
+from utils.processed_store import ProcessedStore  # ✅ NUEVO
 
 from config import (
     DATA_DIR, ARCHIVO_EXCEL, HISTORIAL_EXCEL,
     APROB_FOLDER_NAME, APROB_SEARCH_SINCE_DAYS, MATCH_PRIORIDAD,
     TMP_DIR,
     AUTO_STOP_MIN_PROCESADOS, AUTO_STOP_SIN_MATCH_CONSEC, AUTO_STOP_SIN_NUEVOS_CONSEC,
+    PROCESSED_MESSAGES_PATH, PROCESSED_MESSAGES_TTL_DAYS,  # ✅ NUEVO
 )
 
 from services.excel_service import (
@@ -40,7 +42,6 @@ from services.m365.mail_graph import (
 
 from utils.pdf_utils import extraer_texto_pdf, parse_identificadores_pdf, normalizar_fecha
 from utils.normalizacion_facturas import claves_normalizadas_factura
-
 from services.aprobaciones_service import sincronizar_aprobaciones_en_facturas
 
 # ✅ Workbook API
@@ -179,6 +180,9 @@ def run_desde_aprobadas(
     os.makedirs(TMP_DIR, exist_ok=True)
     os.makedirs(EXT_HOY, exist_ok=True)
 
+    # ✅ Store local anti-reproceso
+    store = ProcessedStore(PROCESSED_MESSAGES_PATH, ttl_days=PROCESSED_MESSAGES_TTL_DAYS)
+
     folder_id = get_folder_id_by_name("Inbox", APROB_FOLDER_NAME) or find_folder_id_anywhere(APROB_FOLDER_NAME)
     if not folder_id:
         print(f"[APROB] No se encontró la carpeta: {APROB_FOLDER_NAME!r}")
@@ -210,8 +214,15 @@ def run_desde_aprobadas(
         msg_id = msg["id"]
         subj   = msg.get("subject") or ""
 
+        # ✅ ANTI-REPROCESO: si ya lo procesamos antes, lo saltamos
+        if store.is_processed(msg_id):
+            print(f"⏭️  Mensaje ya procesado (store). Se omite. id={msg_id}")
+            continue
+
         pdf_atts = listar_adjuntos_pdf(msg_id)
         if not pdf_atts:
+            # Marcamos como procesado para no quedarnos en loop con emails raros
+            store.mark_processed(msg_id, {"status": "sin_pdf"})
             continue
 
         pdf = pdf_atts[0]
@@ -220,6 +231,7 @@ def run_desde_aprobadas(
 
         if not descargar_adjunto_por_id(msg_id, pdf["id"], pdf_tmp):
             print(f"[APROB] No pude descargar PDF {pdf_name}")
+            store.mark_processed(msg_id, {"status": "error_descarga_pdf", "pdf": pdf_name})
             continue
 
         texto     = extraer_texto_pdf(pdf_tmp)
@@ -235,19 +247,19 @@ def run_desde_aprobadas(
         if fecha_pdf:
             fecha_pdf = normalizar_fecha(fecha_pdf) or fecha_pdf
 
+        # Corte: si CUFE ya está en Excel, no buscar ZIP
         if cufe_pdf and cufe_pdf in { _norm_cufe(x) for x in cufes_existentes }:
             print(f"🔁 Factura ya registrada (CUFE en Excel). Se omite búsqueda de ZIP para {pdf_name}.")
             resumen.append((pdf_name, time.time() - t0, "ya registrado", 0))
+
+            # ✅ Guardar estado (para evitar re-loop por 403)
+            store.mark_processed(msg_id, {"status": "ya_registrado", "pdf": pdf_name, "cufe": cufe_pdf})
 
             sin_match_consec = 0
             sin_nuevos_consec += 1
             procesados += 1
 
-            try:
-                marcar_mensaje_como_leido(msg_id)
-            except Exception as e:
-                print(f"[APROB] No se pudo marcar como leído el mensaje: {e}")
-
+            marcar_mensaje_como_leido(msg_id)  # si falla no importa (store manda)
             if (procesados >= AUTO_STOP_MIN_PROCESADOS) and (sin_nuevos_consec >= AUTO_STOP_SIN_NUEVOS_CONSEC):
                 print("🛑 Deteniendo flujo: varios PDFs ya registrados/sin nuevos (optimización de tiempo).")
                 break
@@ -257,20 +269,22 @@ def run_desde_aprobadas(
         found_zip_name = None
         found_zip_bytes = None
 
+        # A) CUFE
         if cufe_pdf and cufe_pdf in idx_cufe:
             found_zip_name, found_zip_bytes = idx_cufe[cufe_pdf]
             found_match = True
         else:
+            # B) NUMERO+FECHA
             num_pdf = (ident_pdf.get("NUMERO") or "").strip()
             if num_pdf and fecha_pdf:
-                claves_pdf = claves_normalizadas_factura(num_pdf)
-                for k in claves_pdf:
+                for k in claves_normalizadas_factura(num_pdf):
                     key = (k, fecha_pdf)
                     if key in idx_nf:
                         found_zip_name, found_zip_bytes = idx_nf[key]
                         found_match = True
                         break
 
+        # C) Fallback por nombre
         if not found_match:
             pdf_base = Path(pdf_name).stem.lower()
             pdf_clean = re.sub(r"[^a-z0-9]", "", pdf_base)
@@ -280,7 +294,6 @@ def run_desde_aprobadas(
                 if zn in vistos:
                     continue
                 vistos.add(zn)
-
                 zbase = Path(zn).stem.lower()
                 zclean = re.sub(r"[^a-z0-9]", "", zbase)
                 if pdf_clean == zclean or pdf_clean in zclean or zclean in pdf_clean:
@@ -289,9 +302,13 @@ def run_desde_aprobadas(
                     print(f"🔄 Emparejado por nombre: {pdf_name} ↔ {zn}")
                     break
 
+        # Sin match
         if not found_match or not found_zip_name or not found_zip_bytes:
             print(f"❌ No se encontró ZIP que coincida para PDF {pdf_name}.")
             resumen.append((pdf_name, time.time() - t0, "sin match", 0))
+
+            # ✅ Guardar estado (así no se repite cada minuto por 403)
+            store.mark_processed(msg_id, {"status": "sin_match", "pdf": pdf_name, "cufe": cufe_pdf})
 
             sin_match_consec += 1
             sin_nuevos_consec = 0
@@ -302,10 +319,12 @@ def run_desde_aprobadas(
                 break
             continue
 
+        # Guardar ZIP local
         zip_local_path = Path(ADJ_HOY) / found_zip_name
         with open(zip_local_path, "wb") as f:
             f.write(found_zip_bytes)
 
+        # Procesamiento normal
         print(f"🗜️  Extrayendo {found_zip_name} ...")
         resultados = extraer_por_zip(ADJ_HOY, EXT_HOY)
         print("🧾 Procesando XMLs...")
@@ -352,6 +371,7 @@ def run_desde_aprobadas(
         except Exception as e:
             print(f"[APROB] Error al sincronizar aprobaciones: {e}")
 
+        # Subida a SharePoint (ZIPs/extraídos)
         print("☁️  Subiendo a SharePoint (desde aprobadas)...")
         if USE_DATE_SUBFOLDERS:
             sp_adj_root = f"{BASE_SP}/adjuntos/{fecha_local}"
@@ -372,11 +392,10 @@ def run_desde_aprobadas(
         else:
             upload_directory(EXT_HOY, sp_ext_root, mode="skip")
 
-        # ✅ Workbook API: append sin reemplazar el archivo
+        # Workbook API: append filas nuevas
         hubo_cambios_excel = (total_nuevos > 0) or (enriquecidas > 0)
         if hubo_cambios_excel and sp_excel:
             try:
-                # Tomamos nombres XML reales de la carpeta extraída para saber qué filas mandar
                 archivos_xml = set()
                 if ruta_obj and os.path.isdir(ruta_obj):
                     for fn in os.listdir(ruta_obj):
@@ -401,17 +420,23 @@ def run_desde_aprobadas(
         else:
             print("ℹ️ Excel sin cambios; no se actualiza facturas.xlsx en nube.")
 
-        # Historial se sube normal (siempre es seguro)
         if historial_rows and os.path.exists(HISTORIAL_EXCEL):
             upload_small_file(HISTORIAL_EXCEL, f"{sp_excel}/historial_ejecuciones.xlsx", mode="replace")
 
         print("🎉 Proceso por aprobadas finalizado para:", found_zip_name)
         resumen.append((pdf_name, time.time() - t0, "match", total_nuevos))
 
-        try:
-            marcar_mensaje_como_leido(msg_id)
-        except Exception as e:
-            print(f"[APROB] No se pudo marcar como leído el mensaje: {e}")
+        # ✅ Guardar estado final (el punto clave)
+        store.mark_processed(msg_id, {
+            "status": "ok",
+            "pdf": pdf_name,
+            "zip": found_zip_name,
+            "nuevos": int(total_nuevos),
+            "enriquecidas": int(enriquecidas),
+            "cufe": cufe_pdf,
+        })
+
+        marcar_mensaje_como_leido(msg_id)  # si falla no importa (store manda)
 
         sin_match_consec = 0
         if total_nuevos == 0:
@@ -426,6 +451,7 @@ def run_desde_aprobadas(
             print("🛑 Deteniendo flujo: varios PDFs con match pero sin nuevos registros (optimización de tiempo).")
             break
 
+    # Limpieza final
     try:
         n = borrar_pdfs_en_arbol(TMP_DIR)
         print(f"🧹 Limpieza temp_check: borrados {n} PDF(s).")
