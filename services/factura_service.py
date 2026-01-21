@@ -108,42 +108,108 @@ def _extract_inner_invoice(path: str) -> str | None:
     return None
 
 
-def _extraer_descripciones_completas(root: ET.Element) -> str:
+# ----------------------------
+# NUEVO: descripciones por IVA (supermercado / D1)
+# ----------------------------
+def _linea_descripcion(linea: ET.Element) -> str:
     """
-    Extrae la descripción de cada InvoiceLine probando:
-      1. Item/Description
-      2. Item/Name
-      3. InvoiceLine/Note
-      4. SellersItemIdentification/ID
-    Concatena con “; ”.
+    Busca descripción por línea:
+      1) Item/Description
+      2) Item/Name
+      3) InvoiceLine/Note
+      4) SellersItemIdentification/ID
     """
-    descripciones = []
-    for linea in root.findall('.//{*}InvoiceLine'):
-        texto = None
+    texto = None
 
-        nodo = linea.find('.//{*}Item/{*}Description')
+    nodo = linea.find('.//{*}Item/{*}Description')
+    if nodo is not None and nodo.text:
+        texto = nodo.text.strip()
+
+    if not texto:
+        nodo = linea.find('.//{*}Item/{*}Name')
         if nodo is not None and nodo.text:
             texto = nodo.text.strip()
 
-        if not texto:
-            nodo = linea.find('.//{*}Item/{*}Name')
-            if nodo is not None and nodo.text:
-                texto = nodo.text.strip()
+    if not texto:
+        nodo = linea.find('{*}Note')
+        if nodo is not None and nodo.text:
+            texto = nodo.text.strip()
 
-        if not texto:
-            nodo = linea.find('{*}Note')
-            if nodo is not None and nodo.text:
-                texto = nodo.text.strip()
+    if not texto:
+        nodo = linea.find('.//{*}SellersItemIdentification/{*}ID')
+        if nodo is not None and nodo.text:
+            texto = nodo.text.strip()
 
-        if not texto:
-            nodo = linea.find('.//{*}SellersItemIdentification/{*}ID')
-            if nodo is not None and nodo.text:
-                texto = nodo.text.strip()
+    return texto or ""
 
-        if texto:
-            descripciones.append(texto)
 
-    return "; ".join(descripciones)
+def _linea_iva_percent(linea: ET.Element) -> float | None:
+    """
+    Intenta encontrar el % IVA por línea.
+    D1 normalmente trae: InvoiceLine/TaxTotal/TaxSubtotal/TaxCategory/Percent
+    """
+    pct = linea.find('.//{*}TaxTotal/{*}TaxSubtotal/{*}TaxCategory/{*}Percent')
+    if pct is not None and pct.text:
+        try:
+            return float(str(pct.text).strip())
+        except Exception:
+            return None
+
+    pct2 = linea.find('.//{*}ClassifiedTaxCategory/{*}Percent')
+    if pct2 is not None and pct2.text:
+        try:
+            return float(str(pct2.text).strip())
+        except Exception:
+            return None
+
+    # Si no aparece, asumimos 0/None (muchas veces exento)
+    return None
+
+
+def _extraer_descripciones_por_iva(root: ET.Element) -> dict:
+    """
+    Devuelve:
+      - all: todas las líneas
+      - iva19: solo líneas con 19%
+      - iva5:  solo líneas con 5%
+      - iva0:  líneas 0% o sin TaxTotal/Percent (exentas / 0)
+    """
+    all_items: list[str] = []
+    iva19: list[str] = []
+    iva5: list[str] = []
+    iva0: list[str] = []
+
+    for linea in root.findall('.//{*}InvoiceLine'):
+        desc = _linea_descripcion(linea)
+        if not desc:
+            continue
+
+        # evitar duplicados manteniendo orden
+        if desc not in all_items:
+            all_items.append(desc)
+
+        pct = _linea_iva_percent(linea)
+        # None => lo tratamos como 0
+        if pct is None or abs(pct - 0.0) < 0.0001:
+            if desc not in iva0:
+                iva0.append(desc)
+        elif abs(pct - 5.0) < 0.01:
+            if desc not in iva5:
+                iva5.append(desc)
+        elif abs(pct - 19.0) < 0.01:
+            if desc not in iva19:
+                iva19.append(desc)
+        else:
+            # otros porcentajes raros: por ahora van al "all" y también a iva0
+            if desc not in iva0:
+                iva0.append(desc)
+
+    return {
+        "all": "; ".join(all_items),
+        "iva19": "; ".join(iva19),
+        "iva5": "; ".join(iva5),
+        "iva0": "; ".join(iva0),
+    }
 
 
 def _extraer_actividad_de_pdf(xml_path: str) -> str:
@@ -171,7 +237,7 @@ def _extraer_actividad_de_pdf(xml_path: str) -> str:
 
 
 # ----------------------------
-# NUEVO: Helpers CustomFields (Hughes y similares)
+# Helpers CustomFields (Hughes y similares)
 # ----------------------------
 def _dec_from_str(s: str | None) -> Decimal:
     if not s:
@@ -179,8 +245,6 @@ def _dec_from_str(s: str | None) -> Decimal:
     s = str(s).strip()
     if not s:
         return Decimal("0")
-    # soporta "-11697.48" o "336302.51"
-    # (si algún proveedor manda con coma, lo toleramos)
     s = s.replace(",", ".")
     try:
         return Decimal(s)
@@ -205,8 +269,6 @@ def _find_customfieldrow_valor_por_desc(xml_text: str, contains_text: str) -> st
     Busca un bloque CustomFieldRow donde haya un campo "Descripcion" que contenga contains_text
     y retorna el Value del campo "Valor".
     """
-    # match flexible: dentro del CustomFieldRow buscamos Name="Descripcion"...Value="...contains..."
-    # y luego en el mismo row buscamos Name="Valor"...Value="X"
     pat = (
         r'<CustomFieldRow\b[^>]*>.*?'
         r'Name="Descripcion"\s+Value="([^"]*)"\s*/>.*?'
@@ -230,6 +292,9 @@ def leer_datos_xml(path: str) -> dict | None:
     ✅ MEJORA: si vienen CustomFields (Hughes) para Ajuste/Valor a pagar:
       - Retención en la fuente = Ajuste_Notas_Credito (si aplica)
       - Total = Valor_Total_Pagar (si existe)
+
+    ✅ MEJORA D1/supermercado:
+      - Se extraen descripciones por IVA (19/5/0) para usarlas en Excel por concepto.
     """
     xml_text_for_regex = ""  # texto del invoice para detectar CustomFields
 
@@ -242,7 +307,6 @@ def leer_datos_xml(path: str) -> dict | None:
             except ET.ParseError:
                 root = ET.fromstring(_clean_xml_text(inner_xml))
         else:
-            # si no hay invoice embebido, usamos el XML original del archivo
             with open(path, "rb") as f:
                 raw = f.read()
             try:
@@ -290,7 +354,13 @@ def leer_datos_xml(path: str) -> dict | None:
         )
 
     numero = obtener_texto(root, './cbc:ID', ns)
-    descripcion_lineas = _extraer_descripciones_completas(root)
+
+    # ✅ Descripciones completas + por IVA
+    descs = _extraer_descripciones_por_iva(root)
+    descripcion_lineas = descs["all"]
+    descripcion_iva19 = descs["iva19"]
+    descripcion_iva5 = descs["iva5"]
+    descripcion_iva0 = descs["iva0"]
 
     nit = obtener_texto(
         root, './/cac:AccountingSupplierParty//cac:PartyLegalEntity/cbc:CompanyID', ns
@@ -372,26 +442,17 @@ def leer_datos_xml(path: str) -> dict | None:
     # Total calculado normal (UBL)
     total_calc = total_base + reteiva + reteica + rete_fuente
 
-    # ----------------------------------------------------------------
-    # ✅ MEJORA: Hughes / CustomFields
-    # Si existe Ajuste_Notas_Credito (o fila de "Retefuente") y/o Valor_Total_Pagar,
-    # priorizamos esos valores para que cuadre con el PDF.
-    # ----------------------------------------------------------------
+    # ✅ Hughes / CustomFields
     try:
-        # 1) Ajuste/Retefuente desde CustomFieldRow (más específico)
         ajuste_retefuente = _find_customfieldrow_valor_por_desc(xml_text_for_regex, "retefuente")
-        # 2) Ajuste genérico desde CustomField
         ajuste_notas = _find_customfield(xml_text_for_regex, "Ajuste_Notas_Credito")
         ajuste = ajuste_retefuente or ajuste_notas
 
-        # 3) Total a pagar desde CustomField
         valor_total_pagar = _find_customfield(xml_text_for_regex, "Valor_Total_Pagar")
 
         if ajuste:
             aj = float(_dec_from_str(ajuste))  # puede venir negativo
-            # si no venía rete_fuente por UBL, o preferimos el custom, lo aplicamos:
             rete_fuente = aj
-            # y recalculamos total si no viene un total a pagar explícito
             total_calc = total_base + reteiva + reteica + rete_fuente
 
         if valor_total_pagar:
@@ -414,7 +475,13 @@ def leer_datos_xml(path: str) -> dict | None:
         "Día":                    (fecha_text or "")[8:10],
         "Tipo de contribuyente":  tipo_contribuyente,
         "Actividad económica":    actividad_economica,
+
+        # ✅ descripciones
         "DescripcionLineas":      descripcion_lineas,
+        "DescripcionIVA19":       descripcion_iva19,
+        "DescripcionIVA5":        descripcion_iva5,
+        "DescripcionIVA0":        descripcion_iva0,
+
         "Subtotal":               subtotal,
         "IVA 5%":                 iva_5,
         "IVA 19%":                iva_19,

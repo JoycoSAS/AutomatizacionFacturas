@@ -59,7 +59,7 @@ def _rebuild_table_facturas() -> None:
     # ===== Ajuste visual =====
     DEFAULT_ROW_HEIGHT = 15
 
-    # Fijar altura de filas de datos (Excel Online deja de crecer si no hay saltos de línea)
+    # Fijar altura de filas de datos
     for r in range(2, max_row + 1):
         ws.row_dimensions[r].height = DEFAULT_ROW_HEIGHT
 
@@ -73,9 +73,8 @@ def _rebuild_table_facturas() -> None:
     desc_col = header_map.get("DESCRIPCIÓN")
     if desc_col:
         col_letter = get_column_letter(desc_col)
-        ws.column_dimensions[col_letter].width = 45  # ajusta si quieres
+        ws.column_dimensions[col_letter].width = 45
 
-        # sin wrap + alineación arriba
         align = Alignment(wrap_text=False, vertical="top")
         for r in range(2, max_row + 1):
             ws.cell(row=r, column=desc_col).alignment = align
@@ -122,23 +121,36 @@ def obtener_cufes_existentes() -> Set[str]:
 def _limpiar_descripcion(s: Any) -> str:
     """
     Quita saltos de línea reales que hacen que Excel Online agrande la fila.
-    Mantiene el estilo que tú quieres: separado por '; ' en la misma celda.
+    Mantiene el estilo: separado por '; ' en la misma celda.
     """
     if s is None or (isinstance(s, float) and pd.isna(s)):
         return ""
     txt = str(s)
 
-    # Normalizar saltos de línea a un separador único
     txt = txt.replace("\r\n", "\n").replace("\r", "\n")
     txt = txt.replace("\n", "; ")
 
-    # Colapsar espacios
     txt = re.sub(r"[ \t]+", " ", txt).strip()
-
-    # Evitar separadores repetidos
     txt = re.sub(r"(;\s*){2,}", "; ", txt).strip(" ;")
 
     return txt
+
+
+def _descripcion_por_concepto(d: Dict[str, Any], concepto: str) -> str:
+    """
+    ✅ Mejora supermercado/D1:
+    - IVA 19%: solo items 19%
+    - IVA 5%:  solo items 5%
+    - resto: descripción completa
+    """
+    full = d.get("DescripcionLineas", "") or ""
+
+    if concepto == "IVA 19%":
+        return d.get("DescripcionIVA19") or full
+    if concepto == "IVA 5%":
+        return d.get("DescripcionIVA5") or full
+
+    return full
 
 
 def guardar_en_excel(datos: List[Dict[str, Any]]) -> int:
@@ -158,28 +170,28 @@ def guardar_en_excel(datos: List[Dict[str, Any]]) -> int:
     registros_transformados: List[Dict[str, Any]] = []
 
     for d in datos:
-        base = {
-            "Archivo":               d.get("Archivo", ""),
-            "Empresa emisora":       d.get("Empresa emisora", ""),
-            "CUFE":                  d.get("CUFE", ""),
-            "Ciudad emisora":        d.get("Ciudad emisora", ""),
-            "Código ciudad":         d.get("Código ciudad", ""),
-            "NIT":                   d.get("NIT", ""),
-            "Cliente":               d.get("Cliente", ""),
-            "Número de factura":     d.get("Número de factura", ""),
-            "Año":                   d.get("Año", ""),
-            "Mes":                   d.get("Mes", ""),
-            "Día":                   d.get("Día", ""),
-            "Tipo de contribuyente": d.get("Tipo de contribuyente", ""),
-            "Actividad económica":   d.get("Actividad económica", ""),
-            "DESCRIPCIÓN":           _limpiar_descripcion(d.get("DescripcionLineas", "")),
-        }
-
         for medida in [
             "Subtotal", "IVA 5%", "IVA 19%",
             "Retención de IVA", "Retención de ICA",
             "Retención en la fuente", "Total"
         ]:
+            base = {
+                "Archivo":               d.get("Archivo", ""),
+                "Empresa emisora":       d.get("Empresa emisora", ""),
+                "CUFE":                  d.get("CUFE", ""),
+                "Ciudad emisora":        d.get("Ciudad emisora", ""),
+                "Código ciudad":         d.get("Código ciudad", ""),
+                "NIT":                   d.get("NIT", ""),
+                "Cliente":               d.get("Cliente", ""),
+                "Número de factura":     d.get("Número de factura", ""),
+                "Año":                   d.get("Año", ""),
+                "Mes":                   d.get("Mes", ""),
+                "Día":                   d.get("Día", ""),
+                "Tipo de contribuyente": d.get("Tipo de contribuyente", ""),
+                "Actividad económica":   d.get("Actividad económica", ""),
+                "DESCRIPCIÓN":           _limpiar_descripcion(_descripcion_por_concepto(d, medida)),
+            }
+
             fila = base.copy()
             fila["Concepto"] = medida
             fila["VALOR"] = d.get(medida, 0)
@@ -221,7 +233,6 @@ def guardar_en_excel(datos: List[Dict[str, Any]]) -> int:
                     .reset_index(drop=True)
         )
 
-    # Guardado seguro
     safe_save_pandas(
         final_df,
         ARCHIVO_EXCEL,
@@ -230,7 +241,6 @@ def guardar_en_excel(datos: List[Dict[str, Any]]) -> int:
         index=False,
     )
 
-    # Tabla + formato
     _rebuild_table_facturas()
 
     print(f"✅ Excel formateado y actualizado: {ARCHIVO_EXCEL}")

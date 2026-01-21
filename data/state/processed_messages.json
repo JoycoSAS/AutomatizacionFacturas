@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": 1768936914,
+  "updated_at": 1769015940,
   "items": {
     "AAMkADlmNGY2ZDI2LWM4ZTItNDJlNy04NDJhLTljNzllNjQ2YTQ0YgBGAAAAAABahaMbX7OoRLRV-mxR0YnFBwBBJoOs-aj_QbJ5PcJmsgDCAAAAATTcAABBJoOs-aj_QbJ5PcJmsgDCAAAJHtriAAA=": {
       "ts": 1768936086,
@@ -101,6 +101,58 @@
         "zip": "z09012824140852600000022.zip",
         "nuevos": 7,
         "enriquecidas": 7,
+        "cufe": "86f4c4b9fe5d8e8622869334335bcfd060ef2670c851d67f7c86ac3deb620f9ec6fbaf75393c79d8ef59de303add62a5"
+      }
+    },
+    "AAMkADlmNGY2ZDI2LWM4ZTItNDJlNy04NDJhLTljNzllNjQ2YTQ0YgBGAAAAAABahaMbX7OoRLRV-mxR0YnFBwBBJoOs-aj_QbJ5PcJmsgDCAAAAATTcAABBJoOs-aj_QbJ5PcJmsgDCAAAJHtrkAAA=": {
+      "ts": 1769011093,
+      "meta": {
+        "status": "ok",
+        "pdf": "fv090027696202126H8Y2154313_Daniel Andrés Leones.pdf",
+        "zip": "090027696202126H8Y2154313.zip",
+        "nuevos": 7,
+        "enriquecidas": 7,
+        "cufe": "facaeeccadeeafacaeeccadeeafecadceeadadeccefd1ad1aeda6a18013282154313202601141004308600675619cac4"
+      }
+    },
+    "AAMkADlmNGY2ZDI2LWM4ZTItNDJlNy04NDJhLTljNzllNjQ2YTQ0YgBGAAAAAABahaMbX7OoRLRV-mxR0YnFBwBBJoOs-aj_QbJ5PcJmsgDCAAAAATTcAABBJoOs-aj_QbJ5PcJmsgDCAAAJHtrlAAA=": {
+      "ts": 1769012414,
+      "meta": {
+        "status": "ok",
+        "pdf": "fv090027696202126I0H0317002_Daniel Andrés Leones.pdf",
+        "zip": "090027696202126I0H0317002.zip",
+        "nuevos": 7,
+        "enriquecidas": 7,
+        "cufe": "facaeeccadeeafacaeeccadeeafecadceeadadeccefeecdcdcacaaadeccdeccededaad1ad1aeda6a2701130031700220"
+      }
+    },
+    "AAMkADlmNGY2ZDI2LWM4ZTItNDJlNy04NDJhLTljNzllNjQ2YTQ0YgBGAAAAAABahaMbX7OoRLRV-mxR0YnFBwBBJoOs-aj_QbJ5PcJmsgDCAAAAATTcAABBJoOs-aj_QbJ5PcJmsgDCAAAJHtrmAAA=": {
+      "ts": 1769015927,
+      "meta": {
+        "status": "ok",
+        "pdf": "Representacion grafica_Daniel Andrés Leones.pdf",
+        "zip": "Factura-A515148008.zip",
+        "nuevos": 7,
+        "enriquecidas": 7,
+        "cufe": "5faf69104983f224e538d05e3325fe45b754fd5b7b358bb3876bb87b83bb7c39ff03d20e0a419ab83902578bcc7d51fd"
+      }
+    },
+    "AAMkADlmNGY2ZDI2LWM4ZTItNDJlNy04NDJhLTljNzllNjQ2YTQ0YgBGAAAAAABahaMbX7OoRLRV-mxR0YnFBwBBJoOs-aj_QbJ5PcJmsgDCAAAAATTcAABBJoOs-aj_QbJ5PcJmsgDCAAAJHtroAAA=": {
+      "ts": 1769015940,
+      "meta": {
+        "status": "ok",
+        "pdf": "fv090027696202126H8Y2154313_Daniel Andrés Leones.pdf",
+        "zip": "090027696202126H8Y2154313.zip",
+        "nuevos": 0,
+        "enriquecidas": 7,
+        "cufe": "facaeeccadeeafacaeeccadeeafecadceeadadeccefd1ad1aeda6a18013282154313202601141004308600675619cac4"
+      }
+    },
+    "AAMkADlmNGY2ZDI2LWM4ZTItNDJlNy04NDJhLTljNzllNjQ2YTQ0YgBGAAAAAABahaMbX7OoRLRV-mxR0YnFBwBBJoOs-aj_QbJ5PcJmsgDCAAAAATTcAABBJoOs-aj_QbJ5PcJmsgDCAAAJHtrpAAA=": {
+      "ts": 1769015940,
+      "meta": {
+        "status": "ya_registrado",
+        "pdf": "ad09012824140852600000022_Daniel Andrés Leones.pdf",
         "cufe": "86f4c4b9fe5d8e8622869334335bcfd060ef2670c851d67f7c86ac3deb620f9ec6fbaf75393c79d8ef59de303add62a5"
       }
     }
