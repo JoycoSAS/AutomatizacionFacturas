@@ -26,3 +26,9 @@ __pycache__/
 
 # Archivos ocultos o de respaldo
 ~$*
+
+
+# Estado / cache de ejecución
+data/state/
+data/state/*.json
+processed_messages.json
