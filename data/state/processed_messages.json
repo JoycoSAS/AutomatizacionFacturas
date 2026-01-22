@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": 1769015940,
+  "updated_at": 1769103504,
   "items": {
     "AAMkADlmNGY2ZDI2LWM4ZTItNDJlNy04NDJhLTljNzllNjQ2YTQ0YgBGAAAAAABahaMbX7OoRLRV-mxR0YnFBwBBJoOs-aj_QbJ5PcJmsgDCAAAAATTcAABBJoOs-aj_QbJ5PcJmsgDCAAAJHtriAAA=": {
       "ts": 1768936086,
@@ -154,6 +154,17 @@
         "status": "ya_registrado",
         "pdf": "ad09012824140852600000022_Daniel Andrés Leones.pdf",
         "cufe": "86f4c4b9fe5d8e8622869334335bcfd060ef2670c851d67f7c86ac3deb620f9ec6fbaf75393c79d8ef59de303add62a5"
+      }
+    },
+    "AAMkADlmNGY2ZDI2LWM4ZTItNDJlNy04NDJhLTljNzllNjQ2YTQ0YgBGAAAAAABahaMbX7OoRLRV-mxR0YnFBwBBJoOs-aj_QbJ5PcJmsgDCAAAAATTcAABBJoOs-aj_QbJ5PcJmsgDCAAAJHtr1AAA=": {
+      "ts": 1769103504,
+      "meta": {
+        "status": "ok",
+        "pdf": "900092385_18764098297031_BOPU130195134_01_Daniel Andrés Leones.pdf",
+        "zip": "Attachment-BOPU130195134.zip",
+        "nuevos": 7,
+        "enriquecidas": 7,
+        "cufe": "abcdeffebe2026cc23faccceccc2378069118cccecccfacaeeccadeeadeecffecaeedcfaca2026011880000000000032"
       }
     }
   }

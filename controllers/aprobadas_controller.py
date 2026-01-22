@@ -1,4 +1,3 @@
-# controllers/aprobadas_controller.py
 import os
 import io
 import re
@@ -7,6 +6,7 @@ import datetime
 import time
 from pathlib import Path
 from typing import List, Dict, Tuple
+import xml.etree.ElementTree as ET
 
 from utils.fs_utils import borrar_pdfs_en_arbol
 from utils.processed_store import ProcessedStore  # ✅ NUEVO
@@ -56,7 +56,7 @@ UPLOAD_MODE = "skip"
 
 def __re(pattern: str, text: str):
     import re as _re
-    return _re.search(pattern, text, flags=_re.IGNORECASE)
+    return _re.search(pattern, text, flags=_re.IGNORECASE | _re.DOTALL)
 
 
 def _norm_cufe(s: str) -> str:
@@ -67,21 +67,121 @@ def _norm_cufe(s: str) -> str:
     return s
 
 
+_CTRL_REGEX = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
+_AMP_FIX = re.compile(r"&(?!(?:[a-zA-Z]+|#\d+|#x[0-9A-Fa-f]+);)")
+
+
+def _clean_xml_text(txt: str) -> str:
+    txt = _CTRL_REGEX.sub("", txt)
+    txt = _AMP_FIX.sub("&amp;", txt)
+    return txt
+
+
+def _extract_inner_invoice_text(xml_text: str) -> str | None:
+    """
+    En AttachedDocument suele venir un Invoice embebido como texto dentro de <cbc:Description><![CDATA[ ... ]]></cbc:Description>
+    o directamente como XML string.
+    Intentamos sacar el bloque <Invoice ... </Invoice> (o CreditNote/DebitNote).
+    """
+    if not xml_text:
+        return None
+
+    m = re.search(
+        r'(<\s*(?:Invoice|CreditNote|DebitNote)\b.*?</\s*(?:Invoice|CreditNote|DebitNote)\s*>)',
+        xml_text,
+        flags=re.IGNORECASE | re.DOTALL
+    )
+    if m:
+        inner = m.group(1)
+        return _clean_xml_text(inner)
+
+    return None
+
+
 def _parse_ident_from_xml_bytes(xml_bytes: bytes) -> Dict[str, str]:
-    text = xml_bytes.decode("utf-8", errors="ignore")
+    """
+    ✅ Mejorado:
+    - Soporta AttachedDocument (ParentDocumentID / Invoice embebido)
+    - Toma el ID correcto del Invoice (no el primer <cbc:ID> que aparezca en direcciones)
+    """
     ident: Dict[str, str] = {}
 
-    m = __re(r"<(?:cbc:|)UUID[^>]*>([^<]{20,})</", text)
-    if m:
-        ident["CUFE"] = _norm_cufe(m.group(1).strip())
+    try:
+        text = xml_bytes.decode("utf-8-sig", errors="replace")
+    except Exception:
+        text = xml_bytes.decode("utf-8", errors="ignore")
 
-    m = __re(r"<(?:cbc:|)ID[^>]*>([^<]{3,})</", text)
-    if m:
-        ident["NUMERO"] = m.group(1).strip()
+    text = _clean_xml_text(text)
 
-    m = __re(r"<(?:cbc:|)IssueDate[^>]*>([^<]+)</", text)
-    if m:
-        ident["FECHA"] = normalizar_fecha(m.group(1).strip()) or m.group(1).strip()
+    # 1) Si hay Invoice embebido, parsearlo primero
+    inner = _extract_inner_invoice_text(text)
+    if inner:
+        try:
+            r = ET.fromstring(inner)
+            id_el = r.find("./{*}ID")
+            uuid_el = r.find(".//{*}UUID")
+            issue_el = r.find("./{*}IssueDate")
+
+            if uuid_el is not None and uuid_el.text:
+                ident["CUFE"] = _norm_cufe(uuid_el.text.strip())
+
+            if id_el is not None and id_el.text:
+                ident["NUMERO"] = id_el.text.strip()
+
+            if issue_el is not None and issue_el.text:
+                ident["FECHA"] = normalizar_fecha(issue_el.text.strip()) or issue_el.text.strip()
+
+            return ident
+        except Exception:
+            pass
+
+    # 2) Parse del XML raíz (puede ser Invoice o AttachedDocument)
+    try:
+        root = ET.fromstring(text)
+    except Exception:
+        # fallback regex muy básico si el XML está roto
+        m = __re(r"<(?:cbc:|)UUID[^>]*>([^<]{20,})</", text)
+        if m:
+            ident["CUFE"] = _norm_cufe(m.group(1).strip())
+        m = __re(r"<(?:cbc:|)IssueDate[^>]*>([^<]+)</", text)
+        if m:
+            ident["FECHA"] = normalizar_fecha(m.group(1).strip()) or m.group(1).strip()
+        # ParentDocumentID es buen "numero" en AttachedDocument
+        m = __re(r"<(?:cbc:|)ParentDocumentID[^>]*>([^<]{3,})</", text)
+        if m:
+            ident["NUMERO"] = m.group(1).strip()
+        return ident
+
+    local = root.tag.split("}")[-1] if "}" in root.tag else root.tag
+
+    if local.lower() == "attacheddocument":
+        # ParentDocumentID suele ser el ID real del documento
+        pd = root.find(".//{*}ParentDocumentID")
+        if pd is not None and pd.text:
+            ident["NUMERO"] = pd.text.strip()
+
+        uuid_el = root.find(".//{*}UUID")
+        if uuid_el is not None and uuid_el.text:
+            ident["CUFE"] = _norm_cufe(uuid_el.text.strip())
+
+        # a veces la IssueDate está en el attached, si no, quedará vacía
+        issue_el = root.find(".//{*}IssueDate")
+        if issue_el is not None and issue_el.text:
+            ident["FECHA"] = normalizar_fecha(issue_el.text.strip()) or issue_el.text.strip()
+
+        return ident
+
+    # Si ya es Invoice/CreditNote normal
+    id_el = root.find("./{*}ID")
+    uuid_el = root.find(".//{*}UUID")
+    issue_el = root.find("./{*}IssueDate")
+
+    if uuid_el is not None and uuid_el.text:
+        ident["CUFE"] = _norm_cufe(uuid_el.text.strip())
+    if id_el is not None and id_el.text:
+        ident["NUMERO"] = id_el.text.strip()
+    if issue_el is not None and issue_el.text:
+        ident["FECHA"] = normalizar_fecha(issue_el.text.strip()) or issue_el.text.strip()
 
     return ident
 
@@ -221,7 +321,6 @@ def run_desde_aprobadas(
 
         pdf_atts = listar_adjuntos_pdf(msg_id)
         if not pdf_atts:
-            # Marcamos como procesado para no quedarnos en loop con emails raros
             store.mark_processed(msg_id, {"status": "sin_pdf"})
             continue
 
@@ -237,6 +336,14 @@ def run_desde_aprobadas(
         texto     = extraer_texto_pdf(pdf_tmp)
         ident_pdf = parse_identificadores_pdf(texto)
 
+        # --- ✅ numero alterno de aprobaciones (Contrato), si viene ---
+        numero_aprob = (ident_pdf.get("NUMERO_APROB") or "").strip()
+        if not numero_aprob:
+            subj_num = _numero_from_subject(subj)
+            # si el subject trae un número distinto al NUMERO del PDF, lo usamos como aprobación
+            if subj_num and subj_num.strip() and subj_num.strip() != (ident_pdf.get("NUMERO") or "").strip():
+                numero_aprob = subj_num.strip()
+
         if not ident_pdf.get("NUMERO"):
             ident_pdf.setdefault("NUMERO", _numero_from_subject(subj))
         if not ident_pdf.get("FECHA"):
@@ -251,15 +358,13 @@ def run_desde_aprobadas(
         if cufe_pdf and cufe_pdf in { _norm_cufe(x) for x in cufes_existentes }:
             print(f"🔁 Factura ya registrada (CUFE en Excel). Se omite búsqueda de ZIP para {pdf_name}.")
             resumen.append((pdf_name, time.time() - t0, "ya registrado", 0))
-
-            # ✅ Guardar estado (para evitar re-loop por 403)
             store.mark_processed(msg_id, {"status": "ya_registrado", "pdf": pdf_name, "cufe": cufe_pdf})
 
             sin_match_consec = 0
             sin_nuevos_consec += 1
             procesados += 1
 
-            marcar_mensaje_como_leido(msg_id)  # si falla no importa (store manda)
+            marcar_mensaje_como_leido(msg_id)
             if (procesados >= AUTO_STOP_MIN_PROCESADOS) and (sin_nuevos_consec >= AUTO_STOP_SIN_NUEVOS_CONSEC):
                 print("🛑 Deteniendo flujo: varios PDFs ya registrados/sin nuevos (optimización de tiempo).")
                 break
@@ -306,8 +411,6 @@ def run_desde_aprobadas(
         if not found_match or not found_zip_name or not found_zip_bytes:
             print(f"❌ No se encontró ZIP que coincida para PDF {pdf_name}.")
             resumen.append((pdf_name, time.time() - t0, "sin match", 0))
-
-            # ✅ Guardar estado (así no se repite cada minuto por 403)
             store.mark_processed(msg_id, {"status": "sin_match", "pdf": pdf_name, "cufe": cufe_pdf})
 
             sin_match_consec += 1
@@ -347,6 +450,15 @@ def run_desde_aprobadas(
                 continue
 
             regs, errores_zip = procesar_xml_en_carpeta(ruta)
+
+            # ✅ CLAVE: si existe "numero_aprob" (Contrato), lo usamos como "Número de factura"
+            # para que el cruce con Aprobaciones funcione.
+            if regs and numero_aprob:
+                for d in regs:
+                    old = str(d.get("Número de factura", "")).strip()
+                    if old != numero_aprob and len(numero_aprob) >= 5:
+                        d["Número de factura"] = numero_aprob
+
             nuevos = guardar_en_excel(regs) if regs else 0
             total_nuevos += nuevos
 
@@ -426,7 +538,7 @@ def run_desde_aprobadas(
         print("🎉 Proceso por aprobadas finalizado para:", found_zip_name)
         resumen.append((pdf_name, time.time() - t0, "match", total_nuevos))
 
-        # ✅ Guardar estado final (el punto clave)
+        # ✅ Guardar estado final
         store.mark_processed(msg_id, {
             "status": "ok",
             "pdf": pdf_name,
@@ -436,7 +548,7 @@ def run_desde_aprobadas(
             "cufe": cufe_pdf,
         })
 
-        marcar_mensaje_como_leido(msg_id)  # si falla no importa (store manda)
+        marcar_mensaje_como_leido(msg_id)
 
         sin_match_consec = 0
         if total_nuevos == 0:

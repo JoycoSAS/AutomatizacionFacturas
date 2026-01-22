@@ -1,4 +1,3 @@
-# utils/pdf_utils.py
 import re
 from typing import Optional, Dict
 
@@ -61,7 +60,7 @@ _RE_CUFE_SIMPLE = re.compile(
 _RE_FEC1 = re.compile(r"(\d{4}[-/]\d{2}[-/]\d{2})")
 _RE_FEC2 = re.compile(r"(\d{2}[-/]\d{2}[-/]\d{4})")
 
-# Fecha en formato "DD MM YYYY" (muy común en PDFs como el tuyo)
+# Fecha en formato "DD MM YYYY" (muy común en PDFs)
 _RE_FEC3 = re.compile(r"\b(\d{2})\s+(\d{2})\s+(\d{4})\b")
 
 
@@ -231,6 +230,45 @@ def _pick_best_numero(texto: str) -> Optional[str]:
     return None
 
 
+# --------------------------------------------------------
+# ✅ NUEVO: Extraer "Contrato" / "Paga con este número" / "Referencia de pago"
+# (Para facturas tipo UNE/servicios donde Aprobaciones usa el contrato)
+# --------------------------------------------------------
+
+_RE_CONTRATO = re.compile(r"\bContrato\b[^0-9]{0,30}(\d{5,15})", re.IGNORECASE)
+_RE_PAGA_CON_ESTE_NUM = re.compile(r"\bPaga\s+con\s+este\s+n[uú]mero\b[^0-9]{0,30}(\d{5,15})", re.IGNORECASE)
+_RE_REF_PAGO = re.compile(
+    r"\bReferencia\s+de\s+pago\b[^0-9]{0,30}([0-9]{4,}(?:[-–—/][0-9A-Za-z]{2,})?)",
+    re.IGNORECASE
+)
+
+
+def _extraer_numero_aprobacion(texto: str) -> Optional[str]:
+    """
+    Busca un identificador alterno para cruce con Aprobaciones:
+      - Contrato 21359670
+      - Paga con este número 21359670
+      - Referencia de pago 9570534325-37 (si aplica)
+    Retorna el candidato más "usable" (prioriza Contrato).
+    """
+    if not texto:
+        return None
+
+    m = _RE_CONTRATO.search(texto)
+    if m:
+        return (m.group(1) or "").strip()
+
+    m = _RE_PAGA_CON_ESTE_NUM.search(texto)
+    if m:
+        return (m.group(1) or "").strip()
+
+    m = _RE_REF_PAGO.search(texto)
+    if m:
+        return (m.group(1) or "").strip()
+
+    return None
+
+
 def normalizar_fecha(fecha_str: str) -> Optional[str]:
     """Devuelve fecha normalizada a YYYY-MM-DD si es posible."""
     try:
@@ -251,27 +289,23 @@ def normalizar_fecha(fecha_str: str) -> Optional[str]:
 def _extraer_cufe_cercano_a_label(texto: str) -> Optional[str]:
     """
     Busca un CUFE (hex 80-120) después de la palabra CUFE/UUID
-    dentro de una ventana corta, evitando capturar otro hex largo “por ahí”.
+    dentro de una ventana corta.
     """
     if not texto:
         return None
 
-    # Buscar “CUFE” o “UUID” y revisar lo que viene después
     m = re.search(r"\b(CUFE|UUID)\b", texto, flags=re.IGNORECASE)
     if not m:
         return None
 
-    # Ventana corta después del label
     after = texto[m.end(): m.end() + 600]
 
-    # Buscar el primer bloque hex suficientemente largo
     mhex = re.search(r"([0-9a-fA-F][0-9a-fA-F\s\-]{70,160})", after)
     if not mhex:
         return None
 
     cufe = _clean_hex_chunks(mhex.group(1))
 
-    # Preferimos CUFE de 96 exactos (estándar). Si viene >96, tomamos los primeros 96 (no los últimos).
     if len(cufe) >= 96:
         return cufe[:96]
 
@@ -282,34 +316,25 @@ def _extraer_fecha_factura_por_label(texto: str) -> Optional[str]:
     """
     Intenta sacar la fecha de la factura cerca del label 'Fecha'
     (y evita 'vigencia').
-    Soporta:
-      - Fecha 2025-07-04 / 2025/07/04
-      - Fecha 04 07 2025
-      - Fecha: 04/07/2025
     """
     if not texto:
         return None
 
-    # Buscar ocurrencias de "Fecha" y evaluar contexto
     for m in re.finditer(r"\bFecha\b", texto, flags=re.IGNORECASE):
         ctx = texto[m.start(): m.start() + 200].lower()
-        # Si la palabra "vigencia" está muy cerca, no es la fecha de factura
         if "vigencia" in ctx:
             continue
 
         frag = texto[m.end(): m.end() + 200]
 
-        # YYYY-MM-DD o YYYY/MM/DD
         m1 = _RE_FEC1.search(frag)
         if m1:
             return normalizar_fecha(m1.group(1))
 
-        # DD/MM/YYYY
         m2 = _RE_FEC2.search(frag)
         if m2:
             return normalizar_fecha(m2.group(1))
 
-        # DD MM YYYY
         m3 = _RE_FEC3.search(frag)
         if m3:
             d, mo, y = m3.group(1), m3.group(2), m3.group(3)
@@ -321,12 +346,13 @@ def _extraer_fecha_factura_por_label(texto: str) -> Optional[str]:
 def parse_identificadores_pdf(texto: str) -> Dict[str, str]:
     """
     Extrae CUFE (preferido) y, como respaldo, Número y Fecha.
-    Retorna dict con llaves posibles: {"CUFE": "...", "NUMERO": "...", "FECHA": "YYYY-MM-DD"}
+    Además extrae NUMERO_APROB (Contrato / Paga con este número / Referencia de pago)
+    para cruce con la tabla de aprobaciones.
     """
     out: Dict[str, str] = {}
     texto = _normalize_text(texto or "")
 
-    # --- 1) CUFE cercano al label (MÁS confiable para tu caso) ---
+    # --- 1) CUFE cercano al label ---
     cufe_label = _extraer_cufe_cercano_a_label(texto)
     if cufe_label and len(cufe_label) == 96:
         out["CUFE"] = cufe_label
@@ -340,24 +366,29 @@ def parse_identificadores_pdf(texto: str) -> Dict[str, str]:
             if len(cleaned_hex) >= 96:
                 out["CUFE"] = cleaned_hex[:96]
 
-    # --- 3) Fallback: buscar un hex largo, pero SOLO si no hay CUFE aún ---
+    # --- 3) Fallback: buscar un hex largo ---
     if "CUFE" not in out:
         flat = _clean_hex_chunks(texto)
         m = re.search(r"([0-9a-f]{96})", flat)
         if m:
             out["CUFE"] = m.group(1)
 
-    # --- 4) Número de factura ---
+    # --- 4) Número principal (normalmente el de factura/ID) ---
     numero = _pick_best_numero(texto)
     if numero:
         out["NUMERO"] = numero
 
-    # --- 5) Fecha de factura por label ---
+    # --- 4.1) ✅ Número alterno para aprobaciones (Contrato/Ref pago) ---
+    num_aprob = _extraer_numero_aprobacion(texto)
+    if num_aprob:
+        out["NUMERO_APROB"] = num_aprob
+
+    # --- 5) Fecha por label ---
     fecha = _extraer_fecha_factura_por_label(texto)
     if fecha:
         out["FECHA"] = fecha
 
-    # --- 6) Fallback de fecha (GENÉRICO; puede capturar vigencias, por eso va al final) ---
+    # --- 6) Fallback genérico de fecha ---
     if "FECHA" not in out:
         m1 = _RE_FEC1.search(texto)
         if m1:
@@ -375,6 +406,7 @@ def parse_identificadores_pdf(texto: str) -> Dict[str, str]:
     print("\n===== DEBUG PDF PARSE =====")
     print(f"→ CUFE detectado: {out.get('CUFE')}")
     print(f"→ NUMERO detectado: {out.get('NUMERO')}")
+    print(f"→ NUMERO_APROB detectado: {out.get('NUMERO_APROB')}")
     print(f"→ FECHA detectada: {out.get('FECHA')}")
     print("===========================\n")
 
