@@ -55,7 +55,7 @@ def _safe_parse_xml(path: str) -> ET.Element:
 
 def _extract_inner_invoice(path: str) -> str | None:
     """
-    Devuelve el XML del Invoice embebido si existe en un AttachedDocument.
+    Devuelve el XML del Invoice/CreditNote/DebitNote embebido si existe en un AttachedDocument.
     Soporta:
       - <EmbeddedDocumentBinaryObject> (base64 con el XML)
       - <ExternalReference>/<Description> (XML escapado)
@@ -109,14 +109,35 @@ def _extract_inner_invoice(path: str) -> str | None:
 
 
 # ----------------------------
-# NUEVO: descripciones por IVA (supermercado / D1)
+# Helpers: detectar tipo documento y líneas (Invoice/CreditNote/DebitNote)
+# ----------------------------
+def _local_name(tag: str) -> str:
+    return tag.split("}")[-1] if "}" in tag else tag
+
+
+def _iter_lineas_documento(root: ET.Element) -> list[ET.Element]:
+    """
+    Devuelve las líneas del documento según tipo:
+      - InvoiceLine
+      - CreditNoteLine
+      - DebitNoteLine
+    """
+    for xp in ('.//{*}InvoiceLine', './/{*}CreditNoteLine', './/{*}DebitNoteLine'):
+        lines = root.findall(xp)
+        if lines:
+            return lines
+    return []
+
+
+# ----------------------------
+# DESCRIPCIONES por línea / IVA (D1 y también aplica a NC/ND)
 # ----------------------------
 def _linea_descripcion(linea: ET.Element) -> str:
     """
     Busca descripción por línea:
       1) Item/Description
       2) Item/Name
-      3) InvoiceLine/Note
+      3) Line/Note
       4) SellersItemIdentification/ID
     """
     texto = None
@@ -146,7 +167,9 @@ def _linea_descripcion(linea: ET.Element) -> str:
 def _linea_iva_percent(linea: ET.Element) -> float | None:
     """
     Intenta encontrar el % IVA por línea.
-    D1 normalmente trae: InvoiceLine/TaxTotal/TaxSubtotal/TaxCategory/Percent
+    Suele venir en:
+      - Line/TaxTotal/TaxSubtotal/TaxCategory/Percent
+      - Item/ClassifiedTaxCategory/Percent
     """
     pct = linea.find('.//{*}TaxTotal/{*}TaxSubtotal/{*}TaxCategory/{*}Percent')
     if pct is not None and pct.text:
@@ -162,7 +185,6 @@ def _linea_iva_percent(linea: ET.Element) -> float | None:
         except Exception:
             return None
 
-    # Si no aparece, asumimos 0/None (muchas veces exento)
     return None
 
 
@@ -172,24 +194,22 @@ def _extraer_descripciones_por_iva(root: ET.Element) -> dict:
       - all: todas las líneas
       - iva19: solo líneas con 19%
       - iva5:  solo líneas con 5%
-      - iva0:  líneas 0% o sin TaxTotal/Percent (exentas / 0)
+      - iva0:  líneas 0% o sin Percent (exentas / 0)
     """
     all_items: list[str] = []
     iva19: list[str] = []
     iva5: list[str] = []
     iva0: list[str] = []
 
-    for linea in root.findall('.//{*}InvoiceLine'):
+    for linea in _iter_lineas_documento(root):
         desc = _linea_descripcion(linea)
         if not desc:
             continue
 
-        # evitar duplicados manteniendo orden
         if desc not in all_items:
             all_items.append(desc)
 
         pct = _linea_iva_percent(linea)
-        # None => lo tratamos como 0
         if pct is None or abs(pct - 0.0) < 0.0001:
             if desc not in iva0:
                 iva0.append(desc)
@@ -200,7 +220,7 @@ def _extraer_descripciones_por_iva(root: ET.Element) -> dict:
             if desc not in iva19:
                 iva19.append(desc)
         else:
-            # otros porcentajes raros: por ahora van al "all" y también a iva0
+            # porcentajes raros: por ahora se consideran "otros/0"
             if desc not in iva0:
                 iva0.append(desc)
 
@@ -253,9 +273,7 @@ def _dec_from_str(s: str | None) -> Decimal:
 
 
 def _find_customfield(xml_text: str, name: str) -> str | None:
-    """
-    Busca <CustomField Name="X" Value="Y" />
-    """
+    """Busca <CustomField Name="X" Value="Y" />"""
     m = re.search(
         rf'<CustomField\s+Name="{re.escape(name)}"\s+Value="([^"]*)"\s*/?>',
         xml_text,
@@ -283,20 +301,62 @@ def _find_customfieldrow_valor_por_desc(xml_text: str, contains_text: str) -> st
     return None
 
 
+# ----------------------------
+# IVA: evitar doble conteo (documento vs líneas)
+# ----------------------------
+def _sumar_iva_porcentaje(root: ET.Element, ns: dict, pct_obj: float) -> float:
+    """
+    Primero suma IVA a nivel documento (./cac:TaxTotal/...), para evitar duplicar con líneas.
+    Si no encuentra nada, cae a suma por líneas (.//...) como fallback.
+    """
+    total = 0.0
+
+    # A) Preferido: nivel documento (NO duplica)
+    subs_doc = root.findall('./cac:TaxTotal/cac:TaxSubtotal', ns)
+    if subs_doc:
+        for tax in subs_doc:
+            amt = convertir_a_numero(obtener_texto(tax, './cbc:TaxAmount', ns))
+            pct_text = obtener_texto(tax, './cac:TaxCategory/cbc:Percent', ns)
+            try:
+                pct = float(pct_text)
+                if abs(pct - pct_obj) < 0.01:
+                    total += amt
+            except Exception:
+                continue
+        return total
+
+    # B) Fallback: por líneas (si el proveedor NO trae TaxTotal a nivel documento)
+    subs_any = root.findall('.//cac:TaxTotal/cac:TaxSubtotal', ns)
+    for tax in subs_any:
+        amt = convertir_a_numero(obtener_texto(tax, './cbc:TaxAmount', ns))
+        pct_text = obtener_texto(tax, './cac:TaxCategory/cbc:Percent', ns)
+        try:
+            pct = float(pct_text)
+            if abs(pct - pct_obj) < 0.01:
+                total += amt
+        except Exception:
+            continue
+
+    return total
+
+
 def leer_datos_xml(path: str) -> dict | None:
     """
-    Lee una factura UBL. Si es AttachedDocument intenta extraer el Invoice embebido.
-    Si no hay Invoice embebido, NO crea fila (evita “fila mínima”).
-    Ahora es tolerante a XML con caracteres ilegales o & sin escapar.
+    Lee un documento UBL:
+      - Invoice
+      - CreditNote (NC)
+      - DebitNote (ND)
 
-    ✅ MEJORA: si vienen CustomFields (Hughes) para Ajuste/Valor a pagar:
-      - Retención en la fuente = Ajuste_Notas_Credito (si aplica)
-      - Total = Valor_Total_Pagar (si existe)
+    Si es AttachedDocument intenta extraer el documento embebido.
+    Si no hay documento embebido, NO crea fila (evita “fila mínima”).
 
-    ✅ MEJORA D1/supermercado:
-      - Se extraen descripciones por IVA (19/5/0) para usarlas en Excel por concepto.
+    ✅ Mejoras incluidas:
+      - tolerante a XML con caracteres ilegales o & sin escapar
+      - CustomFields (Hughes) Ajuste/Valor_Total_Pagar
+      - D1/supermercado: descripciones por IVA (19/5/0)
+      - NC/ND: soporte de líneas CreditNoteLine/DebitNoteLine y NO duplicar IVA
     """
-    xml_text_for_regex = ""  # texto del invoice para detectar CustomFields
+    xml_text_for_regex = ""
 
     try:
         inner_xml = _extract_inner_invoice(path)
@@ -316,10 +376,10 @@ def leer_datos_xml(path: str) -> dict | None:
             xml_text_for_regex = _clean_xml_text(xml_text_for_regex)
 
             root = ET.fromstring(xml_text_for_regex)
-            local = root.tag.split('}')[-1] if '}' in root.tag else root.tag
+            local = _local_name(root.tag)
             if local == 'AttachedDocument':
                 errores.append(
-                    f"AttachedDocument sin Invoice embebido: {os.path.basename(path)}"
+                    f"AttachedDocument sin documento embebido: {os.path.basename(path)}"
                 )
                 return None
 
@@ -334,6 +394,9 @@ def leer_datos_xml(path: str) -> dict | None:
         'cbc': 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2',
         'cac': 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2'
     }
+
+    # Tipo doc (solo informativo / debug si lo necesitas)
+    tipo_doc = _local_name(root.tag).lower()  # invoice / creditnote / debitnote
 
     emisor = obtener_texto(
         root, './/cac:AccountingSupplierParty/cac:Party/cac:PartyName/cbc:Name', ns
@@ -355,7 +418,7 @@ def leer_datos_xml(path: str) -> dict | None:
 
     numero = obtener_texto(root, './cbc:ID', ns)
 
-    # ✅ Descripciones completas + por IVA
+    # ✅ Descripciones completas + por IVA (Invoice/CreditNote/DebitNote)
     descs = _extraer_descripciones_por_iva(root)
     descripcion_lineas = descs["all"]
     descripcion_iva19 = descs["iva19"]
@@ -404,18 +467,9 @@ def leer_datos_xml(path: str) -> dict | None:
     if not actividad_economica:
         actividad_economica = _extraer_actividad_de_pdf(path)
 
-    iva_5 = iva_19 = 0.0
-    for tax in root.findall('./cac:TaxTotal/cac:TaxSubtotal', ns):
-        amt = convertir_a_numero(obtener_texto(tax, './cbc:TaxAmount', ns))
-        pct_text = obtener_texto(tax, './cac:TaxCategory/cbc:Percent', ns)
-        try:
-            pct = float(pct_text)
-            if abs(pct - 5.0) < 0.01:
-                iva_5 += amt
-            elif abs(pct - 19.0) < 0.01:
-                iva_19 += amt
-        except Exception:
-            continue
+    # ✅ IVA sin duplicar (documento primero, líneas solo si no hay)
+    iva_5 = _sumar_iva_porcentaje(root, ns, 5.0)
+    iva_19 = _sumar_iva_porcentaje(root, ns, 19.0)
 
     reteiva = reteica = rete_fuente = 0.0
     for tax in root.findall('./cac:WithholdingTaxTotal/cac:TaxSubtotal', ns):
@@ -488,7 +542,7 @@ def leer_datos_xml(path: str) -> dict | None:
         "Retención de IVA":       reteiva,
         "Retención de ICA":       reteica,
         "Retención en la fuente": rete_fuente,
-        "Total":                  total_calc
+        "Total":                  total_calc,
     }
 
 
