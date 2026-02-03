@@ -47,3 +47,9 @@ PROCESSED_MESSAGES_PATH = os.path.join(STATE_DIR, "processed_messages.json")
 
 # (opcional) TTL por defecto (días)
 PROCESSED_MESSAGES_TTL_DAYS = 20
+
+# ==========================
+# ✅ NUEVO: AttachmentIndexStore (ZIP históricos)
+# ==========================
+ATTACHMENT_INDEX_PATH = os.path.join(STATE_DIR, "attachment_index_store.json")
+ATTACHMENT_INDEX_TTL_DAYS = 365

@@ -5,6 +5,7 @@ import re
 import zipfile
 import datetime
 import time
+import shutil
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 import xml.etree.ElementTree as ET
@@ -12,6 +13,7 @@ import xml.etree.ElementTree as ET
 from utils.fs_utils import borrar_pdfs_en_arbol
 from utils.processed_store import ProcessedStore
 from utils.text_normalizer import normalize_text
+from utils.attachment_index_store import AttachmentIndexStore  # ✅ NUEVO
 
 from config import (
     DATA_DIR, ARCHIVO_EXCEL, HISTORIAL_EXCEL,
@@ -19,6 +21,7 @@ from config import (
     TMP_DIR,
     AUTO_STOP_MIN_PROCESADOS, AUTO_STOP_SIN_MATCH_CONSEC, AUTO_STOP_SIN_NUEVOS_CONSEC,
     PROCESSED_MESSAGES_PATH, PROCESSED_MESSAGES_TTL_DAYS,
+    ATTACHMENT_INDEX_PATH, ATTACHMENT_INDEX_TTL_DAYS,  # ✅ NUEVO
 )
 
 # ✅ (opcionales) si no existen en tu config, no rompe: se usan defaults
@@ -67,6 +70,54 @@ ADJ_HOY = os.path.join(DATA_DIR, "adjuntos", "hoy")
 EXT_HOY = os.path.join(DATA_DIR, "extraidos", "hoy")
 
 USE_DATE_SUBFOLDERS = False
+
+
+# ✅ NUEVO: limpiar ZIPs viejos para que extraer_por_zip() NO procese basura
+def _limpiar_adj_hoy() -> int:
+    """
+    Borra únicamente archivos .zip dentro de ADJ_HOY.
+    Retorna cuántos ZIPs borró.
+    """
+    borrados = 0
+    try:
+        if not os.path.isdir(ADJ_HOY):
+            return 0
+        for fn in os.listdir(ADJ_HOY):
+            if fn.lower().endswith(".zip"):
+                try:
+                    os.remove(os.path.join(ADJ_HOY, fn))
+                    borrados += 1
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return borrados
+
+
+# ✅ NUEVO: limpiar extraídos viejos para que NO se suba basura a SharePoint
+def _limpiar_ext_hoy() -> int:
+    """
+    Borra TODO el contenido dentro de EXT_HOY (carpetas y archivos).
+    Retorna cuántos elementos (entradas directas) intentó borrar.
+    """
+    borrados = 0
+    try:
+        if not os.path.isdir(EXT_HOY):
+            return 0
+
+        for name in os.listdir(EXT_HOY):
+            p = os.path.join(EXT_HOY, name)
+            try:
+                if os.path.isdir(p):
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
+                    os.remove(p)
+                borrados += 1
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return borrados
 
 
 def __re(pattern: str, text: str):
@@ -205,7 +256,8 @@ def _peek_ident_xml_from_zip_bytes(zip_bytes: bytes) -> List[Dict[str, str]]:
 
 def _build_zip_index(
     since_days: int,
-    max_zip_buscar: int
+    max_zip_buscar: int,
+    aidx: AttachmentIndexStore  # ✅ NUEVO
 ) -> Tuple[Dict[str, Tuple[str, bytes]], Dict[Tuple[str, str], Tuple[str, bytes]]]:
     idx_cufe: Dict[str, Tuple[str, bytes]] = {}
     idx_nf: Dict[Tuple[str, str], Tuple[str, bytes]] = {}
@@ -228,14 +280,22 @@ def _build_zip_index(
     print(f"📦 Prefetch ZIPs: {len(candidatos)} mensajes con adjuntos (ventana {since_days} día(s))")
 
     for imsg in candidatos:
-        zips = listar_adjuntos_zip(imsg["id"])
+        mid = imsg.get("id")
+        if not mid:
+            continue
+
+        zips = listar_adjuntos_zip(mid)
         if not zips:
             continue
 
         for z in zips:
-            zname = z.get("name") or f"{z['id']}.zip"
+            zid = z.get("id")
+            if not zid:
+                continue
+
+            zname = z.get("name") or f"{zid}.zip"
             tmp_zip = os.path.join(TMP_DIR, f"prefetch_{zname}")
-            if not descargar_adjunto_por_id(imsg["id"], z["id"], tmp_zip):
+            if not descargar_adjunto_por_id(mid, zid, tmp_zip):
                 continue
 
             try:
@@ -255,6 +315,20 @@ def _build_zip_index(
 
                 if fec:
                     fec = normalizar_fecha(fec) or fec
+
+                # ✅ NUEVO: persistimos referencia del ZIP (para meses después)
+                try:
+                    aidx.upsert_zip(
+                        cufe=cufe,
+                        numero=num,
+                        fecha=fec,
+                        msg_id=mid,
+                        att_id=zid,
+                        att_name=zname,
+                        received_dt_iso=imsg.get("receivedDateTime", "") or "",
+                    )
+                except Exception as e:
+                    print(f"[AIDX] No pude upsert ZIP index: {e}")
 
                 if cufe and cufe not in idx_cufe:
                     idx_cufe[cufe] = (zname, zip_bytes)
@@ -349,24 +423,16 @@ def _buscar_pdf_en_correo_validacion_dian(
     since_days: int,
     top_msgs: int = 50
 ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """
-    Busca el PDF real dentro de INBOX cuyo asunto contenga CONTABILIDAD_INBOX_SUBJECT_KEY,
-    robusto con tildes/case-insensitive.
-    IMPORTANTÍSIMO: este fallback NO depende de listar_mensajes_en_carpeta()
-    (porque esa función en tu proyecto trae solo NO leídos).
-    """
     os.makedirs(os.path.join(TMP_DIR, "conta15"), exist_ok=True)
 
     key_norm = normalize_text(CONTABILIDAD_INBOX_SUBJECT_KEY)
 
-    # 1) Intento con Graph Search "DIAN" (rápido)
     msgs = buscar_mensajes_inbox_por_asunto(
         asunto_contiene="DIAN",
         top=top_msgs,
         since_days=since_days
     ) or []
 
-    # 2) Fallback: pedir "Inbox" amplio (si tu buscar_mensajes... permite asunto vacío)
     if not msgs:
         print("[CONTA15] Graph search no devolvió nada. Intento fallback pidiendo INBOX sin filtro de asunto...")
         msgs = buscar_mensajes_inbox_por_asunto(
@@ -377,10 +443,8 @@ def _buscar_pdf_en_correo_validacion_dian(
 
     if not msgs:
         print("[CONTA15] ❌ No pude listar Inbox (ni por DIAN ni por fallback).")
-        print("👉 Esto confirma que en mail_graph.py estás filtrando demasiado (ej: solo no leídos).")
         return None, None, None
 
-    # 3) Filtrar localmente por asunto normalizado
     filtrados = []
     for m in msgs:
         subj = (m.get("subject") or "")
@@ -393,7 +457,6 @@ def _buscar_pdf_en_correo_validacion_dian(
             print(f"   - subj: {x.get('subject','')!r}")
         return None, None, None
 
-    # 4) Recorrer adjuntos PDF y validar por CUFE/NUMERO/nombre
     for m in filtrados:
         mid = m.get("id")
         if not mid:
@@ -442,7 +505,7 @@ def _extraer_descripciones_items_pdf(texto: str) -> str:
                 return i
         return -1
 
-    idx_desc = find_idx(r"^Descripci[oó]n$")  # típico
+    idx_desc = find_idx(r"^Descripci[oó]n$")
     if idx_desc < 0:
         idx_desc = find_idx(r"Descripci[oó]n")
     if idx_desc < 0:
@@ -574,6 +637,15 @@ def run_desde_aprobadas(
 
     store = ProcessedStore(PROCESSED_MESSAGES_PATH, ttl_days=PROCESSED_MESSAGES_TTL_DAYS)
 
+    # ✅ NUEVO: store del índice histórico de ZIPs
+    aidx = AttachmentIndexStore(ATTACHMENT_INDEX_PATH, ttl_days=ATTACHMENT_INDEX_TTL_DAYS)
+    try:
+        purged = aidx.purge()
+        if purged:
+            print(f"🧹 [AIDX] Purge index: removidas {purged} entradas viejas.")
+    except Exception:
+        pass
+
     folder_id = get_folder_id_by_name("Inbox", APROB_FOLDER_NAME) or find_folder_id_anywhere(APROB_FOLDER_NAME)
     if not folder_id:
         print(f"[APROB] No se encontró la carpeta: {APROB_FOLDER_NAME!r}")
@@ -585,7 +657,7 @@ def run_desde_aprobadas(
         print("ℹ️ No hay mensajes no leídos con aprobaciones recientes.")
         return
 
-    idx_cufe, idx_nf = _build_zip_index(since_days=since_days, max_zip_buscar=max_zip_buscar)
+    idx_cufe, idx_nf = _build_zip_index(since_days=since_days, max_zip_buscar=max_zip_buscar, aidx=aidx)
 
     cufes_existentes = obtener_cufes_existentes()
     print(f"ℹ️ CUFEs ya registrados en facturas.xlsx: {len(cufes_existentes)}")
@@ -790,6 +862,42 @@ def run_desde_aprobadas(
                     print(f"🔄 Emparejado por nombre: {pdf_name} ↔ {zn}")
                     break
 
+        # ✅ NUEVO FALLBACK: usar índice persistente si el ZIP es viejo
+        if not found_match or not found_zip_name or not found_zip_bytes:
+            entry = None
+
+            if cufe_pdf:
+                entry = aidx.find_zip_by_cufe(cufe_pdf)
+
+            if not entry:
+                num_pdf = (ident_pdf.get("NUMERO") or "").strip()
+                if num_pdf and fecha_pdf:
+                    entry = aidx.find_zip_by_num_fecha(num_pdf, fecha_pdf)
+
+            if entry:
+                try:
+                    zname = entry.get("att_name") or "factura.zip"
+                    mid = entry.get("msg_id")
+                    aid = entry.get("att_id")
+
+                    if mid and aid:
+                        print(f"🧠 [AIDX] Encontré ZIP histórico: {zname} (descargando directo por IDs)...")
+                        tmp_zip = os.path.join(TMP_DIR, f"aidx_{zname}")
+                        ok = descargar_adjunto_por_id(mid, aid, tmp_zip)
+                        if ok and os.path.exists(tmp_zip):
+                            with open(tmp_zip, "rb") as f:
+                                found_zip_bytes = f.read()
+                            try:
+                                os.remove(tmp_zip)
+                            except Exception:
+                                pass
+
+                            found_zip_name = zname
+                            found_match = True
+                            print(f"✅ [AIDX] ZIP histórico listo en memoria: {found_zip_name}")
+                except Exception as e:
+                    print(f"⚠️ [AIDX] Falló descarga ZIP histórico: {e}")
+
         if not found_match or not found_zip_name or not found_zip_bytes:
             print(f"❌ No se encontró ZIP que coincida para PDF {pdf_name}.")
             resumen.append((pdf_name, time.time() - t0, "sin match", 0))
@@ -803,6 +911,15 @@ def run_desde_aprobadas(
                 print("🛑 Deteniendo flujo: varios PDFs consecutivos sin match (optimización de tiempo).")
                 break
             continue
+
+        # ✅ LIMPIEZAS: ADJ_HOY y EXT_HOY ANTES del ZIP actual
+        b1 = _limpiar_adj_hoy()
+        if b1:
+            print(f"🧹 Limpieza ADJ_HOY: borrados {b1} ZIP(s) viejos.")
+
+        b2 = _limpiar_ext_hoy()
+        if b2:
+            print(f"🧹 Limpieza EXT_HOY: borrados {b2} elemento(s) viejos.")
 
         zip_local_path = Path(ADJ_HOY) / found_zip_name
         with open(zip_local_path, "wb") as f:
