@@ -21,18 +21,21 @@ def _h(session_id: Optional[str] = None) -> Dict[str, str]:
 class ExcelWorkbookGraph:
     """
     Escribe en un Excel en SharePoint usando Graph Workbook API (sin reemplazar el archivo).
-    Ideal para que el Excel esté abierto en Excel Online y no crashee el flujo.
+    ✅ Permite que el Excel esté abierto en Excel Online sin romper el flujo.
+    ✅ Soporta drive_id opcional (por defecto usa SP_DRIVE_ID -> DRIVE_ID).
     """
 
-    def __init__(self, sp_excel_rel_path: str):
-        """
-        sp_excel_rel_path ejemplo:
-          "Innovacion/08. Pruebas proyectos/autoFacturas/excel/facturas.xlsx"
-        """
+    def __init__(self, sp_excel_rel_path: str, drive_id: Optional[str] = None):
+        self.drive_id = (drive_id or DRIVE_ID or "").strip()
+        if not self.drive_id:
+            raise RuntimeError("No hay DRIVE_ID disponible para Workbook API (SP_DRIVE_ID).")
+
         self.sp_excel_rel_path = sp_excel_rel_path.strip().strip("/")
-        item = get_item_by_path(self.sp_excel_rel_path)
+
+        item = get_item_by_path(self.sp_excel_rel_path, drive_id=self.drive_id)
         self.item_id = item["id"]
-        self.base = f"{GRAPH}/drives/{DRIVE_ID}/items/{self.item_id}/workbook"
+
+        self.base = f"{GRAPH}/drives/{self.drive_id}/items/{self.item_id}/workbook"
 
     def create_session(self, persist_changes: bool = True) -> str:
         url = f"{self.base}/createSession"
@@ -96,10 +99,7 @@ class ExcelWorkbookGraph:
 
     @staticmethod
     def _align_rows_to_table(header: List[str], rows_dicts: List[Dict]) -> List[List]:
-        out = []
-        for d in rows_dicts:
-            out.append([d.get(col, "") for col in header])
-        return out
+        return [[d.get(col, "") for col in header] for d in rows_dicts]
 
     def append_rows_dedup(
         self,
@@ -108,9 +108,10 @@ class ExcelWorkbookGraph:
         key_cols: Tuple[str, str] = ("Archivo", "Concepto"),
     ) -> int:
         """
-        1) Lee tabla en nube
-        2) Dedupe por key_cols
-        3) Inserta solo nuevas
+        1) Abre sesión workbook
+        2) Lee tabla en nube
+        3) Dedupe por key_cols
+        4) Inserta solo nuevas
         """
         if not rows_dicts:
             return 0

@@ -1,258 +1,211 @@
 # services/aprobaciones_service.py
 """
-Sincroniza datos de Aprobaciones (Radicado, Proyecto) desde el Excel de PA en SharePoint
-hacia el Excel local `facturas.xlsx`, cruzando por "Número de factura".
+Sincroniza Radicado / ProyectoProceso desde el Excel de Radicados (SharePoint)
+hacia facturas.xlsx.
 
-Mejoras incluidas:
-- Normalización fuerte y multi-candidatos del "Número de factura" (tolerante a espacios/guiones/formato).
-- Asegura que las columnas 'Radicado' y 'ProyectoProceso' queden como primeras columnas.
-- Ordena todas las filas por 'Radicado' (numérico ascendente).
-- Reconstruye la tabla de Excel (TblFacturas) para evitar archivos dañados.
+✅ FIX CLAVE:
+- Ya NO detecta columnas con heurísticas propias (eso era lo que fallaba y daba:
+  "[RAD] Columnas no detectadas correctamente")
+- Ahora descarga el Excel de radicados al RADICADOS_LOCAL_PATH (config.py)
+  y reutiliza la lógica robusta de:
+    services/radicados_service.cargar_mapa_radicados()
+
+Resultado:
+- Si existe match por "Número de factura" (normalizado), llena:
+    Radicado, ProyectoProceso
+- Si no existe match, NO rompe, solo no actualiza.
 """
 
-import os
-import pandas as pd
+from __future__ import annotations
 
+import os
+from pathlib import Path
+
+import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.worksheet.table import Table, TableStyleInfo
 from openpyxl.utils import get_column_letter
+from dotenv import load_dotenv
 
 from config import (
-    ARCHIVO_EXCEL, TMP_DIR,
-    APROBACIONES_SP_RELATIVE_PATH, APROBACIONES_SHEET_NAME,
-    APROB_COL_NUMERO, APROB_COL_RAD, APROB_COL_PROY,
-    FACT_COL_NUMERO, FACT_COL_RAD, FACT_COL_PROY
+    ARCHIVO_EXCEL,
+    TMP_DIR,
+    # Radicados (SharePoint + local estandar)
+    RADICADOS_SP_RELATIVE_PATH,
+    RADICADOS_LOCAL_PATH,
+    # Columnas Facturas.xlsx
+    FACT_COL_NUMERO,
+    FACT_COL_RAD,
+    FACT_COL_PROY,
 )
+
 from services.m365.sp_graph import download_small_file
+from services.radicados_service import cargar_mapa_radicados
 from utils.safe_io import safe_save_pandas
-from utils.normalizacion_facturas import (
-    normalizar_texto_basico,
-    claves_normalizadas_factura,
-)
+from utils.normalizacion_facturas import normalizar_texto_basico
+
+load_dotenv()
+SP_DRIVE_ID_RADICADOS = (os.getenv("SP_DRIVE_ID_RADICADOS") or "").strip()
 
 
-# ---------------------------
-# Helpers columnas (encabezados)
-# ---------------------------
-
-def _flatten_names(names):
-    for n in names:
-        if isinstance(n, (list, tuple, set)):
-            for sub in n:
-                yield sub
-        else:
-            yield n
-
-
-def _find_col_idx(ws, wanted_names):
-    """
-    Busca el índice de columna (1-based) en la primera fila de la hoja.
-    Usa normalizar_texto_basico para comparar.
-    """
-    wanted = {normalizar_texto_basico(x) for x in _flatten_names(wanted_names)}
+# -------------------------------------------------
+# Helpers (Excel facturas)
+# -------------------------------------------------
+def _find_col(ws, header_row: int, wanted_name: str) -> int | None:
+    wanted = normalizar_texto_basico(wanted_name)
     for c in range(1, ws.max_column + 1):
-        h = ws.cell(row=1, column=c).value
-        if normalizar_texto_basico(h) in wanted:
+        h = ws.cell(row=header_row, column=c).value
+        if normalizar_texto_basico(h) == wanted:
             return c
     return None
 
 
 def _ensure_column(ws, header_name: str) -> int:
-    """
-    Devuelve el índice de la columna 'header_name'; si no existe, la crea al final.
-    """
-    hdrs = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
-    for i, h in enumerate(hdrs, start=1):
-        if normalizar_texto_basico(h) == normalizar_texto_basico(header_name):
-            return i
-    new_idx = ws.max_column + 1
-    ws.cell(row=1, column=new_idx, value=header_name)
-    return new_idx
+    # busca en la fila 1 (headers)
+    col = _find_col(ws, 1, header_name)
+    if col:
+        return col
+    new_c = ws.max_column + 1
+    ws.cell(row=1, column=new_c, value=header_name)
+    return new_c
 
 
-# ------------------------------------------
-# Post-proceso: ordenar y formatear con pandas
-# ------------------------------------------
-
-def _ordenar_y_formatear_por_radicado() -> None:
+def _ordenar_y_formatear_facturas():
     """
-    - Lee facturas.xlsx con pandas
-    - Mueve 'Radicado' y 'ProyectoProceso' al inicio (si existen)
-    - Ordena por 'Radicado' numérico ascendente (vacíos al final)
-    - Guarda con safe_save_pandas
-    - Reconstruye la tabla TblFacturas en la hoja 'Facturas'
+    Mantiene el Excel bonito:
+    - Radicado y ProyectoProceso al inicio
+    - Orden por Radicado (si es numérico)
+    - Tabla + freeze panes
     """
     if not os.path.exists(ARCHIVO_EXCEL):
         return
 
     df = pd.read_excel(ARCHIVO_EXCEL, sheet_name="Facturas", engine="openpyxl")
 
-    cols = list(df.columns)
+    prioridad = [c for c in [FACT_COL_RAD, FACT_COL_PROY] if c in df.columns]
+    resto = [c for c in df.columns if c not in prioridad]
+    df = df[prioridad + resto]
 
-    prioridad = [c for c in ["Radicado", "ProyectoProceso"] if c in cols]
-    resto = [c for c in cols if c not in prioridad]
-    if prioridad:
-        df = df[prioridad + resto]
-
-    if "Radicado" in df.columns:
-        def _rad_to_int(x):
-            if pd.isna(x):
-                return 10**12
+    if FACT_COL_RAD in df.columns:
+        def _rad_sort(x):
             s = str(x).strip()
-            if not s:
-                return 10**12
-            try:
-                return int(s)
-            except Exception:
-                return 10**12
+            return int(s) if s.isdigit() else 10**12
 
-        df = (
-            df.sort_values(
-                by="Radicado",
-                key=lambda s: s.map(_rad_to_int),
-                kind="mergesort"   # estable
-            )
-            .reset_index(drop=True)
-        )
+        df["_rad_sort"] = df[FACT_COL_RAD].apply(_rad_sort)
+        df = df.sort_values("_rad_sort").drop(columns="_rad_sort").reset_index(drop=True)
 
-    safe_save_pandas(
-        df,
-        ARCHIVO_EXCEL,
-        sheet_name="Facturas",
-        header=True,
-        index=False,
-    )
+    safe_save_pandas(df, ARCHIVO_EXCEL, sheet_name="Facturas")
 
     wb = load_workbook(ARCHIVO_EXCEL)
     ws = wb["Facturas"]
 
-    if hasattr(ws, "_tables") and ws._tables:
-        ws._tables = []
+    # recrear tabla
+    ws._tables = []
+    ref = f"A1:{get_column_letter(ws.max_column)}{ws.max_row}"
+    tbl = Table(displayName="TblFacturas", ref=ref)
+    tbl.tableStyleInfo = TableStyleInfo(name="TableStyleMedium9", showRowStripes=True)
 
-    max_row = ws.max_row
-    max_col = ws.max_column
-    last_col = get_column_letter(max_col)
-    table_ref = f"A1:{last_col}{max_row}"
-
-    tbl = Table(displayName="TblFacturas", ref=table_ref)
-    tbl.tableStyleInfo = TableStyleInfo(
-        name="TableStyleMedium9",
-        showFirstColumn=False,
-        showLastColumn=False,
-        showRowStripes=True,
-        showColumnStripes=False,
-    )
     ws.add_table(tbl)
     ws.freeze_panes = "A2"
-
     wb.save(ARCHIVO_EXCEL)
 
 
-# -------------------------------------
-# Función principal de sincronización
-# -------------------------------------
-
-def sincronizar_aprobaciones_en_facturas() -> int:
+# -------------------------------------------------
+# FUNCIÓN PRINCIPAL
+# -------------------------------------------------
+def sincronizar_aprobaciones_en_facturas(force_reload_radicados: bool = True) -> int:
     """
-    Descarga el Excel de Aprobaciones de SP a TMP_DIR,
-    cruza por Número de factura y completa 'Radicado' y 'ProyectoProceso'
-    en facturas.xlsx (solo si esas celdas están vacías).
-
-    Luego:
-      - Reordena columnas para que Radicado/ProyectoProceso sean las primeras.
-      - Ordena todas las filas por Radicado (numérico).
-      - Reconstruye la tabla TblFacturas.
-
-    Devuelve la cantidad de filas actualizadas.
+    1) Descarga el Excel de radicados desde SharePoint a RADICADOS_LOCAL_PATH
+    2) Construye mapa con cargar_mapa_radicados()
+    3) Aplica a facturas.xlsx (solo llena si está vacío)
     """
     if not os.path.exists(ARCHIVO_EXCEL):
         return 0
 
-    # 1) Descargar Excel de Aprobaciones
-    local_pa = os.path.join(TMP_DIR, "Aprobaciones_Facturas.xlsx")
-    ok = download_small_file(APROBACIONES_SP_RELATIVE_PATH, local_pa)
-    if not ok or not os.path.exists(local_pa):
-        print("[APROB] No se pudo descargar el Excel de aprobaciones; se omite cruce.")
+    if not SP_DRIVE_ID_RADICADOS:
+        print("[RAD] Falta SP_DRIVE_ID_RADICADOS en .env")
         return 0
 
-    # 2) Leer aprobaciones (PA)
-    wb_a = load_workbook(local_pa, data_only=True, read_only=True)
-    ws_a = wb_a[APROBACIONES_SHEET_NAME] if APROBACIONES_SHEET_NAME in wb_a.sheetnames else wb_a.active
+    # Asegura carpetas
+    Path(TMP_DIR).mkdir(parents=True, exist_ok=True)
+    Path(os.path.dirname(RADICADOS_LOCAL_PATH)).mkdir(parents=True, exist_ok=True)
 
-    col_num_a = _find_col_idx(ws_a, [APROB_COL_NUMERO, "numero de factura", "numerofactura"])
-    col_rad_a = _find_col_idx(ws_a, [APROB_COL_RAD, "radicado"])
-    col_proy_a = _find_col_idx(ws_a, [APROB_COL_PROY, "proyectoproceso", "proyecto/proceso", "proyecto proceso"])
-
-    if not (col_num_a and col_rad_a and col_proy_a):
-        print("[APROB] No se localizaron columnas esperadas en Aprobaciones.")
+    # 1) Descargar radicados al path estándar que ya usan los tests
+    ok = download_small_file(
+        sp_relative_path=RADICADOS_SP_RELATIVE_PATH,
+        local_path=RADICADOS_LOCAL_PATH,
+        drive_id=SP_DRIVE_ID_RADICADOS,
+    )
+    if not ok:
+        print("[RAD] No se pudo descargar el Excel de radicados.")
         return 0
 
-    # 2.1) Construir mapa: clave_normalizada -> (radicado, proyecto)
-    #      OJO: generamos varias claves por fila (tolerancia máxima)
-    mapa = {}
-    for r in ws_a.iter_rows(min_row=2, values_only=True):
-        raw_num = r[col_num_a - 1]
-        if raw_num is None:
-            continue
+    # 2) Mapa robusto (usa detección real del header row)
+    try:
+        mapa = cargar_mapa_radicados(force_reload=force_reload_radicados)
+    except Exception as e:
+        print(f"[RAD] Error cargando mapa de radicados: {e}")
+        return 0
 
-        rad = r[col_rad_a - 1]
-        proy = r[col_proy_a - 1]
+    if not mapa:
+        print("[RAD] Mapa de radicados vacío (0).")
+        return 0
 
-        # Generar múltiples claves normalizadas
-        for k in claves_normalizadas_factura(str(raw_num)):
-            # nos quedamos con el último (si PA repite factura, gana el último)
-            mapa[k] = (rad, proy)
-
-    # 3) Actualizar facturas.xlsx
+    # 3) Aplicar a facturas.xlsx
     wb_f = load_workbook(ARCHIVO_EXCEL)
-    ws_f = wb_f["Facturas"] if "Facturas" in wb_f.sheetnames else wb_f.active
+    ws_f = wb_f["Facturas"]
 
-    col_num_f = _find_col_idx(ws_f, [FACT_COL_NUMERO, "numero de factura", "numerofactura"])
-    if not col_num_f:
-        print("[APROB] No se encontró la columna de Número de factura en facturas.xlsx.")
+    col_num = _find_col(ws_f, 1, FACT_COL_NUMERO)
+    if not col_num:
+        print(f"[RAD] No existe columna '{FACT_COL_NUMERO}' en facturas.xlsx")
         return 0
 
     col_rad_f = _ensure_column(ws_f, FACT_COL_RAD)
     col_proy_f = _ensure_column(ws_f, FACT_COL_PROY)
 
-    actualizadas = 0
+    updated = 0
 
-    for row in range(2, ws_f.max_row + 1):
-        num_val = ws_f.cell(row=row, column=col_num_f).value
-        if num_val is None:
+    # Importante: la key del mapa ya viene normalizada desde radicados_service
+    # (se guarda como _norm_factura(num_raw)). Por eso aquí SOLO buscamos por
+    # el valor de la celda "Número de factura" pero usando la misma normalización
+    # indirectamente: radicados_service la aplica internamente al consultar.
+    #
+    # Para no re-importar buscar_radicado_y_proyecto por fila (más lento),
+    # usamos el mapa directo con normalización equivalente:
+    from services.radicados_service import _norm_factura as _norm_fact
+
+    for r in range(2, ws_f.max_row + 1):
+        val = ws_f.cell(r, col_num).value
+        if not val:
             continue
 
-        # Claves candidatas del valor local (facturas.xlsx)
-        claves_locales = claves_normalizadas_factura(str(num_val))
-        if not claves_locales:
+        key = _norm_fact(str(val))
+        if not key:
             continue
 
-        hit = None
-        for k in claves_locales:
-            if k in mapa:
-                hit = mapa[k]
-                break
-
-        if not hit:
+        if key not in mapa:
             continue
 
-        rad, proy = hit
-        wrote = False
+        rad, proy = mapa[key]
+        changed = False
 
-        if ws_f.cell(row=row, column=col_rad_f).value in (None, "") and rad not in (None, ""):
-            ws_f.cell(row=row, column=col_rad_f, value=rad)
-            wrote = True
+        if not ws_f.cell(r, col_rad_f).value and rad:
+            ws_f.cell(r, col_rad_f, rad)
+            changed = True
 
-        if ws_f.cell(row=row, column=col_proy_f).value in (None, "") and proy not in (None, ""):
-            ws_f.cell(row=row, column=col_proy_f, value=proy)
-            wrote = True
+        if not ws_f.cell(r, col_proy_f).value and proy:
+            ws_f.cell(r, col_proy_f, proy)
+            changed = True
 
-        if wrote:
-            actualizadas += 1
+        if changed:
+            updated += 1
 
     wb_f.save(ARCHIVO_EXCEL)
 
-    # 4) Reordenar columnas, ordenar por Radicado y reconstruir tabla
-    _ordenar_y_formatear_por_radicado()
+    if updated > 0:
+        _ordenar_y_formatear_facturas()
+        print(f"[RAD] ✅ Filas actualizadas en facturas.xlsx: {updated}")
+    else:
+        print("[RAD] ℹ️ No hubo cambios (sin match o ya estaban llenos).")
 
-    return actualizadas
+    return updated

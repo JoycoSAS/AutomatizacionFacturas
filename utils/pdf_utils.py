@@ -2,7 +2,7 @@
 import re
 import csv
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List
 
 # -----------------------------
 # PDF text extraction
@@ -256,7 +256,6 @@ def _norm_city_key(s: str) -> str:
     s = _strip_accents_upper(s)
     s = s.replace(".", "").replace(",", "").replace(";", "").replace(":", "")
     s = re.sub(r"\s+", " ", s).strip()
-    # normaliza "D C" -> "DC"
     s = re.sub(r"\bD\s*C\b", "DC", s)
     return s
 
@@ -265,12 +264,6 @@ def _cargar_codigos_ciudad() -> Dict[str, str]:
     Soporta CSV simple en:
       - data/codigos_ciudad.csv
       - codigos_ciudad.csv
-
-    Acepta encabezados:
-      ciudad,codigo
-      ciudad,codigo,depto_codigo,mun_codigo
-
-    También acepta separador ; o , (auto-detect).
     """
     candidates = [
         Path("data") / "codigos_ciudad.csv",
@@ -286,7 +279,6 @@ def _cargar_codigos_ciudad() -> Dict[str, str]:
             if not raw.strip():
                 return {}
 
-            # detectar delimitador
             sample = raw[:4096]
             try:
                 dialect = csv.Sniffer().sniff(sample, delimiters=",;|\t")
@@ -302,40 +294,31 @@ def _cargar_codigos_ciudad() -> Dict[str, str]:
                 if not row:
                     continue
                 row = [c.strip() for c in row if c is not None]
-
                 if not row or (len(row) == 1 and not row[0]):
                     continue
 
-                # detectar header
                 if header is None:
                     low = ",".join(row).lower()
                     if "ciudad" in low and "codigo" in low:
                         header = [c.strip().lower() for c in row]
                         continue
-                    header = []  # sin header, seguimos normal
+                    header = []
 
-                # si viene con header, ubicar columnas
                 if header:
-                    # encontrar indices
                     def idx(colname: str) -> int:
                         try:
                             return header.index(colname)
                         except Exception:
                             return -1
-
                     i_city = idx("ciudad")
                     i_code = idx("codigo")
                     if i_city < 0 or i_code < 0:
-                        # fallback: primeras dos columnas
                         i_city, i_code = 0, 1
-
                     if len(row) <= max(i_city, i_code):
                         continue
-
                     city_raw = row[i_city]
                     code = row[i_code]
                 else:
-                    # sin header: primeras 2 columnas
                     if len(row) < 2:
                         continue
                     city_raw = row[0]
@@ -344,13 +327,10 @@ def _cargar_codigos_ciudad() -> Dict[str, str]:
                 city_key = _norm_city_key(city_raw)
                 if city_key and code:
                     mapping[city_key] = code.strip()
-
-                    # alias extra: si termina en " DC", agregar variante sin DC (por si el PDF no lo trae)
                     if city_key.endswith(" DC"):
                         mapping.setdefault(city_key.replace(" DC", ""), code.strip())
 
             return mapping
-
         except Exception:
             return {}
 
@@ -395,14 +375,13 @@ def extraer_descripcion_items_pdf(texto: str) -> str:
 
     seg = lines[i_det:i_end]
 
-    # empezar DESPUÉS del header "Nro."
     i_nro = -1
     for i, ln in enumerate(seg):
         if re.fullmatch(r"Nro\.?", ln, flags=re.IGNORECASE):
             i_nro = i
             break
     if i_nro >= 0:
-        seg = seg[i_nro + 1 :]
+        seg = seg[i_nro + 1:]
 
     header_stop = set(map(str.lower, [
         "código", "codigo", "descripción", "descripcion", "u/m", "cantidad",
@@ -424,19 +403,16 @@ def extraer_descripcion_items_pdf(texto: str) -> str:
     def is_unit(s: str) -> bool:
         return bool(re.fullmatch(r"(UN|UND|KG|LT|GL|NIU|EA|H87|94|ZZ|GAL|LTS|LTR)", (s or "").strip().upper()))
 
-    descs = []
+    descs: List[str] = []
     i = 0
     while i < len(seg):
         ln = seg[i]
-
         if is_item_no(ln):
             i += 1
-
-            # saltar código numérico si viene
             if i < len(seg) and re.fullmatch(r"\d{1,20}", seg[i]):
                 i += 1
 
-            parts = []
+            parts: List[str] = []
             while i < len(seg):
                 cur = seg[i].strip()
                 cur_up = cur.upper()
@@ -456,7 +432,6 @@ def extraer_descripcion_items_pdf(texto: str) -> str:
                 parts.append(cur)
                 i += 1
 
-            # ✅ FIX: re.sub necesita (pattern, repl, string)
             joined = " ".join(parts)
             desc = re.sub(r"\s{2,}", " ", joined).strip()
             if desc:
@@ -464,7 +439,6 @@ def extraer_descripcion_items_pdf(texto: str) -> str:
         else:
             i += 1
 
-    # dedup preservando orden
     seen = set()
     out = []
     for d in descs:
@@ -482,14 +456,7 @@ def extraer_descripcion_items_pdf(texto: str) -> str:
 # --------------------------------------------------------
 def extraer_campos_basicos_pdf(texto: str) -> Dict[str, str]:
     """
-    Extrae campos de cabecera y descripción real de items desde PDF DIAN:
-      - Empresa emisora: Razón Social (sin Nombre Comercial)
-      - Ciudad emisora: desde "Municipio / Ciudad:"
-      - Tipo contribuyente: usa Régimen Fiscal (R-xx-xx) si existe, si no, el texto
-      - Actividad económica
-      - Cliente (Nombre o Razón Social del adquiriente)
-      - DescripcionLineas: items reales
-      - Código ciudad: lookup por CSV
+    Extrae campos de cabecera y descripción real de items desde PDF DIAN.
     """
     t = _clean_spaces(texto)
     lines = [ln.strip() for ln in t.split("\n") if ln.strip()]
@@ -509,7 +476,7 @@ def extraer_campos_basicos_pdf(texto: str) -> Dict[str, str]:
         i_ad = len(lines)
 
     em_lines = lines[i_em:i_ad]
-    ad_lines = lines[i_ad:i_ad + 200]
+    ad_lines = lines[i_ad:i_ad + 250]
 
     def find_after(prefix_pat: str, arr) -> str:
         for ln in arr:
@@ -518,13 +485,13 @@ def extraer_campos_basicos_pdf(texto: str) -> Dict[str, str]:
                 return (m.group(1) or "").strip()
         return ""
 
-    empresa = find_after(r"Raz[oó]n\s+Social:\s*(.+)", em_lines)
-    empresa = re.split(r"Nombre\s+Comercial\s*:", empresa, flags=re.IGNORECASE)[0].strip()
+    empresa = find_after(r"Raz[oó]n\s+Social:\s*(.+)", em_lines).strip()
+    if empresa:
+        empresa = re.split(r"Nombre\s+Comercial\s*:", empresa, flags=re.IGNORECASE)[0].strip()
 
     nit = find_after(r"Nit\s+del\s+Emisor:\s*([0-9\.\-]+)", em_lines)
     nit = re.sub(r"[^\d]", "", nit)
 
-    # ✅ Ciudad: primero intenta en bloque Emisor; si no, busca en todo el texto
     ciudad = find_after(r"Municipio\s*/\s*Ciudad:\s*(.+)", em_lines).strip()
     if not ciudad:
         m = re.search(r"Municipio\s*/\s*Ciudad:\s*(.+)", t, flags=re.IGNORECASE)
@@ -566,7 +533,6 @@ def _to_float_money(s: str) -> float:
 
     s = s.replace(" ", "")
     if "," in s and "." in s:
-        # detectar decimal
         if s.rfind(",") > s.rfind("."):
             s = s.replace(".", "").replace(",", ".")
         else:
@@ -586,38 +552,22 @@ def _extraer_totales_datos_totales_dian(texto: str) -> Dict[str, float]:
     """
     Para PDFs DIAN como el 1100:
     - Busca el bloque donde aparece "COP" y luego una columna de 13 valores.
-    - Asigna por orden oficial.
     """
     t = _clean_spaces(texto)
 
-    # buscamos el "COP" que antecede la columna real (normalmente aparece como línea sola)
     m = re.search(r"\nCOP\s*\n", t)
     if not m:
         return {}
 
     tail = t[m.end():]
+
     vals = re.findall(_MONEY, tail)
     if len(vals) < 13:
         return {}
 
-    # tomamos los primeros 13 valores (son los que corresponden a la columna COP)
     vals = vals[:13]
     nums = [_to_float_money(v) for v in vals]
 
-    # orden esperado en DIAN
-    # 0 Subtotal
-    # 1 Descuento detalle
-    # 2 Recargo detalle
-    # 3 Total Bruto Factura
-    # 4 IVA
-    # 5 INC
-    # 6 Bolsas
-    # 7 Otros impuestos
-    # 8 Total impuesto (=)
-    # 9 Total neto factura (=)
-    # 10 Descuento Global (-)
-    # 11 Recargo Global (+)
-    # 12 Total factura (=)
     return {
         "Subtotal": float(nums[0]),
         "IVA": float(nums[4]),
@@ -630,17 +580,10 @@ def _extraer_totales_datos_totales_dian(texto: str) -> Dict[str, float]:
 def extraer_totales_basicos_pdf(texto: str) -> Dict[str, float]:
     """
     Extrae Subtotal / IVA 19 / IVA 5 / Total.
-
-    ✅ Primero intenta modo DIAN (tabla Datos Totales), para evitar errores como:
-    - Total = Subtotal (cuando el regex agarra el primer número del bloque).
     """
-    # 1) intento DIAN robusto
     dian = _extraer_totales_datos_totales_dian(texto)
     if dian:
         iva_total = dian.get("IVA", 0.0)
-
-        # En PDFs DIAN normalmente no discrimina tarifa (5/19). Si no está explícito:
-        # - Ponemos el IVA en IVA 19% (como han venido quedando tus conceptos)
         return {
             "Subtotal": float(dian.get("Subtotal", 0.0) or 0.0),
             "IVA 19%": float(iva_total or 0.0),
@@ -648,7 +591,6 @@ def extraer_totales_basicos_pdf(texto: str) -> Dict[str, float]:
             "Total": float(dian.get("Total", 0.0) or 0.0),
         }
 
-    # 2) fallback genérico (si el PDF no es DIAN tabla)
     t = _clean_spaces(texto)
     low = t.lower()
 
@@ -664,7 +606,6 @@ def extraer_totales_basicos_pdf(texto: str) -> Dict[str, float]:
         rf"\bbase\b.*?{_MONEY}",
     ])
 
-    # IVA con porcentaje explícito
     iva19 = pick([
         rf"\biva\b.*?19%.*?{_MONEY}",
         rf"\b19%\b.*?{_MONEY}",
@@ -675,7 +616,6 @@ def extraer_totales_basicos_pdf(texto: str) -> Dict[str, float]:
         rf"\b5%\b.*?{_MONEY}",
     ])
 
-    # Total: priorizar "total neto factura" si existe
     total = pick([
         rf"\btotal\s+neto\s+factura\b.*?{_MONEY}",
         rf"\btotal\s+factura\b.*?{_MONEY}",

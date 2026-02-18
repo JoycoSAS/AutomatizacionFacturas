@@ -133,6 +133,28 @@ def _norm_cufe(s: str) -> str:
     return s
 
 
+def _cufe_is_valid(cufe: str) -> bool:
+    """
+    CUFE suele ser un hash hex largo (>= 40 chars). Si viene corto, suele ser falso positivo.
+    """
+    c = _norm_cufe(cufe or "")
+    return bool(c) and len(c) >= 40
+
+
+def _is_acta_filename(name: str) -> bool:
+    """
+    Detecta PDFs tipo Acta/constancia que NO deben usarse para match.
+    """
+    s = (name or "").lower()
+    s_clean = re.sub(r"\s+", " ", s)
+    bad_keys = [
+        "acta", "constancia", "certificado", "aprobacion", "aprobación",
+        "memorando", "oficio", "radicado", "soporte de radicacion", "soporte de radicación",
+        "documento", "comunicado"
+    ]
+    return any(k in s_clean for k in bad_keys)
+
+
 _CTRL_REGEX = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
 _AMP_FIX = re.compile(r"&(?!(?:[a-zA-Z]+|#\d+|#x[0-9A-Fa-f]+);)")
 
@@ -344,14 +366,30 @@ def _build_zip_index(
 
 
 # -------------------------------------------------------------------
-# ✅ Conteo/selección más confiable del "Número de factura" del asunto
+# ✅ Selección más confiable del "Número de factura" vs asunto
+#    FIX: si el PDF trae DDI-xxxxxx / RAD-xxxx (referencias) => se prefiere asunto
 # -------------------------------------------------------------------
 
-def _is_generic_numero(n: str) -> bool:
+# Prefijos típicos que NO son número de factura (radicados/referencias internas)
+_NON_INVOICE_PREFIXES = {"DDI", "RAD", "RDI", "RDC", "REC", "RCP", "DOC", "REF"}
+
+
+def _is_generic_or_non_invoice_numero(n: str) -> bool:
     n = (n or "").strip().upper()
     if not n:
         return True
-    return bool(re.match(r"^[A-Z]{1,4}-\d{1,3}$", n))
+
+    m = re.match(r"^([A-Z]{1,10})[-–—]?\s*(\d{3,})$", n)
+    if m:
+        pref = m.group(1).upper()
+        if pref in _NON_INVOICE_PREFIXES:
+            return True
+
+    # genérico muy corto tipo FE-1 / FV-12 etc (cuando se "corta" mal)
+    if re.match(r"^[A-Z]{1,4}-\d{1,3}$", n):
+        return True
+
+    return False
 
 
 def _prefer_subject_numero(pdf_num: str | None, subj_num: str | None) -> str | None:
@@ -363,9 +401,11 @@ def _prefer_subject_numero(pdf_num: str | None, subj_num: str | None) -> str | N
     if not pdf_num:
         return subj_num
 
-    if _is_generic_numero(pdf_num) and not _is_generic_numero(subj_num):
+    # ✅ FIX CLAVE: si el PDF trae DDI/RAD/etc, el asunto manda.
+    if _is_generic_or_non_invoice_numero(pdf_num) and not _is_generic_or_non_invoice_numero(subj_num):
         return subj_num
 
+    # si el asunto tiene más dígitos, suele ser el verdadero consecutivo
     if len(re.findall(r"\d", subj_num)) > len(re.findall(r"\d", pdf_num)):
         return subj_num
 
@@ -620,6 +660,131 @@ def _generar_registro_pdf_only(pdf_local_path: str, pdf_name: str) -> Dict[str, 
 
 
 # -------------------------------------------------------------------
+# ✅ NUEVO: Selección robusta del PDF correcto cuando hay múltiples PDFs
+# -------------------------------------------------------------------
+
+def _score_pdf_candidate(pdf_name: str, ident: Dict[str, str]) -> int:
+    """
+    Score para elegir el PDF correcto:
+    - Penaliza 'acta'
+    - Premia CUFE válido (hash largo)
+    - Premia número no genérico
+    - Premia fecha presente
+    """
+    score = 0
+    name = (pdf_name or "")
+
+    if _is_acta_filename(name):
+        score -= 200
+
+    # señales positivas por nombre
+    low = name.lower()
+    if "factura" in low:
+        score += 15
+    if "representacion" in low or "representación" in low:
+        score += 5
+    if "dian" in low:
+        score += 3
+
+    cufe = ident.get("CUFE") or ""
+    if _cufe_is_valid(cufe):
+        score += 150
+    elif cufe:
+        score += 10  # CUFE corto: algo pero no suficiente
+
+    num = (ident.get("NUMERO") or "").strip()
+    if num:
+        if _is_generic_or_non_invoice_numero(num):
+            score -= 15
+        else:
+            score += 25
+
+    fec = (ident.get("FECHA") or "").strip()
+    if fec:
+        score += 10
+
+    # si el "NUMERO" detectado parece basura tipo "Proyecto 900"
+    if re.search(r"\bproyecto\b", (num or "").lower()):
+        score -= 50
+
+    return score
+
+
+def _seleccionar_mejor_pdf(msg_id: str, subj: str, pdf_atts: List[dict]) -> Tuple[Optional[dict], Optional[str], Optional[dict]]:
+    """
+    Descarga cada PDF, parsea ident, calcula score y retorna:
+      (att_elegido, pdf_tmp_path, ident_elegido)
+    """
+    os.makedirs(TMP_DIR, exist_ok=True)
+
+    subj_num = _numero_from_subject(subj)
+    best_att = None
+    best_path = None
+    best_ident = None
+    best_score = -10**9
+
+    for i, att in enumerate(pdf_atts, start=1):
+        aid = att.get("id")
+        if not aid:
+            continue
+
+        aname = att.get("name") or f"{aid}.pdf"
+
+        # nombre temporal único por mensaje (evita colisiones)
+        safe_name = re.sub(r"[^A-Za-z0-9_.\- ]", "_", aname)
+        tmp_path = os.path.join(TMP_DIR, f"{msg_id[:8]}_{i}_{safe_name}")
+
+        ok = descargar_adjunto_por_id(msg_id, aid, tmp_path)
+        if not ok or not os.path.exists(tmp_path):
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+            continue
+
+        try:
+            texto = extraer_texto_pdf(tmp_path)
+            ident = parse_identificadores_pdf(texto)
+
+            # aplicar preferencia de número por asunto (mismo fix que ya tenías)
+            best_num = _prefer_subject_numero(ident.get("NUMERO"), subj_num)
+            if best_num:
+                ident["NUMERO"] = best_num
+
+            if not ident.get("FECHA"):
+                ident.setdefault("FECHA", _fecha_from_subject(subj))
+
+            sc = _score_pdf_candidate(aname, ident)
+
+        except Exception:
+            ident = {}
+            sc = -10**6
+
+        # decidir mejor
+        if sc > best_score:
+            # borrar el anterior best
+            if best_path and best_path != tmp_path:
+                try:
+                    os.remove(best_path)
+                except Exception:
+                    pass
+
+            best_score = sc
+            best_att = att
+            best_path = tmp_path
+            best_ident = ident
+        else:
+            # no es el mejor → borrar
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+    return best_att, best_path, best_ident
+
+
+# -------------------------------------------------------------------
 # RUN
 # -------------------------------------------------------------------
 
@@ -660,6 +825,7 @@ def run_desde_aprobadas(
     idx_cufe, idx_nf = _build_zip_index(since_days=since_days, max_zip_buscar=max_zip_buscar, aidx=aidx)
 
     cufes_existentes = obtener_cufes_existentes()
+    norm_cufes_existentes = {_norm_cufe(x) for x in cufes_existentes}  # ✅ evita recalcular en cada loop
     print(f"ℹ️ CUFEs ya registrados en facturas.xlsx: {len(cufes_existentes)}")
 
     fecha_local = datetime.datetime.now().strftime("%Y-%m-%d")
@@ -686,23 +852,43 @@ def run_desde_aprobadas(
             store.mark_processed(msg_id, {"status": "sin_pdf"})
             continue
 
-        pdf = pdf_atts[0]
+        # ✅ FIX: si hay múltiples PDFs, elegir el mejor (no Acta, con CUFE, etc.)
+        if len(pdf_atts) == 1:
+            pdf = pdf_atts[0]
+            pdf_name = pdf.get("name") or f"{pdf['id']}.pdf"
+            pdf_tmp = os.path.join(TMP_DIR, pdf_name)
+
+            if not descargar_adjunto_por_id(msg_id, pdf["id"], pdf_tmp):
+                print(f"[APROB] No pude descargar PDF {pdf_name}")
+                store.mark_processed(msg_id, {"status": "error_descarga_pdf", "pdf": pdf_name})
+                continue
+
+            texto = extraer_texto_pdf(pdf_tmp)
+            ident_pdf = parse_identificadores_pdf(texto)
+        else:
+            pdf, pdf_tmp, ident_pdf = _seleccionar_mejor_pdf(msg_id, subj, pdf_atts)
+
+            if not pdf or not pdf_tmp:
+                # fallback ultra defensivo al primero
+                pdf = pdf_atts[0]
+                pdf_name = pdf.get("name") or f"{pdf['id']}.pdf"
+                pdf_tmp = os.path.join(TMP_DIR, pdf_name)
+                if not descargar_adjunto_por_id(msg_id, pdf["id"], pdf_tmp):
+                    print(f"[APROB] No pude descargar PDF (fallback) {pdf_name}")
+                    store.mark_processed(msg_id, {"status": "error_descarga_pdf", "pdf": pdf_name})
+                    continue
+                texto = extraer_texto_pdf(pdf_tmp)
+                ident_pdf = parse_identificadores_pdf(texto)
+
         pdf_name = pdf.get("name") or f"{pdf['id']}.pdf"
-        pdf_tmp = os.path.join(TMP_DIR, pdf_name)
 
-        if not descargar_adjunto_por_id(msg_id, pdf["id"], pdf_tmp):
-            print(f"[APROB] No pude descargar PDF {pdf_name}")
-            store.mark_processed(msg_id, {"status": "error_descarga_pdf", "pdf": pdf_name})
-            continue
-
-        texto = extraer_texto_pdf(pdf_tmp)
-        ident_pdf = parse_identificadores_pdf(texto)
-
+        # ✅ Preferir número del asunto cuando el PDF detecta referencias tipo DDI/RAD/etc
         subj_num = _numero_from_subject(subj)
         best_num = _prefer_subject_numero(ident_pdf.get("NUMERO"), subj_num)
         if best_num:
             ident_pdf["NUMERO"] = best_num
 
+        # NUMERO_APROB: si no existe, guarda el del asunto si es diferente
         numero_aprob = (ident_pdf.get("NUMERO_APROB") or "").strip()
         if not numero_aprob:
             if subj_num and subj_num.strip() and subj_num.strip() != (ident_pdf.get("NUMERO") or "").strip():
@@ -715,6 +901,17 @@ def run_desde_aprobadas(
         fecha_pdf = (ident_pdf.get("FECHA") or "").strip()
         if fecha_pdf:
             fecha_pdf = normalizar_fecha(fecha_pdf) or fecha_pdf
+
+        # ------------------------------------------------------------
+        # DEBUG PARSE (útil para ver si seguimos agarrando "Acta")
+        # ------------------------------------------------------------
+        print("\n===== DEBUG PDF PARSE =====")
+        print(f"→ PDF elegido: {pdf_name}")
+        print(f"→ CUFE detectado: {ident_pdf.get('CUFE')}")
+        print(f"→ NUMERO detectado: {ident_pdf.get('NUMERO')}")
+        print(f"→ NUMERO_APROB detectado: {numero_aprob or None}")
+        print(f"→ FECHA detectada: {ident_pdf.get('FECHA')}")
+        print("===========================\n")
 
         # ------------------------------------------------------------
         # ✅ FLUJO ESPECIAL CONTA15 (PDF-only desde VALIDACION DIAN)
@@ -813,7 +1010,7 @@ def run_desde_aprobadas(
         # FLUJO NORMAL (ZIP/XML)
         # ------------------------------------------------------------
 
-        if cufe_pdf and cufe_pdf in {_norm_cufe(x) for x in cufes_existentes}:
+        if cufe_pdf and cufe_pdf in norm_cufes_existentes:
             print(f"🔁 Factura ya registrada (CUFE en Excel). Se omite búsqueda de ZIP para {pdf_name}.")
             resumen.append((pdf_name, time.time() - t0, "ya registrado", 0))
             store.mark_processed(msg_id, {"status": "ya_registrado", "pdf": pdf_name, "cufe": cufe_pdf})
@@ -1049,6 +1246,7 @@ def run_desde_aprobadas(
             sin_nuevos_consec = 0
             if cufe_pdf:
                 cufes_existentes.add(cufe_pdf)
+                norm_cufes_existentes.add(cufe_pdf)
 
         procesados += 1
         if (procesados >= AUTO_STOP_MIN_PROCESADOS) and (sin_nuevos_consec >= AUTO_STOP_SIN_NUEVOS_CONSEC):
