@@ -21,15 +21,13 @@ from config import (
     TMP_DIR,
     AUTO_STOP_MIN_PROCESADOS, AUTO_STOP_SIN_MATCH_CONSEC, AUTO_STOP_SIN_NUEVOS_CONSEC,
     PROCESSED_MESSAGES_PATH, PROCESSED_MESSAGES_TTL_DAYS,
-    ATTACHMENT_INDEX_PATH, ATTACHMENT_INDEX_TTL_DAYS,  # ✅ NUEVO
-)
+    ATTACHMENT_INDEX_PATH, ATTACHMENT_INDEX_TTL_DAYS,
 
-# ✅ (opcionales) si no existen en tu config, no rompe: se usan defaults
-try:
-    from config import CONTABILIDAD_APROB_SUBJECT_KEY, CONTABILIDAD_INBOX_SUBJECT_KEY
-except Exception:
-    CONTABILIDAD_APROB_SUBJECT_KEY = "conta15"
-    CONTABILIDAD_INBOX_SUBJECT_KEY = "VALIDACION DIAN"
+    # ✅ NUEVO (para DIAN)
+    APROB_DIAN_KEYWORD,
+    INBOX_DIAN_SUBJECT_CANDIDATES,
+    REQUIRE_DIAN_IN_BODY_PREVIEW,
+)
 
 from services.excel_service import (
     guardar_en_excel,
@@ -74,10 +72,6 @@ USE_DATE_SUBFOLDERS = False
 
 # ✅ NUEVO: limpiar ZIPs viejos para que extraer_por_zip() NO procese basura
 def _limpiar_adj_hoy() -> int:
-    """
-    Borra únicamente archivos .zip dentro de ADJ_HOY.
-    Retorna cuántos ZIPs borró.
-    """
     borrados = 0
     try:
         if not os.path.isdir(ADJ_HOY):
@@ -96,10 +90,6 @@ def _limpiar_adj_hoy() -> int:
 
 # ✅ NUEVO: limpiar extraídos viejos para que NO se suba basura a SharePoint
 def _limpiar_ext_hoy() -> int:
-    """
-    Borra TODO el contenido dentro de EXT_HOY (carpetas y archivos).
-    Retorna cuántos elementos (entradas directas) intentó borrar.
-    """
     borrados = 0
     try:
         if not os.path.isdir(EXT_HOY):
@@ -134,17 +124,11 @@ def _norm_cufe(s: str) -> str:
 
 
 def _cufe_is_valid(cufe: str) -> bool:
-    """
-    CUFE suele ser un hash hex largo (>= 40 chars). Si viene corto, suele ser falso positivo.
-    """
     c = _norm_cufe(cufe or "")
     return bool(c) and len(c) >= 40
 
 
 def _is_acta_filename(name: str) -> bool:
-    """
-    Detecta PDFs tipo Acta/constancia que NO deben usarse para match.
-    """
     s = (name or "").lower()
     s_clean = re.sub(r"\s+", " ", s)
     bad_keys = [
@@ -153,6 +137,32 @@ def _is_acta_filename(name: str) -> bool:
         "documento", "comunicado"
     ]
     return any(k in s_clean for k in bad_keys)
+
+
+# ============================================================
+# ✅ NUEVO: Detectar DIAN en asunto + bodyPreview (si existe)
+# ============================================================
+
+def _contains_dian(text: str) -> bool:
+    return normalize_text(APROB_DIAN_KEYWORD) in normalize_text(text or "")
+
+
+def _is_dian_trigger_message(msg: dict) -> bool:
+    subj = msg.get("subject") or ""
+    if not _contains_dian(subj):
+        return False
+
+    # Si Graph devuelve bodyPreview, y la política exige DIAN también ahí, lo validamos.
+    preview = (msg.get("bodyPreview") or msg.get("body_preview") or "")
+    if REQUIRE_DIAN_IN_BODY_PREVIEW:
+        if preview:
+            return _contains_dian(preview)
+        else:
+            # No hay preview: fallback a asunto (pero avisamos)
+            print("[DIAN] ⚠️ Mensaje no trae bodyPreview; se valida solo por asunto.")
+            return True
+
+    return True
 
 
 _CTRL_REGEX = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
@@ -182,9 +192,6 @@ def _extract_inner_invoice_text(xml_text: str) -> str | None:
 
 
 def _parse_ident_from_xml_bytes(xml_bytes: bytes) -> Dict[str, str]:
-    """
-    Soporta AttachedDocument con Invoice embebido.
-    """
     ident: Dict[str, str] = {}
 
     try:
@@ -279,7 +286,7 @@ def _peek_ident_xml_from_zip_bytes(zip_bytes: bytes) -> List[Dict[str, str]]:
 def _build_zip_index(
     since_days: int,
     max_zip_buscar: int,
-    aidx: AttachmentIndexStore  # ✅ NUEVO
+    aidx: AttachmentIndexStore
 ) -> Tuple[Dict[str, Tuple[str, bytes]], Dict[Tuple[str, str], Tuple[str, bytes]]]:
     idx_cufe: Dict[str, Tuple[str, bytes]] = {}
     idx_nf: Dict[Tuple[str, str], Tuple[str, bytes]] = {}
@@ -334,11 +341,9 @@ def _build_zip_index(
                 cufe = _norm_cufe(ident_xml.get("CUFE") or "")
                 num = (ident_xml.get("NUMERO") or "").strip()
                 fec = (ident_xml.get("FECHA") or "").strip()
-
                 if fec:
                     fec = normalizar_fecha(fec) or fec
 
-                # ✅ NUEVO: persistimos referencia del ZIP (para meses después)
                 try:
                     aidx.upsert_zip(
                         cufe=cufe,
@@ -365,12 +370,6 @@ def _build_zip_index(
     return idx_cufe, idx_nf
 
 
-# -------------------------------------------------------------------
-# ✅ Selección más confiable del "Número de factura" vs asunto
-#    FIX: si el PDF trae DDI-xxxxxx / RAD-xxxx (referencias) => se prefiere asunto
-# -------------------------------------------------------------------
-
-# Prefijos típicos que NO son número de factura (radicados/referencias internas)
 _NON_INVOICE_PREFIXES = {"DDI", "RAD", "RDI", "RDC", "REC", "RCP", "DOC", "REF"}
 
 
@@ -385,7 +384,6 @@ def _is_generic_or_non_invoice_numero(n: str) -> bool:
         if pref in _NON_INVOICE_PREFIXES:
             return True
 
-    # genérico muy corto tipo FE-1 / FV-12 etc (cuando se "corta" mal)
     if re.match(r"^[A-Z]{1,4}-\d{1,3}$", n):
         return True
 
@@ -397,27 +395,16 @@ def _prefer_subject_numero(pdf_num: str | None, subj_num: str | None) -> str | N
     subj_num = (subj_num or "").strip()
     if not subj_num:
         return pdf_num or None
-
     if not pdf_num:
         return subj_num
 
-    # ✅ FIX CLAVE: si el PDF trae DDI/RAD/etc, el asunto manda.
     if _is_generic_or_non_invoice_numero(pdf_num) and not _is_generic_or_non_invoice_numero(subj_num):
         return subj_num
 
-    # si el asunto tiene más dígitos, suele ser el verdadero consecutivo
     if len(re.findall(r"\d", subj_num)) > len(re.findall(r"\d", pdf_num)):
         return subj_num
 
     return pdf_num
-
-
-# -------------------------------------------------------------------
-# ✅ CONTA15 helpers
-# -------------------------------------------------------------------
-
-def _subject_has_key(subj: str, key: str) -> bool:
-    return normalize_text(key) in normalize_text(subj)
 
 
 def _clean_name(s: str) -> str:
@@ -457,15 +444,29 @@ def _match_pdf_candidate(
     return False
 
 
-def _buscar_pdf_en_correo_validacion_dian(
+# ============================================================
+# ✅ NUEVO: buscar correo contenedor "Validación(s) DIAN"
+# ============================================================
+
+def _is_validacion_dian_subject(subj: str) -> bool:
+    s = normalize_text(subj or "")
+    for cand in INBOX_DIAN_SUBJECT_CANDIDATES:
+        if normalize_text(cand) in s:
+            return True
+    return False
+
+
+def _buscar_pdf_en_correo_validaciones_dian(
     target_ident: Dict[str, str],
     target_pdf_name: str,
     since_days: int,
-    top_msgs: int = 50
+    top_msgs: int = 80
 ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    os.makedirs(os.path.join(TMP_DIR, "conta15"), exist_ok=True)
-
-    key_norm = normalize_text(CONTABILIDAD_INBOX_SUBJECT_KEY)
+    """
+    Busca el PDF correcto dentro del correo contenedor en Inbox:
+    "Validación DIAN" o "Validaciones DIAN" (según config).
+    """
+    os.makedirs(os.path.join(TMP_DIR, "dian_pdf_only"), exist_ok=True)
 
     msgs = buscar_mensajes_inbox_por_asunto(
         asunto_contiene="DIAN",
@@ -474,30 +475,25 @@ def _buscar_pdf_en_correo_validacion_dian(
     ) or []
 
     if not msgs:
-        print("[CONTA15] Graph search no devolvió nada. Intento fallback pidiendo INBOX sin filtro de asunto...")
+        print("[DIAN] Graph search no devolvió nada por 'DIAN'. Fallback: inbox sin filtro...")
         msgs = buscar_mensajes_inbox_por_asunto(
             asunto_contiene="",
-            top=max(top_msgs, 80),
+            top=max(top_msgs, 120),
             since_days=since_days
         ) or []
 
     if not msgs:
-        print("[CONTA15] ❌ No pude listar Inbox (ni por DIAN ni por fallback).")
+        print("[DIAN] ❌ No pude listar Inbox para buscar 'Validación(es) DIAN'.")
         return None, None, None
 
-    filtrados = []
-    for m in msgs:
-        subj = (m.get("subject") or "")
-        if key_norm in normalize_text(subj):
-            filtrados.append(m)
-
-    if not filtrados:
-        print(f"[CONTA15] No encontré correos en INBOX que contengan (normalizado): {CONTABILIDAD_INBOX_SUBJECT_KEY!r}")
+    contenedores = [m for m in msgs if _is_validacion_dian_subject(m.get("subject") or "")]
+    if not contenedores:
+        print("[DIAN] ❌ No encontré correos contenedores con asunto tipo 'Validación(es) DIAN'.")
         for x in msgs[:10]:
             print(f"   - subj: {x.get('subject','')!r}")
         return None, None, None
 
-    for m in filtrados:
+    for m in contenedores:
         mid = m.get("id")
         if not mid:
             continue
@@ -509,17 +505,20 @@ def _buscar_pdf_en_correo_validacion_dian(
         for att in pdfs:
             aname = att.get("name") or f"{att.get('id')}.pdf"
             aid = att.get("id")
-            local = os.path.join(TMP_DIR, "conta15", aname)
+            local = os.path.join(TMP_DIR, "dian_pdf_only", aname)
 
             ok = descargar_adjunto_por_id(mid, aid, local)
             if not ok:
                 continue
 
-            txt = extraer_texto_pdf(local)
-            ident = parse_identificadores_pdf(txt)
+            try:
+                txt = extraer_texto_pdf(local)
+                ident = parse_identificadores_pdf(txt)
+            except Exception:
+                ident = {}
 
             if _match_pdf_candidate(target_ident, target_pdf_name, ident, aname):
-                print(f"[CONTA15] ✅ Match PDF en correo '{CONTABILIDAD_INBOX_SUBJECT_KEY}': {aname}")
+                print(f"[DIAN] ✅ Match PDF dentro de correo contenedor: {aname}")
                 return local, mid, aid
 
             try:
@@ -527,12 +526,12 @@ def _buscar_pdf_en_correo_validacion_dian(
             except Exception:
                 pass
 
-    print(f"[CONTA15] ❌ No encontré PDF coincidente dentro de correos '{CONTABILIDAD_INBOX_SUBJECT_KEY}'.")
+    print("[DIAN] ❌ No encontré PDF coincidente dentro de los correos contenedores.")
     return None, None, None
 
 
 # -----------------------------
-# ✅ Helpers PDF-only (Conta15)
+# Helpers PDF-only (DIAN)
 # -----------------------------
 
 def _extraer_descripciones_items_pdf(texto: str) -> str:
@@ -664,20 +663,12 @@ def _generar_registro_pdf_only(pdf_local_path: str, pdf_name: str) -> Dict[str, 
 # -------------------------------------------------------------------
 
 def _score_pdf_candidate(pdf_name: str, ident: Dict[str, str]) -> int:
-    """
-    Score para elegir el PDF correcto:
-    - Penaliza 'acta'
-    - Premia CUFE válido (hash largo)
-    - Premia número no genérico
-    - Premia fecha presente
-    """
     score = 0
     name = (pdf_name or "")
 
     if _is_acta_filename(name):
         score -= 200
 
-    # señales positivas por nombre
     low = name.lower()
     if "factura" in low:
         score += 15
@@ -690,7 +681,7 @@ def _score_pdf_candidate(pdf_name: str, ident: Dict[str, str]) -> int:
     if _cufe_is_valid(cufe):
         score += 150
     elif cufe:
-        score += 10  # CUFE corto: algo pero no suficiente
+        score += 10
 
     num = (ident.get("NUMERO") or "").strip()
     if num:
@@ -703,7 +694,6 @@ def _score_pdf_candidate(pdf_name: str, ident: Dict[str, str]) -> int:
     if fec:
         score += 10
 
-    # si el "NUMERO" detectado parece basura tipo "Proyecto 900"
     if re.search(r"\bproyecto\b", (num or "").lower()):
         score -= 50
 
@@ -711,10 +701,6 @@ def _score_pdf_candidate(pdf_name: str, ident: Dict[str, str]) -> int:
 
 
 def _seleccionar_mejor_pdf(msg_id: str, subj: str, pdf_atts: List[dict]) -> Tuple[Optional[dict], Optional[str], Optional[dict]]:
-    """
-    Descarga cada PDF, parsea ident, calcula score y retorna:
-      (att_elegido, pdf_tmp_path, ident_elegido)
-    """
     os.makedirs(TMP_DIR, exist_ok=True)
 
     subj_num = _numero_from_subject(subj)
@@ -729,8 +715,6 @@ def _seleccionar_mejor_pdf(msg_id: str, subj: str, pdf_atts: List[dict]) -> Tupl
             continue
 
         aname = att.get("name") or f"{aid}.pdf"
-
-        # nombre temporal único por mensaje (evita colisiones)
         safe_name = re.sub(r"[^A-Za-z0-9_.\- ]", "_", aname)
         tmp_path = os.path.join(TMP_DIR, f"{msg_id[:8]}_{i}_{safe_name}")
 
@@ -747,7 +731,6 @@ def _seleccionar_mejor_pdf(msg_id: str, subj: str, pdf_atts: List[dict]) -> Tupl
             texto = extraer_texto_pdf(tmp_path)
             ident = parse_identificadores_pdf(texto)
 
-            # aplicar preferencia de número por asunto (mismo fix que ya tenías)
             best_num = _prefer_subject_numero(ident.get("NUMERO"), subj_num)
             if best_num:
                 ident["NUMERO"] = best_num
@@ -761,9 +744,7 @@ def _seleccionar_mejor_pdf(msg_id: str, subj: str, pdf_atts: List[dict]) -> Tupl
             ident = {}
             sc = -10**6
 
-        # decidir mejor
         if sc > best_score:
-            # borrar el anterior best
             if best_path and best_path != tmp_path:
                 try:
                     os.remove(best_path)
@@ -775,7 +756,6 @@ def _seleccionar_mejor_pdf(msg_id: str, subj: str, pdf_atts: List[dict]) -> Tupl
             best_path = tmp_path
             best_ident = ident
         else:
-            # no es el mejor → borrar
             try:
                 os.remove(tmp_path)
             except Exception:
@@ -802,7 +782,6 @@ def run_desde_aprobadas(
 
     store = ProcessedStore(PROCESSED_MESSAGES_PATH, ttl_days=PROCESSED_MESSAGES_TTL_DAYS)
 
-    # ✅ NUEVO: store del índice histórico de ZIPs
     aidx = AttachmentIndexStore(ATTACHMENT_INDEX_PATH, ttl_days=ATTACHMENT_INDEX_TTL_DAYS)
     try:
         purged = aidx.purge()
@@ -825,7 +804,7 @@ def run_desde_aprobadas(
     idx_cufe, idx_nf = _build_zip_index(since_days=since_days, max_zip_buscar=max_zip_buscar, aidx=aidx)
 
     cufes_existentes = obtener_cufes_existentes()
-    norm_cufes_existentes = {_norm_cufe(x) for x in cufes_existentes}  # ✅ evita recalcular en cada loop
+    norm_cufes_existentes = {_norm_cufe(x) for x in cufes_existentes}
     print(f"ℹ️ CUFEs ya registrados en facturas.xlsx: {len(cufes_existentes)}")
 
     fecha_local = datetime.datetime.now().strftime("%Y-%m-%d")
@@ -852,7 +831,7 @@ def run_desde_aprobadas(
             store.mark_processed(msg_id, {"status": "sin_pdf"})
             continue
 
-        # ✅ FIX: si hay múltiples PDFs, elegir el mejor (no Acta, con CUFE, etc.)
+        # ✅ elegir el mejor PDF si hay múltiples
         if len(pdf_atts) == 1:
             pdf = pdf_atts[0]
             pdf_name = pdf.get("name") or f"{pdf['id']}.pdf"
@@ -867,9 +846,7 @@ def run_desde_aprobadas(
             ident_pdf = parse_identificadores_pdf(texto)
         else:
             pdf, pdf_tmp, ident_pdf = _seleccionar_mejor_pdf(msg_id, subj, pdf_atts)
-
             if not pdf or not pdf_tmp:
-                # fallback ultra defensivo al primero
                 pdf = pdf_atts[0]
                 pdf_name = pdf.get("name") or f"{pdf['id']}.pdf"
                 pdf_tmp = os.path.join(TMP_DIR, pdf_name)
@@ -882,13 +859,11 @@ def run_desde_aprobadas(
 
         pdf_name = pdf.get("name") or f"{pdf['id']}.pdf"
 
-        # ✅ Preferir número del asunto cuando el PDF detecta referencias tipo DDI/RAD/etc
         subj_num = _numero_from_subject(subj)
         best_num = _prefer_subject_numero(ident_pdf.get("NUMERO"), subj_num)
         if best_num:
             ident_pdf["NUMERO"] = best_num
 
-        # NUMERO_APROB: si no existe, guarda el del asunto si es diferente
         numero_aprob = (ident_pdf.get("NUMERO_APROB") or "").strip()
         if not numero_aprob:
             if subj_num and subj_num.strip() and subj_num.strip() != (ident_pdf.get("NUMERO") or "").strip():
@@ -902,9 +877,6 @@ def run_desde_aprobadas(
         if fecha_pdf:
             fecha_pdf = normalizar_fecha(fecha_pdf) or fecha_pdf
 
-        # ------------------------------------------------------------
-        # DEBUG PARSE (útil para ver si seguimos agarrando "Acta")
-        # ------------------------------------------------------------
         print("\n===== DEBUG PDF PARSE =====")
         print(f"→ PDF elegido: {pdf_name}")
         print(f"→ CUFE detectado: {ident_pdf.get('CUFE')}")
@@ -913,23 +885,23 @@ def run_desde_aprobadas(
         print(f"→ FECHA detectada: {ident_pdf.get('FECHA')}")
         print("===========================\n")
 
-        # ------------------------------------------------------------
-        # ✅ FLUJO ESPECIAL CONTA15 (PDF-only desde VALIDACION DIAN)
-        # ------------------------------------------------------------
-        if _subject_has_key(subj, CONTABILIDAD_APROB_SUBJECT_KEY):
-            print(f"[CONTA15] Detectado asunto especial en aprobadas: {subj!r}")
+        # ============================================================
+        # ✅ FLUJO ESPECIAL DIAN (PDF-only desde "Validación(es) DIAN")
+        # ============================================================
+        if _is_dian_trigger_message(msg):
+            print(f"[DIAN] Detectado mensaje DIAN en aprobadas (asunto+cuerpo): {subj!r}")
 
-            pdf_real_path, mid_src, aid_src = _buscar_pdf_en_correo_validacion_dian(
+            pdf_real_path, mid_src, aid_src = _buscar_pdf_en_correo_validaciones_dian(
                 target_ident=ident_pdf,
                 target_pdf_name=pdf_name,
                 since_days=since_days,
-                top_msgs=50
+                top_msgs=80
             )
 
             if not pdf_real_path:
-                resumen.append((pdf_name, time.time() - t0, "sin match conta15", 0))
+                resumen.append((pdf_name, time.time() - t0, "sin match dian", 0))
                 store.mark_processed(msg_id, {
-                    "status": "sin_match_conta15",
+                    "status": "sin_match_dian",
                     "pdf": pdf_name,
                     "cufe": cufe_pdf,
                 })
@@ -948,7 +920,7 @@ def run_desde_aprobadas(
                 registrar_historial_por_zip([{
                     "Fecha": fecha_local,
                     "Hora": hora_local,
-                    "Archivo ZIP": "(PDF-ONLY) VALIDACION DIAN",
+                    "Archivo ZIP": "(PDF-ONLY) VALIDACIONES DIAN",
                     "Nuevos XML guardados": total_nuevos,
                     "Errores encontrados": 0
                 }])
@@ -961,8 +933,8 @@ def run_desde_aprobadas(
             except Exception as e:
                 print(f"[APROB] Error al sincronizar aprobaciones: {e}")
 
-            print("☁️  Subiendo a SharePoint (conta15 / PDF-only)...")
-            sp_ext_root = f"{BASE_SP}/extraidos/conta15"
+            print("☁️  Subiendo a SharePoint (DIAN / PDF-only)...")
+            sp_ext_root = f"{BASE_SP}/extraidos/dian_pdf_only"
             sp_excel = f"{BASE_SP}/excel"
             ensure_folder(sp_ext_root)
             ensure_folder(sp_excel)
@@ -970,7 +942,7 @@ def run_desde_aprobadas(
             try:
                 upload_small_file(pdf_real_path, f"{sp_ext_root}/{os.path.basename(pdf_real_path)}", mode="skip")
             except Exception as e:
-                print(f"[CONTA15] No pude subir PDF real: {e}")
+                print(f"[DIAN] No pude subir PDF real: {e}")
 
             hubo_cambios_excel = (total_nuevos > 0) or (enriquecidas > 0)
             if hubo_cambios_excel and sp_excel:
@@ -986,10 +958,10 @@ def run_desde_aprobadas(
                     )
                     print(f"✅ SharePoint facturas.xlsx actualizado (Workbook API): +{insertadas} fila(s) nuevas.")
                 except Exception as e:
-                    print(f"⚠️ Workbook API falló (PDF-only): {e}")
+                    print(f"⚠️ Workbook API falló (PDF-only DIAN): {e}")
 
             store.mark_processed(msg_id, {
-                "status": "ok_conta15",
+                "status": "ok_dian_pdf_only",
                 "pdf": pdf_name,
                 "nuevos": int(total_nuevos),
                 "enriquecidas": int(enriquecidas),
@@ -999,7 +971,7 @@ def run_desde_aprobadas(
             })
 
             marcar_mensaje_como_leido(msg_id)
-            resumen.append((pdf_name, time.time() - t0, "match conta15", total_nuevos))
+            resumen.append((pdf_name, time.time() - t0, "match dian", total_nuevos))
 
             sin_match_consec = 0
             sin_nuevos_consec = 0 if total_nuevos > 0 else (sin_nuevos_consec + 1)
@@ -1059,7 +1031,6 @@ def run_desde_aprobadas(
                     print(f"🔄 Emparejado por nombre: {pdf_name} ↔ {zn}")
                     break
 
-        # ✅ NUEVO FALLBACK: usar índice persistente si el ZIP es viejo
         if not found_match or not found_zip_name or not found_zip_bytes:
             entry = None
 
@@ -1109,7 +1080,6 @@ def run_desde_aprobadas(
                 break
             continue
 
-        # ✅ LIMPIEZAS: ADJ_HOY y EXT_HOY ANTES del ZIP actual
         b1 = _limpiar_adj_hoy()
         if b1:
             print(f"🧹 Limpieza ADJ_HOY: borrados {b1} ZIP(s) viejos.")

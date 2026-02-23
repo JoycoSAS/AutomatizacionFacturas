@@ -38,25 +38,38 @@ AUTO_STOP_SIN_MATCH_CONSEC = 2
 AUTO_STOP_SIN_NUEVOS_CONSEC = 2
 
 # ============================================================
+# ✅ FLUJO ESPECIAL "DIAN" (PDF-only desde "Validación(s) DIAN")
+# ============================================================
+# Palabra clave que activa el flujo especial dentro de "solo aprobadas"
+APROB_DIAN_KEYWORD = "DIAN"
+
+# Asuntos aceptados del correo contenedor en INBOX donde están "todos los PDFs"
+# (se normaliza: sin tildes, sin dobles espacios, etc.)
+INBOX_DIAN_SUBJECT_CANDIDATES = [
+    "VALIDACION DIAN",
+    "VALIDACIONES DIAN",
+    "VALIDACIÓN DIAN",
+    "VALIDACIONES DIAN",
+]
+
+# Si el mensaje NO trae bodyPreview desde Graph, se hace fallback a solo asunto.
+# True = exigir DIAN también en bodyPreview si existe.
+REQUIRE_DIAN_IN_BODY_PREVIEW = True
+
+# ============================================================
 # ✅ RADICADOS: Control Correspondencia (SharePoint / Drive nuevo)
 # ============================================================
-# Este es el archivo real en SharePoint (ruta relativa dentro del drive)
-# OJO: según tu captura, el root del drive YA contiene la carpeta:
-# "Control de correspondencia Oficina Principal"
 RADICADOS_SP_RELATIVE_PATH = (
     "Control de correspondencia Oficina Principal/"
     "Control correspondencia Oficina Principal.xlsx"
 )
 
-# Hoja a leer dentro del Excel de radicados
 RADICADOS_SHEET_NAME = "Recibida"
 
-# Columnas a leer del Excel de radicados
 RAD_COL_ASUNTO = "Asunto"
 RAD_COL_RADICADO = "Consecutivo de entrada"
 RAD_COL_PROY = "Proyecto o Proceso"
 
-# Columnas destino dentro de facturas.xlsx
 FACT_COL_NUMERO = "Número de factura"
 FACT_COL_RAD = "Radicado"
 FACT_COL_PROY = "ProyectoProceso"
@@ -64,15 +77,9 @@ FACT_COL_PROY = "ProyectoProceso"
 # ============================================================
 # ✅ RADICADOS: ruta local estándar (para tests y ejecución)
 # ============================================================
-# El downloader debe guardar SIEMPRE aquí para que:
-# - tests/sp_debug_radicados_headers.py lo encuentre
-# - el pipeline lo lea sin depender de rutas viejas
 RADICADOS_LOCAL_DIR = os.path.join(TEMP_CHECK_DIR, "radicados")
 RADICADOS_LOCAL_FILENAME = "Control correspondencia Oficina Principal.xlsx"
 RADICADOS_LOCAL_PATH = os.path.join(RADICADOS_LOCAL_DIR, RADICADOS_LOCAL_FILENAME)
-
-# (Opcional) asegurar que existan carpetas base (solo constantes acá; creación real en runtime)
-# Path(RADICADOS_LOCAL_DIR).mkdir(parents=True, exist_ok=True)
 
 # ============================================================
 # STATE (ProcessedStore)
