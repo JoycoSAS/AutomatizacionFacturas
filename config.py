@@ -1,4 +1,3 @@
-# config.py
 import os
 from pathlib import Path
 
@@ -33,9 +32,9 @@ MATCH_PRIORIDAD = ["CUFE", "NUMERO_FECHA"]
 APROB_CAT_OK = "AprobMatchOK"
 APROB_CAT_ERROR = "AprobMatchError"
 
-AUTO_STOP_MIN_PROCESADOS = 2
-AUTO_STOP_SIN_MATCH_CONSEC = 2
-AUTO_STOP_SIN_NUEVOS_CONSEC = 2
+AUTO_STOP_MIN_PROCESADOS = 9999
+AUTO_STOP_SIN_MATCH_CONSEC = 9999
+AUTO_STOP_SIN_NUEVOS_CONSEC = 9999
 
 # ============================================================
 # ✅ FLUJO ESPECIAL "DIAN" (PDF-only desde "Validación(s) DIAN")
@@ -93,3 +92,22 @@ PROCESSED_MESSAGES_TTL_DAYS = 2000
 # ============================================================
 ATTACHMENT_INDEX_PATH = os.path.join(STATE_DIR, "attachment_index_store.json")
 ATTACHMENT_INDEX_TTL_DAYS = 765
+
+# ============================================================
+# ✅ AUDITORÍA CSV (rotación diaria)
+# ============================================================
+AUDIT_DIR = os.path.join(DATA_DIR, "audit")
+AUDIT_RUNS_PREFIX = "audit_runs"         # audit_runs_YYYY-MM-DD.csv
+AUDIT_DETALLE_PREFIX = "audit_detalle"   # audit_detalle_YYYY-MM-DD.csv
+
+# True = no escribir CSV si no hubo nada que procesar (modo recomendado para "cada minuto")
+AUDIT_WRITE_ONLY_IF_ACTIVITY = True
+
+# ============================================================
+# ✅ LOCK (anti-ejecución simultánea)
+# ============================================================
+LOCK_FILE_APROBADAS = os.path.join(STATE_DIR, "aprobadas.lock")
+
+# TTL del lock: si por alguna razón un proceso muere y deja el lock,
+# pasados X segundos se considera stale y se reemplaza.
+LOCK_TTL_SECONDS = 60 * 30  # 30 minutos

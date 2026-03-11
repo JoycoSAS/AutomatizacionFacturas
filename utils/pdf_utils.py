@@ -9,9 +9,10 @@ from typing import Optional, Dict, List
 # -----------------------------
 def extraer_texto_pdf(local_pdf_path: str) -> str:
     """
-    Extrae texto de un PDF 'searchable'. Requiere pdfminer.six:
-      pip install pdfminer.six
-    Si falla, retorna cadena vacía (no rompemos el flujo).
+    Extrae texto de un PDF searchable.
+    Requiere pdfminer.six:
+        pip install pdfminer.six
+    Si falla, retorna cadena vacía para no romper el flujo.
     """
     try:
         from pdfminer.high_level import extract_text
@@ -43,6 +44,7 @@ def _normalize_text(s: str) -> str:
     if not s:
         return ""
     s = s.translate(_LIGATURE_MAP)
+    s = s.replace("\u00a0", " ")
     s = re.sub(r"[ \t\r\f\v]+", " ", s)
     s = re.sub(r"\n+", "\n", s)
     return s.strip()
@@ -54,175 +56,378 @@ def _clean_spaces(s: str) -> str:
     return s.strip()
 
 def _clean_hex_chunks(s: str) -> str:
-    s = re.sub(r"[^0-9a-fA-F]", "", s)
-    return s.lower()
+    return re.sub(r"[^0-9a-fA-F]", "", s or "").lower()
 
 
 # -----------------------------
 # Fechas
 # -----------------------------
-_RE_FEC1 = re.compile(r"(\d{4}[-/]\d{2}[-/]\d{2})")
-_RE_FEC2 = re.compile(r"(\d{2}[-/]\d{2}[-/]\d{4})")
+_RE_FEC1 = re.compile(r"\b(\d{4}[-/]\d{2}[-/]\d{2})\b")
+_RE_FEC2 = re.compile(r"\b(\d{2}[-/]\d{2}[-/]\d{4})\b")
 
 def normalizar_fecha(fecha_str: str) -> Optional[str]:
-    """Devuelve fecha normalizada a YYYY-MM-DD si es posible."""
+    """
+    Convierte a YYYY-MM-DD si es posible.
+    Acepta:
+    - YYYY/MM/DD
+    - YYYY-MM-DD
+    - DD/MM/YYYY
+    - DD-MM-YYYY
+    """
     try:
         import datetime as dt
-        s = fecha_str.strip().replace("\\", "/").replace(".", "/").replace("-", "/")
+
+        s = (fecha_str or "").strip()
+        if not s:
+            return None
+
+        s = s.replace("\\", "/").replace(".", "/").replace("-", "/")
         parts = s.split("/")
         if len(parts) != 3:
             return None
+
         if len(parts[0]) == 4:
-            y, m, d = map(int, parts)  # YYYY/MM/DD
+            y, m, d = map(int, parts)
         else:
-            d, m, y = map(int, parts)  # DD/MM/YYYY
+            d, m, y = map(int, parts)
+
         return dt.date(y, m, d).strftime("%Y-%m-%d")
     except Exception:
         return None
 
 
 # -----------------------------
-# Identificadores (CUFE / NUMERO / NUMERO_APROB / FECHA)
+# Reglas y filtros para número
 # -----------------------------
-_RE_CUFE_SIMPLE = re.compile(
-    r"(CUFE|CUFD|UUID)\s*[:=]?\s*([0-9a-fA-F\-]{20,})",
-    re.IGNORECASE,
+_FACT_PREFIXES = (
+    "FEAC", "FETR", "FVE", "FVN", "FE", "FV", "FCII", "FC", "FD",
+    "NC", "ND", "RH", "MQ", "GS", "EN", "BP", "CO", "SKYB",
+    "HYSB", "FHM", "EB", "N", "A", "H4Z", "FPP", "FEC", "FET"
 )
 
-_FACT_PREFIXES = r"(?:FPP|FE|FVE|FV|FEC|FETR|FET|FC|FD|NC|ND|GURA|GURC|GURD)"
-
-_RE_NUM_AFTER_LABEL = re.compile(
-    r"(?:n[uú]mero\s+de\s+factura\s*[:#]?\s*|factura(?:\s+electr[oó]nica)?(?:\s+de\s+venta)?\s*(?:no\.?|nro\.?|n[°ºo]|número|numero)\s*[:#]?\s*)"
-    r"([A-Z0-9]{1,20}\s*[-–—]?\s*\d{2,20})",
-    re.IGNORECASE,
-)
-
-_RE_NUM_STRONG = re.compile(
-    rf"(?:Factura\s*[:#]?\s*|Factura\s+No\.?\s*[:#]?\s*|N[o°º\.]?\s*[:#]?\s*|N[úu]mero\s*[:#]?\s*)?"
-    rf"({_FACT_PREFIXES})\s*[-–—]?\s*(\d{{2,20}})",
-    re.IGNORECASE,
-)
-
-_RE_NUM_GLUE = re.compile(rf"\b({_FACT_PREFIXES})(\d{{2,20}})\b", re.IGNORECASE)
-_RE_NUM_GENERIC = re.compile(r"\b[A-Z]{1,10}\s*[-–—]?\s*\d{2,20}\b", re.IGNORECASE)
+_BAD_NUM_WORDS = {
+    "CALLE", "CARRERA", "CR", "CRA", "AV", "AVENIDA", "TRANSV", "TRANSVERSAL",
+    "DIAGONAL", "DG", "KM", "VIA", "PROYECTO", "PROY", "NOTARIA", "CIIU",
+    "MUNICIPIO", "CIUDAD", "NIT", "CUFE", "CUFD", "UUID", "CONTRATO",
+    "REFERENCIA", "PAGO", "CLIENTE", "EMISOR", "ADQUIRIENTE", "FACTURACION",
+    "FACTURACIÓN", "RESOLUCION", "RESOLUCIÓN", "ACTIVIDAD", "ECONOMICA",
+    "ECONÓMICA", "DIRECCION", "DIRECCIÓN", "CODIGO", "CÓDIGO", "PAIS",
+    "PAÍS", "DEPARTAMENTO", "TELEFONO", "TELÉFONO", "CORREO", "BARRIO"
+}
 
 def _clean_candidate(raw: str) -> str:
     raw = (raw or "").strip()
-    raw = re.sub(r"\s+", " ", raw)
     raw = raw.replace("–", "-").replace("—", "-")
+    raw = re.sub(r"\s+", " ", raw)
     raw = re.sub(r"\s*-\s*", "-", raw)
-    return raw.strip("-").strip()
+    return raw.strip(" -")
+
+def _num_digits(s: str) -> int:
+    return len(re.findall(r"\d", s or ""))
+
+def _has_letters(s: str) -> bool:
+    return bool(re.search(r"[A-Za-z]", s or ""))
+
+def _is_bad_num_candidate(s: str) -> bool:
+    s = _clean_candidate(s).upper()
+    if not s:
+        return True
+
+    if len(s) < 3:
+        return True
+
+    if s in _BAD_NUM_WORDS:
+        return True
+
+    parts = re.split(r"[-\s/]+", s)
+    if parts and parts[0] in _BAD_NUM_WORDS:
+        return True
+
+    if s.startswith(("CALLE ", "CARRERA ", "CR ", "CRA ", "AV ", "AVENIDA ", "TRANSV ")):
+        return True
+
+    if s.startswith(("CIIU ", "NOTARIA ", "PROYECTO ", "NIT ")):
+        return True
+
+    # Solo texto sin números -> no sirve
+    if not re.search(r"\d", s):
+        return True
+
+    # Caso tipo "FEB-26" o "MARZO 2026" o similares
+    if re.fullmatch(r"[A-Z]{2,10}-\d{2,4}", s):
+        monthish = {"ENE", "FEB", "MAR", "ABR", "MAY", "JUN", "JUL", "AGO", "SEP", "OCT", "NOV", "DIC"}
+        pref = s.split("-")[0]
+        if pref in monthish:
+            return True
+
+    if re.fullmatch(r"(ENERO|FEBRERO|MARZO|ABRIL|MAYO|JUNIO|JULIO|AGOSTO|SEPTIEMBRE|OCTUBRE|NOVIEMBRE|DICIEMBRE)\s+\d{4}", s):
+        return True
+
+    # "y 100", "S 199", etc.
+    if re.fullmatch(r"[A-ZY]\s+\d{2,6}", s):
+        return True
+
+    return False
+
+def _normalize_numero_factura(s: str) -> str:
+    s = _clean_candidate(s)
+
+    # unir prefijo+numero si viene separado: FE 1985 -> FE1985
+    m = re.fullmatch(r"([A-Za-z]{1,10})\s+(\d{2,20})", s)
+    if m:
+        pref = m.group(1).upper()
+        num = m.group(2)
+        if pref in _FACT_PREFIXES or len(pref) <= 5:
+            return f"{pref}{num}"
+
+    # si ya trae guion, mantener pero sin espacios
+    m = re.fullmatch(r"([A-Za-z]{1,10})-(\d{2,20})", s)
+    if m:
+        return f"{m.group(1).upper()}{m.group(2)}"
+
+    return s
+
+def _candidate_score(num: str, full_text: str = "") -> int:
+    n = _clean_candidate(num)
+    up = n.upper()
+    score = 0
+
+    if _is_bad_num_candidate(up):
+        return -10_000
+
+    if any(up.startswith(p) for p in _FACT_PREFIXES):
+        score += 200
+
+    if "-" in n:
+        score += 30
+
+    if _num_digits(n) >= 4:
+        score += 25
+
+    if _has_letters(n):
+        score += 20
+
+    # Penalizar si parece solo número demasiado genérico pero muy largo
+    if re.fullmatch(r"\d{10,25}", n):
+        score -= 30
+
+    # Mejor si aparece cerca de palabra factura
+    if full_text:
+        pat = re.escape(n).replace(r"\ ", r"\s+")
+        if re.search(rf"(factura|número de factura|numero de factura).{{0,80}}{pat}", full_text, re.IGNORECASE | re.DOTALL):
+            score += 120
+
+    return score
+
+
+# -----------------------------
+# CUFE
+# -----------------------------
+_RE_CUFE_SIMPLE = re.compile(
+    r"\b(?:CUFE|CUFD|UUID)\b\s*[:=]?\s*([0-9a-fA-F\-\s]{20,})",
+    re.IGNORECASE,
+)
+
+def _extraer_cufe_cercano_a_label(texto: str) -> Optional[str]:
+    if not texto:
+        return None
+
+    m = re.search(r"\b(CUFE|UUID|CUFD)\b", texto, flags=re.IGNORECASE)
+    if not m:
+        return None
+
+    after = texto[m.end(): m.end() + 1200]
+    mhex = re.search(r"([0-9a-fA-F][0-9a-fA-F\s\-]{60,220})", after)
+    if not mhex:
+        return None
+
+    cufe = _clean_hex_chunks(mhex.group(1))
+    if len(cufe) >= 96:
+        return cufe[:96]
+    if len(cufe) >= 64:
+        return cufe
+    return None
+
+
+# -----------------------------
+# Número de factura
+# -----------------------------
+_RE_NUM_LABEL_1 = re.compile(
+    r"(?:n[uú]mero\s+de\s+factura|numero\s+de\s+factura|factura(?:\s+electr[oó]nica)?(?:\s+de\s+venta)?\s*(?:no\.?|nro\.?|n[°ºo]|n[uú]mero|numero)?)\s*[:#]?\s*([A-Z0-9][A-Z0-9\-/ ]{1,30}\d{1,20})",
+    re.IGNORECASE,
+)
+
+_RE_NUM_LABEL_2 = re.compile(
+    r"\bFactura\s*[:#]?\s*([A-Z0-9][A-Z0-9\-/ ]{1,30}\d{1,20})",
+    re.IGNORECASE,
+)
+
+_RE_PREFIXED = re.compile(
+    rf"\b({'|'.join(sorted(_FACT_PREFIXES, key=len, reverse=True))})\s*[- ]?\s*(\d{{2,20}})\b",
+    re.IGNORECASE,
+)
+
+_RE_ALNUM_COMPACT = re.compile(r"\b([A-Z]{1,8}\d{3,20})\b", re.IGNORECASE)
+_RE_ALNUM_SPACED = re.compile(r"\b([A-Z]{1,8}\s+\d{2,20})\b", re.IGNORECASE)
+_RE_ALNUM_HYPHEN = re.compile(r"\b([A-Z]{1,8}-\d{2,20})\b", re.IGNORECASE)
+_RE_NUM_PLAIN_LONG = re.compile(r"\b(\d{6,25})\b")
+
 
 def _pick_best_numero(texto: str) -> Optional[str]:
     if not texto:
         return None
 
-    m0 = _RE_NUM_AFTER_LABEL.search(texto)
-    if m0:
-        cand0 = _clean_candidate(m0.group(1))
-        return cand0 or None
+    text = _normalize_text(texto)
+    candidates: List[str] = []
 
-    m = _RE_NUM_STRONG.search(texto)
-    if m:
+    # 1) Etiquetas explícitas
+    for rx in (_RE_NUM_LABEL_1, _RE_NUM_LABEL_2):
+        for m in rx.finditer(text):
+            cand = _clean_candidate(m.group(1))
+            if cand:
+                candidates.append(cand)
+
+    # 2) Prefijos fuertes conocidos
+    for m in _RE_PREFIXED.finditer(text):
         pref = m.group(1).upper()
         num = m.group(2)
-        return f"{pref}-{num}"
+        candidates.append(f"{pref}{num}")
 
-    m = _RE_NUM_GLUE.search(texto)
-    if m:
-        pref = m.group(1).upper()
-        num = m.group(2)
-        return f"{pref}-{num}"
+    # 3) Compactos, espaciados, con guion
+    for rx in (_RE_ALNUM_HYPHEN, _RE_ALNUM_SPACED, _RE_ALNUM_COMPACT):
+        for m in rx.finditer(text):
+            cand = _clean_candidate(m.group(1))
+            if cand:
+                candidates.append(cand)
 
-    t = " ".join((texto or "").split())
-    for m3 in _RE_NUM_GENERIC.finditer(t):
-        cand = _clean_candidate(m3.group(0))
+    # 4) Solo número largo como último recurso
+    for m in _RE_NUM_PLAIN_LONG.finditer(text):
+        cand = _clean_candidate(m.group(1))
         if cand:
-            return cand
+            candidates.append(cand)
 
-    return None
+    # Dedup manteniendo orden
+    seen = set()
+    uniq = []
+    for c in candidates:
+        key = c.upper()
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(c)
 
-_RE_CONTRATO = re.compile(r"\bContrato\b[^0-9]{0,30}(\d{5,20})", re.IGNORECASE)
-_RE_PAGA_CON_ESTE_NUM = re.compile(r"\bPaga\s+con\s+este\s+n[uú]mero\b[^0-9]{0,30}(\d{5,20})", re.IGNORECASE)
-_RE_REF_PAGO = re.compile(r"\bReferencia\s+de\s+pago\b[^0-9]{0,30}([0-9]{4,}(?:[-–—/][0-9A-Za-z]{2,})?)", re.IGNORECASE)
+    best = None
+    best_score = -10_000
 
-def _extraer_numero_aprobacion(texto: str) -> Optional[str]:
+    for cand in uniq:
+        norm = _normalize_numero_factura(cand)
+        score = _candidate_score(norm, text)
+        if score > best_score:
+            best_score = score
+            best = norm
+
+    return best if best_score > 0 else None
+
+
+# -----------------------------
+# Número alterno / aprobación
+# -----------------------------
+_RE_CONTRATO = re.compile(r"\bContrato\b[^0-9A-Za-z]{0,20}([A-Z0-9\-]{4,30})", re.IGNORECASE)
+_RE_REF_PAGO = re.compile(r"\bReferencia\s+de\s+pago\b[^0-9A-Za-z]{0,20}([A-Z0-9\-]{4,30})", re.IGNORECASE)
+_RE_PAGA_NUM = re.compile(r"\bPaga\s+con\s+este\s+n[uú]mero\b[^0-9A-Za-z]{0,20}([A-Z0-9\-]{4,30})", re.IGNORECASE)
+
+def _extraer_numero_aprobacion(texto: str, numero_principal: str = "") -> Optional[str]:
     if not texto:
         return None
-    for rx in (_RE_CONTRATO, _RE_PAGA_CON_ESTE_NUM, _RE_REF_PAGO):
+
+    for rx in (_RE_CONTRATO, _RE_REF_PAGO, _RE_PAGA_NUM):
         m = rx.search(texto)
         if m:
-            return (m.group(1) or "").strip()
+            cand = _clean_candidate(m.group(1))
+            if cand and cand != numero_principal and not _is_bad_num_candidate(cand):
+                return _normalize_numero_factura(cand)
+
     return None
 
-def _extraer_cufe_cercano_a_label(texto: str) -> Optional[str]:
-    if not texto:
-        return None
-    m = re.search(r"\b(CUFE|UUID)\b", texto, flags=re.IGNORECASE)
-    if not m:
-        return None
-    after = texto[m.end(): m.end() + 900]
-    mhex = re.search(r"([0-9a-fA-F][0-9a-fA-F\s\-]{70,180})", after)
-    if not mhex:
-        return None
-    cufe = _clean_hex_chunks(mhex.group(1))
-    if len(cufe) >= 96:
-        return cufe[:96]
-    return None
 
+# -----------------------------
+# Fecha
+# -----------------------------
 def _extraer_fecha_emision(texto: str) -> Optional[str]:
-    m = re.search(
-        r"Fecha\s+de\s+Emisi[oó]n\s*:\s*([0-9]{2}[\/\-][0-9]{2}[\/\-][0-9]{4}|[0-9]{4}[\/\-][0-9]{2}[\/\-][0-9]{2})",
-        texto, re.IGNORECASE
-    )
-    if m:
-        return normalizar_fecha(m.group(1))
+    patrones = [
+        r"Fecha\s+de\s+Emisi[oó]n\s*[:#]?\s*([0-9]{2}[\/\-][0-9]{2}[\/\-][0-9]{4}|[0-9]{4}[\/\-][0-9]{2}[\/\-][0-9]{2})",
+        r"Fecha\s+de\s+factura\s*[:#]?\s*([0-9]{2}[\/\-][0-9]{2}[\/\-][0-9]{4}|[0-9]{4}[\/\-][0-9]{2}[\/\-][0-9]{2})",
+        r"Fecha\s*[:#]?\s*([0-9]{2}[\/\-][0-9]{2}[\/\-][0-9]{4}|[0-9]{4}[\/\-][0-9]{2}[\/\-][0-9]{2})",
+    ]
+
+    for pat in patrones:
+        m = re.search(pat, texto, re.IGNORECASE)
+        if m:
+            f = normalizar_fecha(m.group(1))
+            if f:
+                return f
 
     m1 = _RE_FEC1.search(texto)
     if m1:
         return normalizar_fecha(m1.group(1))
+
     m2 = _RE_FEC2.search(texto)
     if m2:
         return normalizar_fecha(m2.group(1))
+
     return None
 
+
+# -----------------------------
+# Parse principal
+# -----------------------------
 def parse_identificadores_pdf(texto: str) -> Dict[str, str]:
     """
-    Extrae:
-      - CUFE (preferido)
-      - NUMERO (factura)
-      - NUMERO_APROB (Contrato / Ref pago, etc.)
-      - FECHA (YYYY-MM-DD)
+    Extrae principalmente:
+      - CUFE
+      - NUMERO
+      - NUMERO_APROB
+      - FECHA
+
+    Prioriza:
+      1. CUFE etiquetado o hex fuerte
+      2. Número real de factura
+      3. Reduce falsos positivos
     """
     out: Dict[str, str] = {}
     texto = _normalize_text(texto or "")
 
-    cufe_label = _extraer_cufe_cercano_a_label(texto)
-    if cufe_label and len(cufe_label) == 96:
-        out["CUFE"] = cufe_label
-
-    if "CUFE" not in out:
+    # CUFE
+    cufe = _extraer_cufe_cercano_a_label(texto)
+    if not cufe:
         m = _RE_CUFE_SIMPLE.search(texto)
         if m:
-            raw = m.group(2).strip()
-            cleaned_hex = _clean_hex_chunks(raw)
-            if len(cleaned_hex) >= 96:
-                out["CUFE"] = cleaned_hex[:96]
+            cufe = _clean_hex_chunks(m.group(1))
+            if len(cufe) >= 96:
+                cufe = cufe[:96]
+            elif len(cufe) < 64:
+                cufe = None
 
-    if "CUFE" not in out:
+    if not cufe:
         flat = _clean_hex_chunks(texto)
         m = re.search(r"([0-9a-f]{96})", flat)
         if m:
-            out["CUFE"] = m.group(1)
+            cufe = m.group(1)
 
+    if cufe:
+        out["CUFE"] = cufe
+
+    # Número
     numero = _pick_best_numero(texto)
     if numero:
         out["NUMERO"] = numero
 
-    num_aprob = _extraer_numero_aprobacion(texto)
+    # Número alterno / aprobación
+    num_aprob = _extraer_numero_aprobacion(texto, numero_principal=numero or "")
     if num_aprob:
         out["NUMERO_APROB"] = num_aprob
 
+    # Fecha
     fecha = _extraer_fecha_emision(texto)
     if fecha:
         out["FECHA"] = fecha
@@ -238,21 +443,13 @@ def parse_identificadores_pdf(texto: str) -> Dict[str, str]:
 
 
 # --------------------------------------------------------
-# Códigos de ciudad desde CSV externo (robusto)
+# Códigos de ciudad desde CSV externo
 # --------------------------------------------------------
 def _strip_accents_upper(s: str) -> str:
     rep = str.maketrans("ÁÉÍÓÚÜÑáéíóúüñ", "AEIOUUNaeiouun")
     return (s or "").translate(rep).upper().strip()
 
 def _norm_city_key(s: str) -> str:
-    """
-    Normaliza para matching:
-      - quita acentos
-      - upper
-      - quita . , ; :
-      - colapsa espacios
-      - normaliza D.C / DC / D C
-    """
     s = _strip_accents_upper(s)
     s = s.replace(".", "").replace(",", "").replace(";", "").replace(":", "")
     s = re.sub(r"\s+", " ", s).strip()
@@ -260,11 +457,6 @@ def _norm_city_key(s: str) -> str:
     return s
 
 def _cargar_codigos_ciudad() -> Dict[str, str]:
-    """
-    Soporta CSV simple en:
-      - data/codigos_ciudad.csv
-      - codigos_ciudad.csv
-    """
     candidates = [
         Path("data") / "codigos_ciudad.csv",
         Path("codigos_ciudad.csv"),
@@ -293,6 +485,7 @@ def _cargar_codigos_ciudad() -> Dict[str, str]:
             for row in reader:
                 if not row:
                     continue
+
                 row = [c.strip() for c in row if c is not None]
                 if not row or (len(row) == 1 and not row[0]):
                     continue
@@ -310,6 +503,7 @@ def _cargar_codigos_ciudad() -> Dict[str, str]:
                             return header.index(colname)
                         except Exception:
                             return -1
+
                     i_city = idx("ciudad")
                     i_code = idx("codigo")
                     if i_city < 0 or i_code < 0:
@@ -346,16 +540,13 @@ def _codigo_ciudad(nombre_ciudad: str) -> str:
     key = _norm_city_key(nombre_ciudad)
     if not key:
         return ""
-    return (_CITY_CODES.get(key) or "")
+    return _CITY_CODES.get(key) or ""
 
 
 # --------------------------------------------------------
-# Descripción items desde “Detalles de Productos”
+# Descripción items
 # --------------------------------------------------------
 def extraer_descripcion_items_pdf(texto: str) -> str:
-    """
-    Extrae SOLO descripciones reales de items, evitando cabeceras/columnas numéricas.
-    """
     t = _clean_spaces(texto)
     lines = [ln.strip() for ln in t.split("\n") if ln.strip()]
 
@@ -389,11 +580,6 @@ def extraer_descripcion_items_pdf(texto: str) -> str:
         "iva %", "inc %", "dcto detalle"
     ]))
 
-    bad_prefixes = (
-        "PAÍS:", "PAIS:", "DEPARTAMENTO:", "MUNICIPIO", "CIUDAD",
-        "DIRECCIÓN:", "DIRECCION:", "TELÉFONO", "TELEFONO", "CORREO"
-    )
-
     def is_item_no(s: str) -> bool:
         return bool(re.fullmatch(r"\d{1,3}", s or ""))
 
@@ -415,25 +601,21 @@ def extraer_descripcion_items_pdf(texto: str) -> str:
             parts: List[str] = []
             while i < len(seg):
                 cur = seg[i].strip()
-                cur_up = cur.upper()
                 cur_low = cur.lower()
 
                 if is_item_no(cur):
                     break
                 if cur_low in header_stop:
                     break
-                if cur_up.startswith(bad_prefixes):
-                    break
                 if looks_numeric(cur) or is_unit(cur):
                     break
-                if re.search(r"\bIVA\b|\bRETENCI", cur_up):
+                if re.search(r"\bIVA\b|\bRETENCI", cur, flags=re.IGNORECASE):
                     break
 
                 parts.append(cur)
                 i += 1
 
-            joined = " ".join(parts)
-            desc = re.sub(r"\s{2,}", " ", joined).strip()
+            desc = re.sub(r"\s{2,}", " ", " ".join(parts)).strip()
             if desc:
                 descs.append(desc)
         else:
@@ -452,12 +634,9 @@ def extraer_descripcion_items_pdf(texto: str) -> str:
 
 
 # --------------------------------------------------------
-# Extracción cabecera desde PDF (DIAN)
+# Cabecera desde PDF
 # --------------------------------------------------------
 def extraer_campos_basicos_pdf(texto: str) -> Dict[str, str]:
-    """
-    Extrae campos de cabecera y descripción real de items desde PDF DIAN.
-    """
     t = _clean_spaces(texto)
     lines = [ln.strip() for ln in t.split("\n") if ln.strip()]
 
@@ -522,7 +701,7 @@ def extraer_campos_basicos_pdf(texto: str) -> Dict[str, str]:
 
 
 # --------------------------------------------------------
-# Totales desde PDF (DIAN robusto)
+# Totales
 # --------------------------------------------------------
 _MONEY = r"(\d{1,3}(?:[.\s]\d{3})*(?:[.,]\d{2})|\d+(?:[.,]\d{2})?)"
 
@@ -543,16 +722,13 @@ def _to_float_money(s: str) -> float:
         else:
             if s.count(".") > 1:
                 s = s.replace(".", "")
+
     try:
         return float(s)
     except Exception:
         return 0.0
 
 def _extraer_totales_datos_totales_dian(texto: str) -> Dict[str, float]:
-    """
-    Para PDFs DIAN como el 1100:
-    - Busca el bloque donde aparece "COP" y luego una columna de 13 valores.
-    """
     t = _clean_spaces(texto)
 
     m = re.search(r"\nCOP\s*\n", t)
@@ -560,7 +736,6 @@ def _extraer_totales_datos_totales_dian(texto: str) -> Dict[str, float]:
         return {}
 
     tail = t[m.end():]
-
     vals = re.findall(_MONEY, tail)
     if len(vals) < 13:
         return {}
@@ -578,9 +753,6 @@ def _extraer_totales_datos_totales_dian(texto: str) -> Dict[str, float]:
     }
 
 def extraer_totales_basicos_pdf(texto: str) -> Dict[str, float]:
-    """
-    Extrae Subtotal / IVA 19 / IVA 5 / Total.
-    """
     dian = _extraer_totales_datos_totales_dian(texto)
     if dian:
         iva_total = dian.get("IVA", 0.0)

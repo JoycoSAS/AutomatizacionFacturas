@@ -47,7 +47,12 @@ def _user_segment() -> str:
     return f"users/{quote(MAILBOX)}"
 
 
-def _get_json_with_retries(url: str, retries: int = 2, timeout=TIMEOUT, headers_extra: dict | None = None):
+def _get_json_with_retries(
+    url: str,
+    retries: int = 2,
+    timeout=TIMEOUT,
+    headers_extra: dict | None = None
+):
     """
     GET + parse JSON con reintentos si la respuesta viene truncada/no-JSON.
     Devuelve dict (JSON) o None si no fue posible.
@@ -89,6 +94,22 @@ def _categorias_ok(msg, required_categories=None):
     return all(c.lower() in cats for c in required_categories)
 
 
+def _env_int(name: str, default: int | None = None) -> int | None:
+    raw = (os.getenv(name) or "").strip()
+    if raw.isdigit():
+        return int(raw)
+    return default
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = (os.getenv(name) or "").strip().lower()
+    if raw in ("1", "true", "yes", "y", "si", "sí", "on"):
+        return True
+    if raw in ("0", "false", "no", "n", "off"):
+        return False
+    return default
+
+
 # ----------------------------
 # Listar mensajes (Inbox)
 # ----------------------------
@@ -97,11 +118,14 @@ def _listar_mensajes(max_messages=200, since_days=None):
     Lista mensajes del Inbox (ordenados desc).
     ✅ IMPORTANTE: NO usamos contains(subject,...) en $filter porque puede dar InefficientFilter.
     """
+    max_env = _env_int("MAX_MESSAGES", 200) or 200
+    max_messages = min(int(max_messages or 200), 500, max_env)
+
     base = f"{GRAPH}/{_user_segment()}/messages"
     params = {
-        "$select": "id,subject,hasAttachments,categories,receivedDateTime,conversationId,isRead",
+        "$select": "id,subject,hasAttachments,categories,receivedDateTime,conversationId,isRead,bodyPreview",
         "$orderby": "receivedDateTime desc",
-        "$top": str(min(max_messages, 500)),
+        "$top": str(max_messages),
     }
 
     if since_days is not None and since_days > 0:
@@ -109,7 +133,6 @@ def _listar_mensajes(max_messages=200, since_days=None):
         iso = dt.isoformat().replace("+00:00", "Z")
         params["$filter"] = f"receivedDateTime ge {iso}"
 
-    # armamos query sin reventar commas/spaces innecesariamente
     q = "&".join([f"{k}={quote(v, safe='(),:$ ')}" for k, v in params.items()])
     url = f"{base}?{q}"
 
@@ -125,10 +148,21 @@ def buscar_mensajes_inbox_por_asunto(
 ):
     """
     Filtra por asunto en Python para evitar InefficientFilter en Graph.
+
+    ✅ CORREGIDO:
+    - Si asunto_contiene viene vacío, devolvemos mensajes sin filtrar (para tus fallbacks).
     """
-    asunto_contiene = (asunto_contiene or "").strip().lower()
-    if not asunto_contiene:
+    top = int(top or 50)
+    if top < 1:
         return []
+
+    if not (asunto_contiene or "").strip():
+        msgs = _listar_mensajes(max_messages=max(top, 20), since_days=since_days)
+        if solo_con_adjuntos:
+            msgs = [m for m in msgs if m.get("hasAttachments")]
+        return msgs[:top]
+
+    asunto_contiene = asunto_contiene.strip().lower()
 
     msgs = _listar_mensajes(max_messages=max(top, 20), since_days=since_days)
 
@@ -222,66 +256,6 @@ def listar_adjuntos_zip(msg_id: str):
     return _listar_adjuntos_zip(msg_id)
 
 
-def descargar_zips_validos(
-    temp_check_dir,
-    destino_dir,
-    read_all=False,
-    max_messages=200,
-    since_days=None,
-    required_categories=None,
-):
-    import zipfile
-
-    os.makedirs(temp_check_dir, exist_ok=True)
-    os.makedirs(destino_dir, exist_ok=True)
-
-    msgs = _listar_mensajes(max_messages=max_messages, since_days=since_days)
-    descargados = []
-
-    for msg in msgs:
-        if not msg.get("hasAttachments"):
-            continue
-        if not read_all and not _categorias_ok(msg, required_categories):
-            continue
-
-        msg_id = msg["id"]
-        atts = _listar_adjuntos_zip(msg_id)
-        if not atts:
-            continue
-
-        for att in atts:
-            name = att.get("name") or f"{att['id']}.zip"
-            tmp_path = os.path.join(temp_check_dir, name)
-            if not _descargar_adjunto(msg_id, att["id"], tmp_path):
-                continue
-
-            tiene_xml = False
-            try:
-                with zipfile.ZipFile(tmp_path, "r") as zf:
-                    tiene_xml = any(m.filename.lower().endswith(".xml") for m in zf.infolist())
-            except Exception:
-                tiene_xml = False
-
-            if not tiene_xml:
-                try:
-                    os.remove(tmp_path)
-                except Exception:
-                    pass
-                continue
-
-            dest_path = os.path.join(destino_dir, name)
-            if not os.path.exists(dest_path):
-                os.replace(tmp_path, dest_path)
-                descargados.append(name)
-            else:
-                try:
-                    os.remove(tmp_path)
-                except Exception:
-                    pass
-
-    return descargados
-
-
 # ------------------------------------------------
 # PDFs desde carpeta de “Facturas aprobadas”
 # ------------------------------------------------
@@ -316,15 +290,42 @@ def find_folder_id_anywhere(name: str) -> str | None:
     return None
 
 
-def listar_mensajes_en_carpeta(folder_id: str, top: int = 200):
+def listar_mensajes_en_carpeta(
+    folder_id: str,
+    top: int = 200,
+    unread_only: bool | None = None,
+    since_days: int | None = None,
+):
     fid = quote(folder_id, safe="")
     url = f"{GRAPH}/{_user_segment()}/mailFolders/{fid}/messages"
+
+    if unread_only is None:
+        unread_only = _env_bool("MAIL_UNREAD_ONLY", True)
+
+    if since_days is None:
+        since_days = _env_int("MAIL_LOOKBACK_DAYS", None)
+
+    max_env = _env_int("MAX_MESSAGES", 200) or 200
+    top = min(int(top or 200), 500, max_env)
+
     params = {
-        "$select": "id,subject,hasAttachments,receivedDateTime,conversationId,isRead",
+        "$select": "id,subject,hasAttachments,receivedDateTime,conversationId,isRead,bodyPreview",
         "$orderby": "receivedDateTime desc",
-        "$top": str(min(top, 500)),
-        "$filter": "isRead eq false",
+        "$top": str(top),
     }
+
+    filtros = []
+    if since_days is not None and since_days > 0:
+        dt = datetime.now(timezone.utc) - timedelta(days=int(since_days))
+        iso = dt.isoformat().replace("+00:00", "Z")
+        filtros.append(f"receivedDateTime ge {iso}")
+
+    if unread_only:
+        filtros.append("isRead eq false")
+
+    if filtros:
+        params["$filter"] = " and ".join(filtros)
+
     q = "&".join([f"{k}={quote(v, safe='(),:$ ')}" for k, v in params.items()])
     data = _get_json_with_retries(f"{url}?{q}", retries=2, timeout=TIMEOUT)
     return (data or {}).get("value", [])

@@ -1,0 +1,148 @@
+✅ Guía oficial: Cambiar la ruta de guardado en SharePoint (Facturas Procesador)
+0) Qué vas a cambiar
+
+Este cambio mueve el destino en SharePoint donde el sistema guarda:
+
+adjuntos
+
+extraídos
+
+excel en nube (Workbook API)
+
+carpetas técnicas del flujo
+
+📌 Variables involucradas (en .env):
+
+SP_HOSTNAME
+
+SP_SITE_PATH
+
+SP_DRIVE_ID
+
+SP_FOLDER
+
+1) Identificar el SITE (SP_SITE_PATH)
+
+Mira la URL en el navegador:
+
+Ejemplo:
+
+https://joycocia.sharepoint.com/confin/... → SP_SITE_PATH=/confin
+
+https://joycocia.sharepoint.com/sites/Comunicacionesy... → SP_SITE_PATH=/sites/Comunicacionesy...
+
+✅ Deja SP_HOSTNAME=joycocia.sharepoint.com.
+
+2) Listar bibliotecas (DRIVES) y escoger la correcta
+
+En .env pon temporalmente:
+
+SP_HOSTNAME=joycocia.sharepoint.com
+SP_SITE_PATH=/EL_SITE_QUE_CORRESPONDA
+
+Ejecuta:
+
+python -m tests.sp_list_drives
+
+✅ Busca en la salida el drive que corresponda a tu carpeta (por nombre):
+
+Ej: 01 DATOS GENERALES, Documentos, etc.
+
+Copia el id y ponlo en .env:
+
+SP_DRIVE_ID=b!....
+3) Descubrir la ruta de carpeta dentro del drive (SP_FOLDER)
+
+Primero deja SP_FOLDER vacío para listar el root del drive:
+
+SP_FOLDER=
+
+Ejecuta:
+
+python -m tests.sp_list
+
+✅ Eso te muestra las carpetas raíz del drive.
+
+Ahora vas armando el path real (tal cual aparece) y lo pruebas:
+
+Ejemplo:
+
+SP_FOLDER=01 Causaciones y Facturacion/03 Pruebas Facturación
+
+Vuelves a ejecutar:
+
+python -m tests.sp_list
+
+✅ Si lista items (aunque sean 0) → la ruta existe.
+
+⚠️ Si sale 404 → path mal escrito o drive equivocado.
+
+4) Crear/verificar subcarpetas técnicas y probar subida real
+
+Ejecuta:
+
+python -m tests.sp_check
+
+✅ Debe:
+
+crear/verificar:
+
+.../adjuntos
+
+.../extraidos
+
+.../excel
+
+subir _probar_subida.txt a .../excel/
+
+Verificación final:
+
+En SharePoint debe verse el archivo:
+
+_probar_subida.txt
+
+5) Confirmación “listo para producción”
+
+Cuando sp_check pase, ya puedes correr el flujo normal (main_aprobadas.py) con tranquilidad.
+
+📌 Recomendación:
+
+Deja esta ruta anotada en tu bitácora (como “ruta activa actual”)
+
+No vuelvas a tocar nada más.
+
+🧯 Checklist rápido de errores comunes
+❌ Error 404
+
+SP_FOLDER no existe dentro de ese SP_DRIVE_ID
+
+o estás en el drive correcto pero la ruta tiene:
+
+tildes distintas
+
+espacios dobles
+
+nombre diferente
+
+✅ Solución: volver a listar root con SP_FOLDER= y reconstruir.
+
+❌ Error 403
+
+permiso del app en esa biblioteca/site
+
+✅ Solución: revisar permisos Graph / SharePoint (app registration).
+
+🧾 Plantilla lista para copiar (cuando cambies ruta)
+
+Solo reemplaza valores:
+
+SP_HOSTNAME=joycocia.sharepoint.com
+SP_SITE_PATH=/XXXX
+SP_DRIVE_ID=b!XXXX
+SP_FOLDER=AAAA/BBBB/CCCC
+
+Y ejecutas en orden:
+
+python -m tests.sp_list_drives
+python -m tests.sp_list
+python -m tests.sp_check
