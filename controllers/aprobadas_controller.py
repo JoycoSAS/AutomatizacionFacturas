@@ -224,6 +224,10 @@ def _token_es_util_para_match(token: str) -> bool:
     if not t:
         return False
 
+    # permitir números puros útiles
+    if re.fullmatch(r"\d{4,20}", t):
+        return True
+
     if len(t) < 5:
         return False
 
@@ -325,10 +329,20 @@ def _tokens_match_from_text(texto: str) -> List[str]:
         return []
 
     patrones = [
+        # Prefijo + número
         r"[A-Z]{1,10}\s*[-]?\s*\d{2,20}",
+
+        # Prefijo + bloque + número
         r"[A-Z]{1,10}\s*[-]?\s*\d{1,10}\s*[-]?\s*\d{2,20}",
+
+        # Número + sufijo letras
         r"\d{2,20}\s*[-]?\s*[A-Z]{1,6}",
+
+        # Compactos tipo COL1106
         r"[A-Z]{2,20}\d{2,20}",
+
+        # Números puros útiles
+        r"\b\d{4,20}\b",
     ]
 
     out: List[str] = []
@@ -340,8 +354,21 @@ def _tokens_match_from_text(texto: str) -> List[str]:
             k = _normalizar_numero_match(raw)
             if not k:
                 continue
+
+            # descarta números ridículamente cortos
+            if re.fullmatch(r"\d{1,3}", k):
+                continue
+
+            # si es numérico puro y tiene longitud razonable, permitirlo
+            if re.fullmatch(r"\d{4,20}", k):
+                if k not in seen:
+                    seen.add(k)
+                    out.append(k)
+                continue
+
             if not _token_es_util_para_match(k):
                 continue
+
             if k not in seen:
                 seen.add(k)
                 out.append(k)

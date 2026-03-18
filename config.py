@@ -22,16 +22,16 @@ HISTORIAL_EXCEL = os.path.join(DATA_DIR, "historial_ejecuciones.xlsx")
 STORE_NAME = "radicacion@joyco.com.co"
 
 APROB_FOLDER_NAME = "solo aprobadas"
-APROB_SEARCH_SINCE_DAYS = 965
+APROB_SEARCH_SINCE_DAYS = 90
 
 MATCH_PRIORIDAD = ["CUFE", "NUMERO_FECHA"]
 
 APROB_CAT_OK = "AprobMatchOK"
 APROB_CAT_ERROR = "AprobMatchError"
 
-AUTO_STOP_MIN_PROCESADOS = 9999
-AUTO_STOP_SIN_MATCH_CONSEC = 9999
-AUTO_STOP_SIN_NUEVOS_CONSEC = 9999
+AUTO_STOP_MIN_PROCESADOS = 9
+AUTO_STOP_SIN_MATCH_CONSEC = 9
+AUTO_STOP_SIN_NUEVOS_CONSEC = 9
 
 # ============================================================
 # FLUJO ESPECIAL DIAN
@@ -87,7 +87,7 @@ RADICADOS_LOCAL_PATH = os.path.join(RADICADOS_LOCAL_DIR, RADICADOS_LOCAL_FILENAM
 # ============================================================
 STATE_DIR = os.path.join(DATA_DIR, "state")
 PROCESSED_MESSAGES_PATH = os.path.join(STATE_DIR, "processed_messages.json")
-PROCESSED_MESSAGES_TTL_DAYS = 10000
+PROCESSED_MESSAGES_TTL_DAYS = 20000
 
 # ============================================================
 # AttachmentIndexStore
