@@ -1,9 +1,9 @@
-# utils/attachment_index_store.py
 import json
 import os
 import time
 import datetime
-from typing import Any, Dict, List, Optional, Tuple
+import re
+from typing import Any, Dict, List, Optional
 
 from utils.text_normalizer import normalize_text
 
@@ -13,191 +13,261 @@ def _utc_now_ts() -> int:
 
 
 def _parse_iso_to_ts(iso_str: str) -> Optional[int]:
-    """
-    Convierte '2025-11-24T15:30:10Z' o con offset a epoch ts.
-    """
     if not iso_str:
         return None
-    s = iso_str.strip()
+
+    s = str(iso_str).strip()
+
     try:
-        # Graph suele traer Z
         if s.endswith("Z"):
             dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
         else:
             dt = datetime.datetime.fromisoformat(s)
+
         return int(dt.timestamp())
+
     except Exception:
         return None
 
 
 def _safe_read_json(path: str) -> Dict[str, Any]:
-    if not os.path.exists(path):
+
+    if not path or not os.path.exists(path):
         return {}
+
     try:
+
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f) or {}
+            data = json.load(f)
+
+            if isinstance(data, dict):
+                return data
+
     except Exception:
-        return {}
+        pass
+
+    return {}
 
 
-def _safe_write_json(path: str, data: Dict[str, Any]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+def _safe_write_json(path: str, data: Dict[str, Any]):
+
+    folder = os.path.dirname(path)
+
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+
     tmp = path + ".tmp"
+
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
     os.replace(tmp, path)
 
 
 def _norm_cufe(cufe: str) -> str:
+
     if not cufe:
         return ""
-    # cufe ya viene en hex normalmente; pero por si acaso:
-    s = normalize_text(cufe)
-    # dejamos solo 0-9a-f
+
+    s = normalize_text(str(cufe))
+
     out = []
+
     for ch in s:
         if ch in "0123456789abcdef":
             out.append(ch)
+
     return "".join(out)
 
 
 def _norm_num(n: str) -> str:
-    """
-    Normalización de número de factura para usarlo como clave:
-    - sin espacios
-    - mayúsculas
-    - deja letras/números y separadores comunes (- / .)
-    - también guardamos una "compacta" sin separadores para búsquedas flexibles
-    """
+
     if not n:
         return ""
+
     s = str(n).strip().upper()
-    s = s.replace("–", "-").replace("—", "-")
-    # colapsa espacios
-    s = " ".join(s.split())
+
+    s = s.replace("–", "-")
+    s = s.replace("—", "-")
+    s = s.replace("_", "-")
+
+    s = re.sub(r"\s+", " ", s).strip()
+
+    s = re.sub(r"[^A-Z0-9\-/. ]", "", s)
+
+    s = re.sub(r"\s*-\s*", "-", s)
+    s = re.sub(r"\s*/\s*", "/", s)
+    s = re.sub(r"\s*\.\s*", ".", s)
+
+    s = re.sub(r"\s+", " ", s).strip()
+
     return s
 
 
+def _solo_alnum(s: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", (s or "").upper())
+
+
 def _num_variants(n: str) -> List[str]:
-    s = _norm_num(n)
-    if not s:
+
+    base = _norm_num(n)
+
+    if not base:
         return []
-    compact = "".join(ch for ch in s if ch.isalnum())
-    # variant con separadores normalizados (sin espacios alrededor)
-    s2 = s.replace(" ", "")
-    out = [s2]
-    if compact and compact != s2:
-        out.append(compact)
-    # sin puntos
-    no_dots = s2.replace(".", "")
-    if no_dots != s2:
-        out.append(no_dots)
-    # sin guiones
-    no_dash = s2.replace("-", "")
-    if no_dash != s2:
-        out.append(no_dash)
-    # únicos manteniendo orden
+
+    out: List[str] = []
+
+    def add(v: str):
+
+        v = (v or "").strip()
+
+        if v and v not in out:
+            out.append(v)
+
+    add(base)
+
+    add(base.replace(" ", ""))
+
+    add(base.replace(" ", "").replace(".", ""))
+
+    add(base.replace(" ", "").replace("-", ""))
+
+    add(_solo_alnum(base))
+
+    compact = _solo_alnum(base)
+
+    m = re.match(r"^([A-Z]+)(\d+)$", compact)
+
+    if m:
+
+        pref, dig = m.groups()
+
+        add(f"{pref}{dig}")
+        add(f"{pref}-{dig}")
+        add(f"{pref} {dig}")
+
+    m2 = re.match(r"^([A-Z]+)[\s\-/.]*(\d+)$", base)
+
+    if m2:
+
+        pref, dig = m2.groups()
+
+        add(f"{pref}{dig}")
+        add(f"{pref}-{dig}")
+        add(f"{pref} {dig}")
+
+    uniq: List[str] = []
+
     seen = set()
-    uniq = []
-    for x in out:
-        if x and x not in seen:
-            seen.add(x)
-            uniq.append(x)
+
+    for value in out:
+
+        if value and value not in seen:
+
+            seen.add(value)
+
+            uniq.append(value)
+
     return uniq
 
 
 def _norm_fecha(fecha: str) -> str:
-    """
-    Espera fechas ya normalizadas a 'YYYY-MM-DD' en tu flujo.
-    Si viene 'YYYY-MM', la deja igual. Si viene vacía, ''.
-    """
+
     if not fecha:
         return ""
+
     return str(fecha).strip()
 
 
 class AttachmentIndexStore:
-    """
-    Un solo JSON con secciones:
-      - zip_by_cufe: { cufe: entry }
-      - zip_by_nf: { "NUM|FECHA": [entry, entry, ...] }
-      - conta15_by_cufe: { cufe: entry }
-    """
 
     def __init__(
         self,
         path: str,
         ttl_days: int = 365,
         max_nf_per_key: int = 10,
+        max_num_per_key: int = 10,
     ):
+
         self.path = path
+
         self.ttl_days = max(1, int(ttl_days))
+
         self.max_nf_per_key = max(1, int(max_nf_per_key))
+
+        self.max_num_per_key = max(1, int(max_num_per_key))
+
         self._data = _safe_read_json(self.path)
+
         self._ensure_shape()
 
-    def _ensure_shape(self) -> None:
+    def _ensure_shape(self):
+
         if not isinstance(self._data, dict):
             self._data = {}
+
         self._data.setdefault("meta", {})
+
         self._data.setdefault("zip_by_cufe", {})
+        self._data.setdefault("zip_by_num", {})
         self._data.setdefault("zip_by_nf", {})
         self._data.setdefault("conta15_by_cufe", {})
 
-    def _save(self) -> None:
+    def _save(self):
+
+        self._data["meta"]["updated_ts"] = _utc_now_ts()
+
         _safe_write_json(self.path, self._data)
 
     def purge(self) -> int:
-        """
-        Borra entradas viejas basado en ts (received_ts o added_ts).
-        Retorna cantidad borrada.
-        """
+
         cutoff = _utc_now_ts() - int(self.ttl_days * 86400)
+
         removed = 0
 
-        def is_old(entry: Dict[str, Any]) -> bool:
+        def is_old(entry):
+
             ts = entry.get("received_ts") or entry.get("added_ts") or 0
+
             try:
                 ts = int(ts)
             except Exception:
                 ts = 0
-            return ts and ts < cutoff
 
-        # zip_by_cufe
-        zc = self._data.get("zip_by_cufe", {})
-        for k in list(zc.keys()):
-            if is_old(zc.get(k, {})):
-                del zc[k]
+            return bool(ts) and ts < cutoff
+
+        for key in list(self._data["zip_by_cufe"].keys()):
+
+            if is_old(self._data["zip_by_cufe"][key]):
+
+                del self._data["zip_by_cufe"][key]
+
                 removed += 1
 
-        # zip_by_nf (listas)
-        znf = self._data.get("zip_by_nf", {})
-        for k in list(znf.keys()):
-            arr = znf.get(k) or []
-            if not isinstance(arr, list):
-                arr = []
-            new_arr = [e for e in arr if not is_old(e)]
-            if not new_arr:
-                if k in znf:
-                    del znf[k]
-                removed += 1
-            else:
-                znf[k] = new_arr
+        for table in ["zip_by_num", "zip_by_nf"]:
 
-        # conta15_by_cufe
-        c15 = self._data.get("conta15_by_cufe", {})
-        for k in list(c15.keys()):
-            if is_old(c15.get(k, {})):
-                del c15[k]
-                removed += 1
+            data = self._data.get(table, {})
+
+            for key in list(data.keys()):
+
+                arr = data.get(key) or []
+
+                new_arr = [entry for entry in arr if not is_old(entry)]
+
+                if not new_arr:
+
+                    del data[key]
+
+                    removed += 1
+
+                else:
+
+                    data[key] = new_arr
 
         if removed:
             self._save()
-        return removed
 
-    # -------------------
-    # ZIP (XML) indexing
-    # -------------------
+        return removed
 
     def upsert_zip(
         self,
@@ -208,9 +278,14 @@ class AttachmentIndexStore:
         att_id: str,
         att_name: str,
         received_dt_iso: str = "",
-    ) -> None:
+    ):
+
         cufe_n = _norm_cufe(cufe)
+
+        numero_n = _norm_num(numero)
+
         fecha_n = _norm_fecha(fecha)
+
         numero_vars = _num_variants(numero)
 
         entry = {
@@ -221,28 +296,48 @@ class AttachmentIndexStore:
             "received_ts": _parse_iso_to_ts(received_dt_iso) or 0,
             "added_ts": _utc_now_ts(),
             "cufe": cufe_n,
-            "numero": _norm_num(numero),
+            "numero": numero_n,
             "fecha": fecha_n,
         }
 
-        # por CUFE (1 a 1)
         if cufe_n:
             self._data["zip_by_cufe"][cufe_n] = entry
 
-        # por NUM+FECHA (pueden existir varios: guardamos lista corta)
-        if fecha_n and numero_vars:
+        for nv in numero_vars:
+
+            arr = self._data["zip_by_num"].get(nv, [])
+
+            exists = any(
+                e["msg_id"] == msg_id and e["att_id"] == att_id
+                for e in arr
+            )
+
+            if not exists:
+
+                arr.insert(0, entry)
+
+            if len(arr) > self.max_num_per_key:
+
+                arr = arr[: self.max_num_per_key]
+
+            self._data["zip_by_num"][nv] = arr
+
+        if fecha_n:
+
             for nv in numero_vars:
+
                 key = f"{nv}|{fecha_n}"
-                arr = self._data["zip_by_nf"].get(key)
-                if not isinstance(arr, list):
-                    arr = []
 
-                # evita duplicar mismo msg_id+att_id
-                exists = any((e.get("msg_id") == msg_id and e.get("att_id") == att_id) for e in arr)
+                arr = self._data["zip_by_nf"].get(key, [])
+
+                exists = any(
+                    e["msg_id"] == msg_id and e["att_id"] == att_id
+                    for e in arr
+                )
+
                 if not exists:
-                    arr.insert(0, entry)  # lo más reciente primero
+                    arr.insert(0, entry)
 
-                # recorta
                 if len(arr) > self.max_nf_per_key:
                     arr = arr[: self.max_nf_per_key]
 
@@ -251,57 +346,46 @@ class AttachmentIndexStore:
         self._save()
 
     def find_zip_by_cufe(self, cufe: str) -> Optional[Dict[str, Any]]:
+
         cufe_n = _norm_cufe(cufe)
+
         if not cufe_n:
             return None
-        return self._data.get("zip_by_cufe", {}).get(cufe_n)
 
-    def find_zip_by_num_fecha(self, numero: str, fecha: str) -> Optional[Dict[str, Any]]:
-        fecha_n = _norm_fecha(fecha)
-        if not fecha_n:
-            return None
+        return self._data["zip_by_cufe"].get(cufe_n)
+
+    def find_zip_by_numero(self, numero: str) -> Optional[Dict[str, Any]]:
+
         for nv in _num_variants(numero):
-            key = f"{nv}|{fecha_n}"
-            arr = self._data.get("zip_by_nf", {}).get(key)
-            if isinstance(arr, list) and arr:
-                # devolver el más reciente (arr[0])
+
+            arr = self._data["zip_by_num"].get(nv)
+
+            if arr:
                 return arr[0]
+
+        target = _solo_alnum(numero)
+
+        for key, arr in self._data["zip_by_num"].items():
+
+            if _solo_alnum(key) == target and arr:
+                return arr[0]
+
         return None
 
-    # -------------------------
-    # CONTA15 (PDF DIAN) index
-    # -------------------------
+    def find_zip_by_num_fecha(self, numero: str, fecha: str) -> Optional[Dict[str, Any]]:
 
-    def upsert_conta15_pdf(
-        self,
-        cufe: str,
-        msg_id: str,
-        att_id: str,
-        att_name: str,
-        subject: str = "",
-        received_dt_iso: str = "",
-    ) -> None:
-        cufe_n = _norm_cufe(cufe)
-        if not cufe_n:
-            return
+        fecha_n = _norm_fecha(fecha)
 
-        entry = {
-            "msg_id": msg_id,
-            "att_id": att_id,
-            "att_name": att_name or "",
-            "subject": subject or "",
-            "subject_norm": normalize_text(subject),
-            "received_dt": received_dt_iso or "",
-            "received_ts": _parse_iso_to_ts(received_dt_iso) or 0,
-            "added_ts": _utc_now_ts(),
-            "cufe": cufe_n,
-        }
-
-        self._data["conta15_by_cufe"][cufe_n] = entry
-        self._save()
-
-    def find_conta15_by_cufe(self, cufe: str) -> Optional[Dict[str, Any]]:
-        cufe_n = _norm_cufe(cufe)
-        if not cufe_n:
+        if not fecha_n:
             return None
-        return self._data.get("conta15_by_cufe", {}).get(cufe_n)
+
+        for nv in _num_variants(numero):
+
+            key = f"{nv}|{fecha_n}"
+
+            arr = self._data["zip_by_nf"].get(key)
+
+            if arr:
+                return arr[0]
+
+        return None

@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 
 # ============================================================
-# Paths base (más estable que sys.argv[0] para tests)
+# Paths base
 # ============================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
@@ -22,10 +22,7 @@ HISTORIAL_EXCEL = os.path.join(DATA_DIR, "historial_ejecuciones.xlsx")
 STORE_NAME = "radicacion@joyco.com.co"
 
 APROB_FOLDER_NAME = "solo aprobadas"
-
-# ⚠️ Para “cargar histórico” puedes dejarlo alto (ej: 365).
-# Luego bájalo a 4 cuando ya estés en operación diaria.
-APROB_SEARCH_SINCE_DAYS = 365
+APROB_SEARCH_SINCE_DAYS = 965
 
 MATCH_PRIORIDAD = ["CUFE", "NUMERO_FECHA"]
 
@@ -37,26 +34,31 @@ AUTO_STOP_SIN_MATCH_CONSEC = 9999
 AUTO_STOP_SIN_NUEVOS_CONSEC = 9999
 
 # ============================================================
-# ✅ FLUJO ESPECIAL "DIAN" (PDF-only desde "Validación(s) DIAN")
+# FLUJO ESPECIAL DIAN
 # ============================================================
-# Palabra clave que activa el flujo especial dentro de "solo aprobadas"
 APROB_DIAN_KEYWORD = "DIAN"
 
-# Asuntos aceptados del correo contenedor en INBOX donde están "todos los PDFs"
-# (se normaliza: sin tildes, sin dobles espacios, etc.)
+# Más amplio y tolerante
 INBOX_DIAN_SUBJECT_CANDIDATES = [
+    "DIAN",
     "VALIDACION DIAN",
     "VALIDACIONES DIAN",
-    "VALIDACIÓN DIAN",
-    "VALIDACIONES DIAN",
+    "VALIDACION",
+    "VALIDACIONES",
+    "02-VALIDACION DIAN",
+    "02 VALIDACION DIAN",
+    "02-VALIDACIONES DIAN",
+    "02 VALIDACIONES DIAN",
+    "VALIDACION DIAN JOYCO",
+    "VALIDACIONES DIAN JOYCO",
+    "DIAN VIAL",
 ]
 
-# Si el mensaje NO trae bodyPreview desde Graph, se hace fallback a solo asunto.
-# True = exigir DIAN también en bodyPreview si existe.
+# True = si hay preview, también valida ahí; si no hay, cae a asunto
 REQUIRE_DIAN_IN_BODY_PREVIEW = True
 
 # ============================================================
-# ✅ RADICADOS: Control Correspondencia (SharePoint / Drive nuevo)
+# RADICADOS
 # ============================================================
 RADICADOS_SP_RELATIVE_PATH = (
     "Control de correspondencia Oficina Principal/"
@@ -74,40 +76,37 @@ FACT_COL_RAD = "Radicado"
 FACT_COL_PROY = "ProyectoProceso"
 
 # ============================================================
-# ✅ RADICADOS: ruta local estándar (para tests y ejecución)
+# RADICADOS local
 # ============================================================
 RADICADOS_LOCAL_DIR = os.path.join(TEMP_CHECK_DIR, "radicados")
 RADICADOS_LOCAL_FILENAME = "Control correspondencia Oficina Principal.xlsx"
 RADICADOS_LOCAL_PATH = os.path.join(RADICADOS_LOCAL_DIR, RADICADOS_LOCAL_FILENAME)
 
 # ============================================================
-# STATE (ProcessedStore)
+# STATE
 # ============================================================
 STATE_DIR = os.path.join(DATA_DIR, "state")
 PROCESSED_MESSAGES_PATH = os.path.join(STATE_DIR, "processed_messages.json")
-PROCESSED_MESSAGES_TTL_DAYS = 2000
+PROCESSED_MESSAGES_TTL_DAYS = 10000
 
 # ============================================================
-# AttachmentIndexStore (ZIP históricos)
+# AttachmentIndexStore
 # ============================================================
 ATTACHMENT_INDEX_PATH = os.path.join(STATE_DIR, "attachment_index_store.json")
-ATTACHMENT_INDEX_TTL_DAYS = 765
+ATTACHMENT_INDEX_TTL_DAYS = 965
 
 # ============================================================
-# ✅ AUDITORÍA CSV (rotación diaria)
+# Auditoría CSV
 # ============================================================
 AUDIT_DIR = os.path.join(DATA_DIR, "audit")
-AUDIT_RUNS_PREFIX = "audit_runs"         # audit_runs_YYYY-MM-DD.csv
-AUDIT_DETALLE_PREFIX = "audit_detalle"   # audit_detalle_YYYY-MM-DD.csv
-
-# True = no escribir CSV si no hubo nada que procesar (modo recomendado para "cada minuto")
+AUDIT_RUNS_PREFIX = "audit_runs"
+AUDIT_DETALLE_PREFIX = "audit_detalle"
 AUDIT_WRITE_ONLY_IF_ACTIVITY = True
 
 # ============================================================
-# ✅ LOCK (anti-ejecución simultánea)
+# Lock
 # ============================================================
 LOCK_FILE_APROBADAS = os.path.join(STATE_DIR, "aprobadas.lock")
 
-# TTL del lock: si por alguna razón un proceso muere y deja el lock,
-# pasados X segundos se considera stale y se reemplaza.
-LOCK_TTL_SECONDS = 60 * 30  # 30 minutos
+# 4 horas
+LOCK_TTL_SECONDS = 240 * 60

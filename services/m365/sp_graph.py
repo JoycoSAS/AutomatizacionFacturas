@@ -24,7 +24,10 @@ DRIVE_ID = DRIVE_ID_DEFAULT  # NO BORRAR
 SP_FOLDER = (os.getenv("SP_FOLDER") or "").strip().strip("/")
 
 SSL_VERIFY = (os.getenv("SSL_VERIFY", "true").lower() == "true")
-TIMEOUT = (15, 60)
+
+# (connect_timeout, read_timeout)
+TIMEOUT = (20, 120)
+UPLOAD_TIMEOUT = (20, 300)
 
 _SESSION = requests.Session()
 _SESSION.headers.update({"Accept": "application/json"})
@@ -58,29 +61,70 @@ def _h(ct: str | None = None) -> dict:
     return h
 
 
-def _req(call, max_retries: int = 4):
-    attempt = 0
-    while True:
-        r = call()
-        if r.status_code < 400:
-            return r
+def _sleep_backoff(attempt: int, max_wait: float = 20.0):
+    wait = min(2 ** max(1, attempt), max_wait)
+    time.sleep(wait)
 
-        if r.status_code in (429, 500, 502, 503, 504) and attempt < max_retries:
-            attempt += 1
-            wait = r.headers.get("Retry-After")
-            try:
-                wait = float(wait)
-            except Exception:
-                wait = min(2 ** attempt, 15)
-            time.sleep(wait)
-            continue
 
+def _extract_error_body(response: requests.Response):
+    try:
+        return response.json()
+    except Exception:
         try:
-            body = r.json()
+            return response.text
         except Exception:
-            body = r.text
-        print(f"[Graph ERROR] {r.status_code} {r.request.method} {r.url} -> {body}")
-        r.raise_for_status()
+            return "<sin body>"
+
+
+def _req(call, max_retries: int = 4):
+    """
+    Wrapper general con retry para:
+    - 429
+    - 500/502/503/504
+    - ReadTimeout / ConnectionError
+    """
+    attempt = 0
+
+    while True:
+        try:
+            r = call()
+
+            if r.status_code < 400:
+                return r
+
+            if r.status_code in (429, 500, 502, 503, 504) and attempt < max_retries:
+                attempt += 1
+                retry_after = r.headers.get("Retry-After")
+                try:
+                    wait = float(retry_after)
+                except Exception:
+                    wait = min(2 ** attempt, 20)
+
+                print(
+                    f"[Graph RETRY] HTTP {r.status_code}. "
+                    f"Reintento {attempt}/{max_retries} en {wait:.1f}s"
+                )
+                time.sleep(wait)
+                continue
+
+            body = _extract_error_body(r)
+            print(f"[Graph ERROR] {r.status_code} {r.request.method} {r.url} -> {body}")
+            r.raise_for_status()
+
+        except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as e:
+            if attempt < max_retries:
+                attempt += 1
+                wait = min(2 ** attempt, 20)
+                print(
+                    f"[Graph RETRY] {type(e).__name__}. "
+                    f"Reintento {attempt}/{max_retries} en {wait:.1f}s"
+                )
+                time.sleep(wait)
+                continue
+            raise
+
+        except requests.exceptions.RequestException:
+            raise
 
 
 # -------------------------
@@ -99,19 +143,28 @@ def get_item_by_path(rel_path: str, drive_id: str | None = None) -> dict:
 
 
 def _exists(rel_path: str, drive_id: str | None = None) -> bool:
+    """
+    Verifica existencia sin levantar excepción por 404.
+    Si hay timeout/error de red, devuelve False.
+    """
     d = _drive(drive_id)
     rel_path = (rel_path or "").replace("\\", "/").strip("/")
     url = f"{GRAPH}/drives/{d}/root:/{quote(rel_path)}:/"
-    r = _SESSION.get(url, headers=_h(), timeout=TIMEOUT, verify=SSL_VERIFY)
-    return r.status_code == 200
+
+    try:
+        r = _SESSION.get(url, headers=_h(), timeout=TIMEOUT, verify=SSL_VERIFY)
+        return r.status_code == 200
+    except Exception:
+        return False
 
 
 # -------------------------
 # Carpetas
 # -------------------------
-def ensure_folder(rel_path: str, drive_id: str | None = None):
+def ensure_folder(rel_path: str, drive_id: str | None = None, max_retries: int = 3):
     """
     Asegura una carpeta (y sus padres) en el drive indicado.
+    Versión robusta ante timeouts de Graph.
     """
     rel_path = (rel_path or "").replace("\\", "/").strip("/")
     if not rel_path:
@@ -123,36 +176,68 @@ def ensure_folder(rel_path: str, drive_id: str | None = None):
 
     for seg in parts:
         current = f"{current}/{seg}" if current else seg
+        attempt = 0
 
-        get_url = f"{GRAPH}/drives/{d}/root:/{quote(current)}:/"
-        r = _SESSION.get(get_url, headers=_h(), timeout=TIMEOUT, verify=SSL_VERIFY)
-        if r.status_code == 200:
-            continue
+        while True:
+            try:
+                get_url = f"{GRAPH}/drives/{d}/root:/{quote(current)}:/"
+                r = _SESSION.get(get_url, headers=_h(), timeout=TIMEOUT, verify=SSL_VERIFY)
 
-        if r.status_code == 404:
-            parent = "/".join(current.split("/")[:-1]).strip("/")
-            post_url = (
-                f"{GRAPH}/drives/{d}/root:/{quote(parent)}:/children"
-                if parent
-                else f"{GRAPH}/drives/{d}/root/children"
-            )
-            payload = {
-                "name": seg,
-                "folder": {},
-                "@microsoft.graph.conflictBehavior": "rename",
-            }
-            _req(
-                lambda: _SESSION.post(
-                    post_url,
-                    headers=_h("application/json"),
-                    data=json.dumps(payload),
-                    timeout=TIMEOUT,
-                    verify=SSL_VERIFY,
+                if r.status_code == 200:
+                    break
+
+                if r.status_code == 404:
+                    parent = "/".join(current.split("/")[:-1]).strip("/")
+                    post_url = (
+                        f"{GRAPH}/drives/{d}/root:/{quote(parent)}:/children"
+                        if parent
+                        else f"{GRAPH}/drives/{d}/root/children"
+                    )
+
+                    payload = {
+                        "name": seg,
+                        "folder": {},
+                        "@microsoft.graph.conflictBehavior": "rename",
+                    }
+
+                    _req(
+                        lambda: _SESSION.post(
+                            post_url,
+                            headers=_h("application/json"),
+                            data=json.dumps(payload),
+                            timeout=TIMEOUT,
+                            verify=SSL_VERIFY,
+                        )
+                    )
+                    break
+
+                # para cualquier otro error HTTP dejamos que _req lo trate
+                _req(lambda: _SESSION.get(get_url, headers=_h(), timeout=TIMEOUT, verify=SSL_VERIFY))
+                break
+
+            except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as e:
+                attempt += 1
+                if attempt > max_retries:
+                    print(f"[SP ensure_folder] Error definitivo en '{current}': {e}")
+                    raise
+                wait = min(2 ** attempt, 20)
+                print(
+                    f"[SP ensure_folder] Timeout/conexión en '{current}'. "
+                    f"Reintento {attempt}/{max_retries} en {wait:.1f}s"
                 )
-            )
-            continue
+                time.sleep(wait)
 
-        _req(lambda: _SESSION.get(get_url, headers=_h(), timeout=TIMEOUT, verify=SSL_VERIFY))
+            except requests.exceptions.RequestException as e:
+                attempt += 1
+                if attempt > max_retries:
+                    print(f"[SP ensure_folder] Error HTTP definitivo en '{current}': {e}")
+                    raise
+                wait = min(2 ** attempt, 20)
+                print(
+                    f"[SP ensure_folder] Error HTTP en '{current}'. "
+                    f"Reintento {attempt}/{max_retries} en {wait:.1f}s"
+                )
+                time.sleep(wait)
 
 
 # -------------------------
@@ -173,6 +258,9 @@ def upload_small_file(
     d = _drive(drive_id)
     dest_rel_path = str(dest_rel_path).replace("\\", "/").strip("/")
 
+    if not os.path.exists(local_path):
+        raise FileNotFoundError(f"No existe el archivo local: {local_path}")
+
     parent = os.path.dirname(dest_rel_path).replace("\\", "/").strip("/")
     if parent:
         ensure_folder(parent, drive_id=d)
@@ -190,10 +278,11 @@ def upload_small_file(
             put_url,
             headers=_h(),
             data=data,
-            timeout=(TIMEOUT[0], 300),
+            timeout=UPLOAD_TIMEOUT,
             verify=SSL_VERIFY,
         )
     )
+
     try:
         return r.json()
     except Exception:
@@ -247,11 +336,17 @@ def download_small_file(sp_relative_path: str, local_path: str, drive_id: str | 
 
         r = _req(
             lambda: _SESSION.get(
-                url, headers=_h(), timeout=(TIMEOUT[0], 300), verify=SSL_VERIFY
+                url,
+                headers=_h(),
+                timeout=UPLOAD_TIMEOUT,
+                verify=SSL_VERIFY,
             )
         )
 
-        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        parent = os.path.dirname(local_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
         with open(local_path, "wb") as f:
             f.write(r.content)
 

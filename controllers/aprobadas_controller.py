@@ -1,4 +1,3 @@
-# controllers/aprobadas_controller.py
 import os
 import io
 import re
@@ -26,16 +25,10 @@ from config import (
     AUTO_STOP_MIN_PROCESADOS, AUTO_STOP_SIN_MATCH_CONSEC, AUTO_STOP_SIN_NUEVOS_CONSEC,
     PROCESSED_MESSAGES_PATH, PROCESSED_MESSAGES_TTL_DAYS,
     ATTACHMENT_INDEX_PATH, ATTACHMENT_INDEX_TTL_DAYS,
-
-    # DIAN
     APROB_DIAN_KEYWORD,
     INBOX_DIAN_SUBJECT_CANDIDATES,
     REQUIRE_DIAN_IN_BODY_PREVIEW,
-
-    # AUDIT
     AUDIT_DIR, AUDIT_RUNS_PREFIX, AUDIT_DETALLE_PREFIX, AUDIT_WRITE_ONLY_IF_ACTIVITY,
-
-    # LOCK
     LOCK_FILE_APROBADAS, LOCK_TTL_SECONDS,
 )
 
@@ -69,7 +62,6 @@ from utils.pdf_utils import (
     extraer_campos_basicos_pdf
 )
 
-from utils.normalizacion_facturas import claves_normalizadas_factura
 from services.aprobaciones_service import sincronizar_aprobaciones_en_facturas
 from services.m365.excel_workbook_graph import ExcelWorkbookGraph
 
@@ -79,10 +71,11 @@ EXT_HOY = os.path.join(DATA_DIR, "extraidos", "hoy")
 
 USE_DATE_SUBFOLDERS = False
 
+_CTRL_REGEX = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
+_AMP_FIX = re.compile(r"&(?!(?:[a-zA-Z]+|#\d+|#x[0-9A-Fa-f]+);)")
+_NON_INVOICE_PREFIXES = {"DDI", "RAD", "RDI", "RDC", "REC", "RCP", "DOC", "REF"}
 
-# ============================================================
-# ✅ Helper: auditoría detalle (una fila por mensaje)
-# ============================================================
+
 def _push_detalle(
     detalle_rows: list,
     run_id: str,
@@ -175,6 +168,260 @@ def _cufe_is_valid(cufe: str) -> bool:
     return bool(c) and len(c) >= 40
 
 
+def _norm_numero(s: str) -> str:
+    if not s:
+        return ""
+    s = str(s).strip().upper()
+    s = s.replace("–", "-").replace("—", "-").replace("_", "-")
+    s = re.sub(r"\s+", "", s)
+    s = re.sub(r"[^A-Z0-9\-]", "", s)
+    s = re.sub(r"-{2,}", "-", s).strip("-")
+    return s
+
+
+def _solo_alnum(s: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", (s or "").upper())
+
+
+def _normalize_spaces(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+
+def _clean_name(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+
+def _is_hex_like_token(s: str) -> bool:
+    s = _solo_alnum(s or "")
+    if not s:
+        return False
+    if len(s) < 4:
+        return True
+    if re.fullmatch(r"[0-9A-F]+", s) and len(s) <= 12:
+        return True
+    return False
+
+
+def _is_uuid_like_name(name: str) -> bool:
+    stem = Path(name or "").stem.strip()
+    if not stem:
+        return False
+
+    if re.fullmatch(
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+        stem
+    ):
+        return True
+
+    if re.fullmatch(r"[0-9a-fA-F]{24,64}", stem):
+        return True
+
+    return False
+
+
+def _token_es_util_para_match(token: str) -> bool:
+    t = _solo_alnum(token or "")
+    if not t:
+        return False
+
+    if len(t) < 5:
+        return False
+
+    if _is_hex_like_token(t):
+        return False
+
+    # evita tokens demasiado cortos tipo FE10, NO89, IK17 si salen aislados
+    if re.fullmatch(r"[A-Z]{1,3}\d{1,2}", t):
+        return False
+
+    return True
+
+
+def _numero_variantes(numero: str) -> List[str]:
+    n = _norm_numero(numero)
+    if not n:
+        return []
+
+    variants = []
+
+    def add(v: str):
+        v = (v or "").strip()
+        if v and v not in variants:
+            variants.append(v)
+
+    add(n)
+    add(n.replace("-", ""))
+    add(n.replace("-", " "))
+    add(_solo_alnum(n))
+
+    m = re.match(r"^([A-Z]+)(\d+)$", _solo_alnum(n))
+    if m:
+        pref, dig = m.groups()
+        add(f"{pref}-{dig}")
+        add(f"{pref} {dig}")
+        add(f"{pref}{dig}")
+
+    m2 = re.match(r"^([A-Z]+)-(\d+)$", n)
+    if m2:
+        pref, dig = m2.groups()
+        add(f"{pref}{dig}")
+        add(f"{pref} {dig}")
+
+    # caso FVE-1-16704 -> FVE116704
+    m3 = re.match(r"^([A-Z]+)-(\d+)-(\d+)$", n)
+    if m3:
+        a, b, c = m3.groups()
+        add(f"{a}{b}{c}")
+        add(f"{a}-{b}{c}")
+        add(f"{a} {b}{c}")
+
+    return variants
+
+
+def _normalizar_numero_match(s: str) -> str:
+    if not s:
+        return ""
+    s = str(s).upper().strip()
+    s = s.replace("–", "-").replace("—", "-").replace("_", "-")
+    s = re.sub(r"\bFACTURA\b", "", s)
+    s = re.sub(r"\bFACT\b", "", s)
+    s = re.sub(r"\bNO\.\b", "", s)
+    s = re.sub(r"\bNUMERO\b", "", s)
+    s = re.sub(r"\bN[ÚU]MERO\b", "", s)
+    s = re.sub(r"\s+", "", s)
+    s = re.sub(r"[^A-Z0-9]", "", s)
+    return s.strip()
+
+
+def _numero_parece_valido(n: str) -> bool:
+    n = (n or "").strip().upper()
+    if not n:
+        return False
+
+    invalid_prefixes = (
+        "NIT", "CUFE", "UUID", "DOC", "RAD", "RDI", "RDC", "REC", "RCP",
+        "RADICADO", "ID"
+    )
+    if n.startswith(invalid_prefixes):
+        return False
+
+    solo = _solo_alnum(n)
+
+    if solo.startswith(("RADICADO", "NIT", "ID", "CUFE", "UUID")):
+        return False
+
+    if len(solo) < 4:
+        return False
+
+    if re.fullmatch(r"[A-Z]+", n):
+        return False
+
+    return True
+
+
+def _tokens_match_from_text(texto: str) -> List[str]:
+    texto = (texto or "").upper()
+    if not texto:
+        return []
+
+    patrones = [
+        r"[A-Z]{1,10}\s*[-]?\s*\d{2,20}",
+        r"[A-Z]{1,10}\s*[-]?\s*\d{1,10}\s*[-]?\s*\d{2,20}",
+        r"\d{2,20}\s*[-]?\s*[A-Z]{1,6}",
+        r"[A-Z]{2,20}\d{2,20}",
+    ]
+
+    out: List[str] = []
+    seen = set()
+
+    for pat in patrones:
+        for m in re.finditer(pat, texto):
+            raw = (m.group(0) or "").strip()
+            k = _normalizar_numero_match(raw)
+            if not k:
+                continue
+            if not _token_es_util_para_match(k):
+                continue
+            if k not in seen:
+                seen.add(k)
+                out.append(k)
+
+    return out
+
+
+def _variantes_match_numero(numero: str) -> List[str]:
+    out = []
+    seen = set()
+
+    candidatos = []
+    candidatos.extend(_numero_variantes(numero))
+    candidatos.append(numero)
+
+    for c in candidatos:
+        k = _normalizar_numero_match(c)
+        if not k:
+            continue
+        if not _token_es_util_para_match(k):
+            continue
+        if k not in seen:
+            seen.add(k)
+            out.append(k)
+
+    return out
+
+
+def _elegir_numero_principal(ident_pdf: Dict[str, str], subj: str, pdf_name: str) -> str:
+    candidatos = [
+        (ident_pdf.get("NUMERO_APROB") or "").strip(),
+        (_numero_from_subject(subj) or "").strip(),
+        (ident_pdf.get("NUMERO") or "").strip(),
+    ]
+
+    for c in candidatos:
+        if _numero_parece_valido(c):
+            return c
+
+    # solo usar nombre del archivo si NO parece uuid/guid
+    if not _is_uuid_like_name(pdf_name):
+        toks = _tokens_match_from_text(Path(pdf_name).stem)
+        for t in toks:
+            if _numero_parece_valido(t):
+                return t
+
+    for c in candidatos:
+        if c:
+            return c
+
+    return ""
+
+
+def _es_probable_factura_electronica(subj: str, pdf_name: str, ident: Dict[str, str]) -> bool:
+    texto = f"{subj} {pdf_name}".upper()
+
+    bloqueados_fuertes = [
+        "CUENTA DE COBRO",
+        "ACTA",
+        "MEMORANDO",
+        "OFICIO",
+        "COMUNICADO",
+        "CERTIFICADO",
+        "CONSTANCIA",
+        "SOLICITUD ANTICIPO",
+    ]
+
+    if any(x in texto for x in bloqueados_fuertes):
+        return False
+
+    if _cufe_is_valid(ident.get("CUFE") or ""):
+        return True
+
+    num = ident.get("NUMERO_APROB") or ident.get("NUMERO") or ""
+    if _numero_parece_valido(num):
+        return True
+
+    return False
+
+
 def _is_acta_filename(name: str) -> bool:
     s = (name or "").lower()
     s_clean = re.sub(r"\s+", " ", s)
@@ -186,31 +433,65 @@ def _is_acta_filename(name: str) -> bool:
     return any(k in s_clean for k in bad_keys)
 
 
-# ============================================================
-# Detectar DIAN en asunto + bodyPreview (si existe)
-# ============================================================
 def _contains_dian(text: str) -> bool:
     return normalize_text(APROB_DIAN_KEYWORD) in normalize_text(text or "")
 
 
-def _is_dian_trigger_message(msg: dict) -> bool:
-    subj = msg.get("subject") or ""
-    if not _contains_dian(subj):
+def _is_inbox_dian_container_subject(subj: str) -> bool:
+    s = normalize_text(subj or "")
+    if not s:
         return False
 
+    reglas_directas = [
+        "02-validacion dian",
+        "02 validacion dian",
+        "02-validaciones dian",
+        "02 validaciones dian",
+        "validacion dian",
+        "validaciones dian",
+        "validacion dian joyco",
+        "validaciones dian joyco",
+        "dian vial",
+        "correo validacion dian",
+        "correo validaciones dian",
+    ]
+
+    if any(x in s for x in reglas_directas):
+        return True
+
+    tiene_dian = "dian" in s
+    tiene_validacion = ("validacion" in s) or ("validaciones" in s)
+
+    if tiene_dian and tiene_validacion:
+        return True
+
+    try:
+        if any(normalize_text(c) in s for c in INBOX_DIAN_SUBJECT_CANDIDATES):
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _is_dian_trigger_message(msg: dict) -> bool:
+    subj = msg.get("subject") or ""
+    subj_norm = normalize_text(subj)
+    if "dian" in subj_norm:
+        return True
+
     preview = (msg.get("bodyPreview") or msg.get("body_preview") or "")
+    preview_norm = normalize_text(preview)
+
     if REQUIRE_DIAN_IN_BODY_PREVIEW:
         if preview:
-            return _contains_dian(preview)
-        else:
-            print("[DIAN] ⚠️ Mensaje no trae bodyPreview; se valida solo por asunto.")
-            return True
+            return "dian" in preview_norm
+        return "dian" in subj_norm
 
-    return True
+    if "dian" in preview_norm:
+        return True
 
-
-_CTRL_REGEX = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
-_AMP_FIX = re.compile(r"&(?!(?:[a-zA-Z]+|#\d+|#x[0-9A-Fa-f]+);)")
+    return False
 
 
 def _clean_xml_text(txt: str) -> str:
@@ -229,8 +510,7 @@ def _extract_inner_invoice_text(xml_text: str) -> str | None:
         flags=re.IGNORECASE | re.DOTALL
     )
     if m:
-        inner = m.group(1)
-        return _clean_xml_text(inner)
+        return _clean_xml_text(m.group(1))
 
     return None
 
@@ -248,10 +528,10 @@ def _parse_ident_from_xml_bytes(xml_bytes: bytes) -> Dict[str, str]:
     inner = _extract_inner_invoice_text(text)
     if inner:
         try:
-            r = ET.fromstring(inner)
-            id_el = r.find("./{*}ID")
-            uuid_el = r.find(".//{*}UUID")
-            issue_el = r.find("./{*}IssueDate")
+            root = ET.fromstring(inner)
+            id_el = root.find("./{*}ID")
+            uuid_el = root.find(".//{*}UUID")
+            issue_el = root.find("./{*}IssueDate")
 
             if uuid_el is not None and uuid_el.text:
                 ident["CUFE"] = _norm_cufe(uuid_el.text.strip())
@@ -272,12 +552,19 @@ def _parse_ident_from_xml_bytes(xml_bytes: bytes) -> Dict[str, str]:
         m = __re(r"<(?:cbc:|)UUID[^>]*>([^<]{20,})</", text)
         if m:
             ident["CUFE"] = _norm_cufe(m.group(1).strip())
+
         m = __re(r"<(?:cbc:|)IssueDate[^>]*>([^<]+)</", text)
         if m:
             ident["FECHA"] = normalizar_fecha(m.group(1).strip()) or m.group(1).strip()
+
         m = __re(r"<(?:cbc:|)ParentDocumentID[^>]*>([^<]{3,})</", text)
         if m:
             ident["NUMERO"] = m.group(1).strip()
+
+        m = __re(r"<(?:cbc:|)ID[^>]*>([^<]{3,})</", text)
+        if m and not ident.get("NUMERO"):
+            ident["NUMERO"] = m.group(1).strip()
+
         return ident
 
     local = root.tag.split("}")[-1] if "}" in root.tag else root.tag
@@ -313,113 +600,31 @@ def _parse_ident_from_xml_bytes(xml_bytes: bytes) -> Dict[str, str]:
 
 def _peek_ident_xml_from_zip_bytes(zip_bytes: bytes) -> List[Dict[str, str]]:
     out: List[Dict[str, str]] = []
-    with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zf:
-        for m in zf.infolist():
-            if not m.filename.lower().endswith(".xml"):
-                continue
-            try:
-                xml_data = zf.read(m)
-                ident = _parse_ident_from_xml_bytes(xml_data)
-                ident["xml_name"] = Path(m.filename).name
-                out.append(ident)
-            except Exception as e:
-                print(f"[ZIP] No se pudo leer {m.filename}: {e}")
-    return out
 
-
-def _build_zip_index(
-    since_days: int,
-    max_zip_buscar: int,
-    aidx: AttachmentIndexStore
-) -> Tuple[Dict[str, Tuple[str, bytes]], Dict[Tuple[str, str], Tuple[str, bytes]]]:
-    idx_cufe: Dict[str, Tuple[str, bytes]] = {}
-    idx_nf: Dict[Tuple[str, str], Tuple[str, bytes]] = {}
-
-    inbox_msgs = listar_mensajes_zip_inbox(top=max_zip_buscar, since_days=since_days)
-    limite_utc = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=since_days)
-
-    candidatos = []
-    for imsg in inbox_msgs:
-        rdt = imsg.get("receivedDateTime")
-        if rdt:
-            try:
-                rdt_dt = datetime.datetime.fromisoformat(rdt.replace("Z", "+00:00"))
-                if rdt_dt < limite_utc:
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zf:
+            for member in zf.infolist():
+                if not member.filename.lower().endswith(".xml"):
                     continue
-            except Exception:
-                pass
-        candidatos.append(imsg)
-
-    print(f"📦 Prefetch ZIPs: {len(candidatos)} mensajes con adjuntos (ventana {since_days} día(s))")
-
-    for imsg in candidatos:
-        mid = imsg.get("id")
-        if not mid:
-            continue
-
-        zips = listar_adjuntos_zip(mid)
-        if not zips:
-            continue
-
-        for z in zips:
-            zid = z.get("id")
-            if not zid:
-                continue
-
-            zname = z.get("name") or f"{zid}.zip"
-            tmp_zip = os.path.join(TMP_DIR, f"prefetch_{zname}")
-            if not descargar_adjunto_por_id(mid, zid, tmp_zip):
-                continue
-
-            try:
-                with open(tmp_zip, "rb") as f:
-                    zip_bytes = f.read()
-            finally:
                 try:
-                    os.remove(tmp_zip)
-                except Exception:
-                    pass
-
-            idents_xml = _peek_ident_xml_from_zip_bytes(zip_bytes)
-            for ident_xml in idents_xml:
-                cufe = _norm_cufe(ident_xml.get("CUFE") or "")
-                num = (ident_xml.get("NUMERO") or "").strip()
-                fec = (ident_xml.get("FECHA") or "").strip()
-                if fec:
-                    fec = normalizar_fecha(fec) or fec
-
-                try:
-                    aidx.upsert_zip(
-                        cufe=cufe,
-                        numero=num,
-                        fecha=fec,
-                        msg_id=mid,
-                        att_id=zid,
-                        att_name=zname,
-                        received_dt_iso=imsg.get("receivedDateTime", "") or "",
-                    )
+                    xml_data = zf.read(member)
+                    ident = _parse_ident_from_xml_bytes(xml_data)
+                    ident["xml_name"] = Path(member.filename).name
+                    out.append(ident)
                 except Exception as e:
-                    print(f"[AIDX] No pude upsert ZIP index: {e}")
+                    print(f"[ZIP] No se pudo leer {member.filename}: {e}")
+    except Exception as e:
+        print(f"[ZIP] Error abriendo ZIP en memoria: {e}")
 
-                if cufe and cufe not in idx_cufe:
-                    idx_cufe[cufe] = (zname, zip_bytes)
-
-                if num and fec:
-                    for k in claves_normalizadas_factura(num):
-                        key = (k, fec)
-                        if key not in idx_nf:
-                            idx_nf[key] = (zname, zip_bytes)
-
-    print(f"✅ Índice listo: {len(idx_cufe)} por CUFE, {len(idx_nf)} por NUMERO+FECHA (multi-clave)")
-    return idx_cufe, idx_nf
-
-
-_NON_INVOICE_PREFIXES = {"DDI", "RAD", "RDI", "RDC", "REC", "RCP", "DOC", "REF"}
+    return out
 
 
 def _is_generic_or_non_invoice_numero(n: str) -> bool:
     n = (n or "").strip().upper()
     if not n:
+        return True
+
+    if n.startswith(("RADICADO", "NIT", "ID", "CUFE", "UUID")):
         return True
 
     m = re.match(r"^([A-Z]{1,10})[-–—]?\s*(\d{3,})$", n)
@@ -437,22 +642,71 @@ def _is_generic_or_non_invoice_numero(n: str) -> bool:
 def _prefer_subject_numero(pdf_num: str | None, subj_num: str | None) -> str | None:
     pdf_num = (pdf_num or "").strip()
     subj_num = (subj_num or "").strip()
-    if not subj_num:
-        return pdf_num or None
-    if not pdf_num:
+
+    def invalido(n: str) -> bool:
+        n2 = (n or "").strip().upper()
+        if not n2:
+            return True
+        if n2.startswith(("RADICADO", "NIT", "ID", "CUFE", "UUID")):
+            return True
+        if re.fullmatch(r"RADICADO\d+", _solo_alnum(n2)):
+            return True
+        if re.fullmatch(r"NIT\d+", _solo_alnum(n2)):
+            return True
+        if re.fullmatch(r"ID\d+", _solo_alnum(n2)):
+            return True
+        return False
+
+    if subj_num and not invalido(subj_num):
+        if not pdf_num or invalido(pdf_num):
+            return subj_num
+
+    if pdf_num and not invalido(pdf_num):
+        return pdf_num
+
+    if subj_num:
         return subj_num
-
-    if _is_generic_or_non_invoice_numero(pdf_num) and not _is_generic_or_non_invoice_numero(subj_num):
-        return subj_num
-
-    if len(re.findall(r"\d", subj_num)) > len(re.findall(r"\d", pdf_num)):
-        return subj_num
-
-    return pdf_num
+    return pdf_num or None
 
 
-def _clean_name(s: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+def _build_num_set(ident: Dict[str, str]) -> set[str]:
+    out = set()
+    for x in [
+        ident.get("NUMERO"),
+        ident.get("NUMERO_APROB"),
+    ]:
+        if not x:
+            continue
+
+        x_norm = _norm_numero(x)
+        x_alnum = _solo_alnum(x_norm)
+
+        if x_norm:
+            out.add(x_norm)
+        if x_alnum:
+            out.add(x_alnum)
+
+        for v in _numero_variantes(x):
+            if v:
+                out.add(v)
+                out.add(_solo_alnum(v))
+
+        for v in _variantes_match_numero(x):
+            if v:
+                out.add(v)
+                out.add(_solo_alnum(v))
+
+    return {z for z in out if z}
+
+
+def _safe_pdf_ident(local_pdf: str) -> Dict[str, str]:
+    try:
+        txt = extraer_texto_pdf(local_pdf)
+        ident = parse_identificadores_pdf(txt) or {}
+        return ident
+    except Exception as e:
+        print(f"[DIAN] ⚠️ Error leyendo PDF para ident: {local_pdf} | {e}")
+        return {}
 
 
 def _match_pdf_candidate(
@@ -462,102 +716,676 @@ def _match_pdf_candidate(
     candidate_name: str
 ) -> bool:
     t_cufe = _norm_cufe(target_ident.get("CUFE") or "")
-    t_num = (target_ident.get("NUMERO") or "").strip()
-    t_ap = (target_ident.get("NUMERO_APROB") or "").strip()
-
     c_cufe = _norm_cufe(candidate_ident.get("CUFE") or "")
-    c_num = (candidate_ident.get("NUMERO") or "").strip()
-    c_ap = (candidate_ident.get("NUMERO_APROB") or "").strip()
 
     if t_cufe and c_cufe and t_cufe == c_cufe:
+        print(f"[DIAN MATCH] ✅ Match por CUFE | {candidate_name}")
         return True
 
-    nums_target = {x for x in [t_num, t_ap] if x}
-    nums_cand = {x for x in [c_num, c_ap] if x}
-    if nums_target and nums_cand and (nums_target & nums_cand):
+    nums_target = _build_num_set(target_ident)
+    nums_cand = _build_num_set(candidate_ident)
+
+    inter = nums_target & nums_cand
+    if inter:
+        print(f"[DIAN MATCH] ✅ Match por número | intersección={sorted(list(inter))[:5]} | {candidate_name}")
         return True
 
-    if _clean_name(Path(target_pdf_name).stem) == _clean_name(Path(candidate_name).stem):
-        return True
+    target_name_clean = _solo_alnum(Path(target_pdf_name).stem)
+    cand_name_clean = _solo_alnum(Path(candidate_name).stem)
 
-    base = (candidate_name or "").upper()
+    if target_name_clean and cand_name_clean:
+        if target_name_clean == cand_name_clean:
+            print(f"[DIAN MATCH] ✅ Match por nombre exacto limpio | {candidate_name}")
+            return True
+
+        if target_name_clean in cand_name_clean or cand_name_clean in target_name_clean:
+            print(f"[DIAN MATCH] ✅ Match por nombre contenido | {candidate_name}")
+            return True
+
     for n in nums_target:
-        if n and n.upper() in base:
+        n_alnum = _solo_alnum(n)
+        if not n_alnum:
+            continue
+        if len(n_alnum) < 5:
+            continue
+        if n_alnum in cand_name_clean:
+            print(f"[DIAN MATCH] ✅ Match por número en nombre candidato | num={n_alnum} | {candidate_name}")
             return True
 
     return False
 
 
-# ============================================================
-# buscar correo contenedor "Validación(s) DIAN"
-# ============================================================
-def _is_validacion_dian_subject(subj: str) -> bool:
-    s = normalize_text(subj or "")
-    for cand in INBOX_DIAN_SUBJECT_CANDIDATES:
-        if normalize_text(cand) in s:
-            return True
-    return False
+def _numero_from_subject(subj: str) -> str | None:
+    if not subj:
+        return None
+
+    s = subj.strip()
+
+    patrones = [
+        r"Aprobado-\s*Factura(?:\s+de\s+servicio\s+p[uú]blico)?\s*-\s*([A-Za-z]{1,10}(?:\s*[-–—]?\s*\d+){1,3})\s*-\s*Radicado",
+        r"Factura(?:\s+de\s+servicio\s+p[uú]blico)?\s*-\s*([A-Za-z]{1,10}(?:\s*[-–—]?\s*\d+){1,3})\s*-\s*Radicado",
+        r"Factura(?:\s+de\s+servicio\s+p[uú]blico)?\s*-\s*([A-Za-z]{1,10}(?:\s*[-–—]?\s*\d+){1,3})",
+        r"Aprobado-\s*Factura\s*-\s*(\d{3,20})\s*-\s*Radicado",
+    ]
+
+    for pat in patrones:
+        m = re.search(pat, s, flags=re.IGNORECASE)
+        if not m:
+            continue
+
+        raw = (m.group(1) or "").strip()
+        raw = raw.replace("–", "-").replace("—", "-")
+        raw = re.sub(r"\s*-\s*", "-", raw)
+        raw = re.sub(r"\s+", "", raw)
+
+        test = _solo_alnum(raw)
+        if test.startswith(("RADICADO", "NIT", "ID", "CUFE", "UUID")):
+            continue
+
+        return raw.strip()
+
+    return None
+
+
+def _fecha_from_subject(subj: str) -> str | None:
+    for pat in [r"(\d{4}[-/]\d{2}[-/]\d{2})", r"(\d{2}[-/]\d{2}[-/]\d{4})"]:
+        m = re.search(pat, subj or "")
+        if m:
+            s = m.group(1)
+            return normalizar_fecha(s) or s
+    return None
+
+
+def _score_pdf_candidate(pdf_name: str, ident: Dict[str, str]) -> int:
+    score = 0
+    name = (pdf_name or "")
+
+    if _is_acta_filename(name):
+        score -= 200
+
+    low = name.lower()
+    if "factura" in low:
+        score += 15
+    if "representacion" in low or "representación" in low:
+        score += 5
+    if "dian" in low:
+        score += 3
+
+    cufe = ident.get("CUFE") or ""
+    if _cufe_is_valid(cufe):
+        score += 150
+    elif cufe:
+        score += 10
+
+    num = (ident.get("NUMERO") or "").strip()
+    if num:
+        if _is_generic_or_non_invoice_numero(num):
+            score -= 15
+        else:
+            score += 25
+
+    if ident.get("FECHA"):
+        score += 5
+
+    if re.search(r"\bproyecto\b", (num or "").lower()):
+        score -= 50
+
+    return score
+
+
+def _seleccionar_mejor_pdf(
+    msg_id: str,
+    subj: str,
+    pdf_atts: List[dict]
+) -> Tuple[Optional[dict], Optional[str], Optional[dict]]:
+    os.makedirs(TMP_DIR, exist_ok=True)
+
+    subj_num = _numero_from_subject(subj)
+    best_att = None
+    best_path = None
+    best_ident = None
+    best_score = -10**9
+
+    for i, att in enumerate(pdf_atts, start=1):
+        aid = att.get("id")
+        if not aid:
+            continue
+
+        aname = att.get("name") or f"{aid}.pdf"
+        safe_name = re.sub(r"[^A-Za-z0-9_. -]", "_", aname)
+        tmp_path = os.path.join(TMP_DIR, f"{msg_id[:8]}_{i}_{safe_name}")
+
+        ok = descargar_adjunto_por_id(msg_id, aid, tmp_path)
+        if not ok or not os.path.exists(tmp_path):
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+            continue
+
+        try:
+            texto = extraer_texto_pdf(tmp_path)
+            ident = parse_identificadores_pdf(texto) or {}
+
+            best_num = _prefer_subject_numero(ident.get("NUMERO"), subj_num)
+            if best_num:
+                ident["NUMERO"] = best_num
+
+            if subj_num and subj_num != (ident.get("NUMERO") or "").strip():
+                ident["NUMERO_APROB"] = subj_num
+
+            if not ident.get("FECHA"):
+                ident.setdefault("FECHA", _fecha_from_subject(subj))
+
+            sc = _score_pdf_candidate(aname, ident)
+
+            # si el nombre parece UUID/GUID, no lo premiamos como fuente de número
+            if _is_uuid_like_name(aname):
+                sc -= 5
+
+        except Exception:
+            ident = {}
+            sc = -10**6
+
+        if sc > best_score:
+            if best_path and best_path != tmp_path:
+                try:
+                    os.remove(best_path)
+                except Exception:
+                    pass
+
+            best_score = sc
+            best_att = att
+            best_path = tmp_path
+            best_ident = ident
+        else:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+    return best_att, best_path, best_ident
+
+
+def _debug_top_similares_idx(idx_num: Dict[str, Tuple[str, bytes]], numero: str, limite: int = 15):
+    try:
+        objetivo = _solo_alnum(numero or "")
+        if not objetivo:
+            print("[DEBUG TOP] sin objetivo para comparar")
+            return
+
+        candidatos = []
+        for k, (zname, _zbytes) in idx_num.items():
+            ka = _solo_alnum(k)
+            if not ka:
+                continue
+
+            score = 0
+            if objetivo == ka:
+                score += 100
+            if objetivo in ka or ka in objetivo:
+                score += 40
+
+            common = 0
+            for ch in set(objetivo):
+                if ch in ka:
+                    common += 1
+            score += common
+
+            if score > 0:
+                candidatos.append((score, k, zname))
+
+        candidatos.sort(reverse=True, key=lambda x: x[0])
+
+        print(f"[DEBUG TOP] similares para numero={numero} / objetivo={objetivo}")
+        for score, k, zname in candidatos[:limite]:
+            print(f"   score={score:03d} | idx_num={k} | zip={zname}")
+
+        if not candidatos:
+            print("[DEBUG TOP] no encontré similares en idx_num")
+    except Exception as e:
+        print(f"[DEBUG TOP] error viendo similares: {e}")
+
+
+def _tokens_dian_objetivo(target_ident: Dict[str, str], target_pdf_name: str) -> List[str]:
+    out = []
+    seen = set()
+
+    candidatos = [
+        target_ident.get("NUMERO_APROB") or "",
+        target_ident.get("NUMERO") or "",
+    ]
+
+    if not _is_uuid_like_name(target_pdf_name):
+        candidatos.append(Path(target_pdf_name).stem)
+
+    for c in candidatos:
+        if not c:
+            continue
+
+        for v in _numero_variantes(c):
+            va = _solo_alnum(v)
+            if va and _token_es_util_para_match(va) and va not in seen:
+                seen.add(va)
+                out.append(va)
+
+        for v in _variantes_match_numero(c):
+            va = _solo_alnum(v)
+            if va and _token_es_util_para_match(va) and va not in seen:
+                seen.add(va)
+                out.append(va)
+
+        toks = _tokens_match_from_text(c)
+        for t in toks:
+            ta = _solo_alnum(t)
+            if ta and _token_es_util_para_match(ta) and ta not in seen:
+                seen.add(ta)
+                out.append(ta)
+
+    return out
+
+
+def _build_zip_index(
+    since_days: int,
+    max_zip_buscar: int,
+    aidx: AttachmentIndexStore
+) -> Tuple[
+    Dict[str, Tuple[str, bytes]],
+    Dict[str, Tuple[str, bytes]],
+    Dict[str, Tuple[str, bytes]]
+]:
+    idx_cufe: Dict[str, Tuple[str, bytes]] = {}
+    idx_num: Dict[str, Tuple[str, bytes]] = {}
+    idx_num_match: Dict[str, Tuple[str, bytes]] = {}
+
+    mensajes_fuente = []
+
+    try:
+        inbox_msgs = listar_mensajes_zip_inbox(top=max_zip_buscar, since_days=since_days) or []
+        mensajes_fuente.extend(inbox_msgs)
+    except Exception as e:
+        print(f"[ZIP INDEX] Error en listar_mensajes_zip_inbox: {e}")
+
+    busquedas_fallback = [
+        "DIAN",
+        "Factura",
+        "factura",
+        "",
+    ]
+
+    for termino in busquedas_fallback:
+        try:
+            extra = buscar_mensajes_inbox_por_asunto(
+                asunto_contiene=termino,
+                top=max(200, min(max_zip_buscar, 1500)),
+                since_days=since_days
+            ) or []
+            mensajes_fuente.extend(extra)
+        except Exception as e:
+            print(f"[ZIP INDEX] Error fallback asunto={termino!r}: {e}")
+
+    dedup = []
+    seen_msg = set()
+    for m in mensajes_fuente:
+        mid = m.get("id")
+        if not mid:
+            continue
+        if mid in seen_msg:
+            continue
+        seen_msg.add(mid)
+        dedup.append(m)
+
+    limite_utc = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=since_days)
+
+    candidatos = []
+    for imsg in dedup:
+        rdt = imsg.get("receivedDateTime")
+        if rdt:
+            try:
+                rdt_dt = datetime.datetime.fromisoformat(rdt.replace("Z", "+00:00"))
+                if rdt_dt < limite_utc:
+                    continue
+            except Exception:
+                pass
+        candidatos.append(imsg)
+
+    print(f"📦 Prefetch ZIPs: {len(candidatos)} mensajes candidatos (ventana {since_days} día(s))")
+
+    vistos_zip_ids = set()
+
+    for i_msg, imsg in enumerate(candidatos, start=1):
+        mid = imsg.get("id")
+        if not mid:
+            continue
+
+        try:
+            zips = listar_adjuntos_zip(mid) or []
+        except Exception as e:
+            print(f"[AIDX DEBUG] No pude listar adjuntos ZIP del mensaje {mid}: {e}")
+            zips = []
+
+        try:
+            print(
+                f"[AIDX DEBUG] mensaje={mid} | "
+                f"asunto={(imsg.get('subject') or '')[:120]} | "
+                f"zip_count={len(zips)} | "
+                f"progreso={i_msg}/{len(candidatos)}"
+            )
+        except Exception:
+            pass
+
+        if not zips:
+            continue
+
+        asunto_zip = imsg.get("subject") or ""
+
+        for z in zips:
+            zid = z.get("id")
+            if not zid:
+                continue
+
+            if zid in vistos_zip_ids:
+                continue
+            vistos_zip_ids.add(zid)
+
+            zname = z.get("name") or f"{zid}.zip"
+
+            try:
+                print(f"[AIDX DEBUG] ZIP detectado: {zname} | id={zid}")
+            except Exception:
+                pass
+
+            tmp_zip = os.path.join(TMP_DIR, f"prefetch_{uuid.uuid4().hex}_{re.sub(r'[^A-Za-z0-9_. -]', '_', zname)}")
+            if not descargar_adjunto_por_id(mid, zid, tmp_zip):
+                print(f"[AIDX DEBUG] No se pudo descargar ZIP: {zname}")
+                continue
+
+            try:
+                with open(tmp_zip, "rb") as f:
+                    zip_bytes = f.read()
+            finally:
+                try:
+                    os.remove(tmp_zip)
+                except Exception:
+                    pass
+
+            idents_xml = _peek_ident_xml_from_zip_bytes(zip_bytes)
+
+            if not idents_xml:
+                print(f"[AIDX DEBUG] ZIP sin XMLs útiles o no legibles: {zname}")
+
+            for tk in _tokens_match_from_text(asunto_zip):
+                if _token_es_util_para_match(tk) and tk not in idx_num_match:
+                    idx_num_match[tk] = (zname, zip_bytes)
+
+            # indexar nombre del zip solo si NO parece uuid/guid
+            if not _is_uuid_like_name(zname):
+                for tk in _tokens_match_from_text(Path(zname).stem):
+                    if _token_es_util_para_match(tk) and tk not in idx_num_match:
+                        idx_num_match[tk] = (zname, zip_bytes)
+
+                zn_clean = _solo_alnum(Path(zname).stem)
+                if _token_es_util_para_match(zn_clean) and zn_clean not in idx_num_match:
+                    idx_num_match[zn_clean] = (zname, zip_bytes)
+
+            for ident_xml in idents_xml:
+                cufe = _norm_cufe(ident_xml.get("CUFE") or "")
+                num_raw = (ident_xml.get("NUMERO") or "").strip()
+                fec_raw = (ident_xml.get("FECHA") or "").strip()
+                fec_norm = (normalizar_fecha(fec_raw) or fec_raw) if fec_raw else ""
+
+                try:
+                    print(
+                        f"[AIDX DEBUG] XML en ZIP={zname} | "
+                        f"xml_name={ident_xml.get('xml_name')} | "
+                        f"CUFE={cufe or '-'} | NUMERO={num_raw or '-'} | FECHA={fec_norm or '-'}"
+                    )
+                except Exception:
+                    pass
+
+                try:
+                    aidx.upsert_zip(
+                        cufe=cufe,
+                        numero=num_raw,
+                        fecha=fec_norm,
+                        msg_id=mid,
+                        att_id=zid,
+                        att_name=zname,
+                        received_dt_iso=imsg.get("receivedDateTime", "") or "",
+                    )
+                except Exception as e:
+                    print(f"[AIDX] No pude upsert ZIP index: {e}")
+
+                if cufe and cufe not in idx_cufe:
+                    idx_cufe[cufe] = (zname, zip_bytes)
+
+                if num_raw:
+                    for k in _numero_variantes(num_raw):
+                        if k and k not in idx_num:
+                            idx_num[k] = (zname, zip_bytes)
+
+                    for mk in _variantes_match_numero(num_raw):
+                        if mk and mk not in idx_num_match:
+                            idx_num_match[mk] = (zname, zip_bytes)
+
+            if len(idx_cufe) >= 2500 and len(idx_num_match) >= 2500:
+                print("🛑 Índice suficiente; deteniendo prefetch temprano.")
+                print(f"✅ Índice parcial: {len(idx_cufe)} por CUFE, {len(idx_num)} por NUMERO, {len(idx_num_match)} por MATCH")
+                return idx_cufe, idx_num, idx_num_match
+
+    print(f"✅ Índice listo: {len(idx_cufe)} por CUFE, {len(idx_num)} por NUMERO, {len(idx_num_match)} por MATCH")
+    return idx_cufe, idx_num, idx_num_match
+
+
+def _buscar_zip_por_numero(
+    idx_num: Dict[str, Tuple[str, bytes]],
+    *numeros: str
+) -> Tuple[Optional[str], Optional[bytes], Optional[str]]:
+    vistos = []
+    for n in numeros:
+        for v in _numero_variantes(n):
+            if v not in vistos:
+                vistos.append(v)
+
+    print(f"[DEBUG NUMERO] candidatos exactos idx_num={vistos}")
+
+    for cand in vistos:
+        if cand in idx_num:
+            zname, zbytes = idx_num[cand]
+            print(f"[DEBUG NUMERO] MATCH EXACTO -> cand={cand} | zip={zname}")
+            return zname, zbytes, cand
+
+    cand_alnum = [_solo_alnum(x) for x in vistos if x]
+    print(f"[DEBUG NUMERO] candidatos alnum idx_num={cand_alnum}")
+
+    for k, val in idx_num.items():
+        k_alnum = _solo_alnum(k)
+        for c in cand_alnum:
+            if c and k_alnum == c:
+                zname, zbytes = val
+                print(f"[DEBUG NUMERO] MATCH ALNUM -> cand={c} | idx={k} | zip={zname}")
+                return zname, zbytes, c
+
+    print("[DEBUG NUMERO] sin match en idx_num")
+    return None, None, None
+
+
+def _buscar_zip_por_numero_match(
+    idx_num_match: Dict[str, Tuple[str, bytes]],
+    *numeros: str
+) -> Tuple[Optional[str], Optional[bytes], Optional[str]]:
+    vistos = []
+
+    for n in numeros:
+        if not n:
+            continue
+        for v in _variantes_match_numero(n):
+            if v not in vistos:
+                vistos.append(v)
+
+    print(f"[DEBUG MATCH] candidatos idx_num_match={vistos}")
+
+    for cand in vistos:
+        if cand in idx_num_match:
+            zname, zbytes = idx_num_match[cand]
+            print(f"[DEBUG MATCH] MATCH -> cand={cand} | zip={zname}")
+            return zname, zbytes, cand
+
+    print("[DEBUG MATCH] sin match en idx_num_match")
+    return None, None, None
 
 
 def _buscar_pdf_en_correo_validaciones_dian(
     target_ident: Dict[str, str],
     target_pdf_name: str,
     since_days: int,
-    top_msgs: int = 80
+    top_msgs: int = 200
 ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    os.makedirs(os.path.join(TMP_DIR, "dian_pdf_only"), exist_ok=True)
+    dian_tmp = os.path.join(TMP_DIR, "dian_pdf_only")
+    os.makedirs(dian_tmp, exist_ok=True)
 
-    msgs = buscar_mensajes_inbox_por_asunto(
-        asunto_contiene="DIAN",
-        top=top_msgs,
-        since_days=since_days
-    ) or []
+    print("\n[DIAN] ================= INICIO BÚSQUEDA DIAN =================")
+    print(f"[DIAN] target_pdf_name={target_pdf_name}")
+    print(f"[DIAN] target CUFE={target_ident.get('CUFE')}")
+    print(f"[DIAN] target NUMERO={target_ident.get('NUMERO')}")
+    print(f"[DIAN] target NUMERO_APROB={target_ident.get('NUMERO_APROB')}")
+    print(f"[DIAN] since_days={since_days} | top_msgs={top_msgs}")
+
+    tokens_obj = _tokens_dian_objetivo(target_ident, target_pdf_name)
+    print(f"[DIAN] tokens objetivo={tokens_obj}")
+
+    candidatos_totales = []
+
+    busquedas = ["DIAN", "Validacion", "Validaciones", ""]
+    for term in busquedas:
+        try:
+            lote = buscar_mensajes_inbox_por_asunto(
+                asunto_contiene=term,
+                top=top_msgs,
+                since_days=since_days
+            ) or []
+            candidatos_totales.extend(lote)
+            print(f"[DIAN] candidatos búsqueda {term!r}: {len(lote)}")
+        except Exception as e:
+            print(f"[DIAN] Error buscando {term!r}: {e}")
+
+    msgs = []
+    seen = set()
+    for m in candidatos_totales:
+        mid = m.get("id")
+        if not mid or mid in seen:
+            continue
+        seen.add(mid)
+        msgs.append(m)
+
+    print(f"[DIAN] candidatos deduplicados: {len(msgs)}")
 
     if not msgs:
-        print("[DIAN] Graph search no devolvió nada por 'DIAN'. Fallback: inbox sin filtro...")
-        msgs = buscar_mensajes_inbox_por_asunto(
-            asunto_contiene="",
-            top=max(top_msgs, 120),
-            since_days=since_days
-        ) or []
-
-    if not msgs:
-        print("[DIAN] ❌ No pude listar Inbox para buscar 'Validación(es) DIAN'.")
+        print("[DIAN] ❌ No pude listar Inbox para buscar contenedores DIAN.")
+        print("[DIAN] ================= FIN BÚSQUEDA DIAN =================\n")
         return None, None, None
 
-    contenedores = [m for m in msgs if _is_validacion_dian_subject(m.get("subject") or "")]
+    contenedores = []
+    for m in msgs:
+        subj = m.get("subject") or ""
+        subj_norm = normalize_text(subj)
+        subj_alnum = _solo_alnum(subj)
+
+        if _is_inbox_dian_container_subject(subj):
+            contenedores.append(m)
+            continue
+
+        if "dian" in subj_norm:
+            for tk in tokens_obj:
+                if tk and tk in subj_alnum:
+                    contenedores.append(m)
+                    break
+
+    tmp = []
+    seen_ids = set()
+    for m in contenedores:
+        mid = m.get("id")
+        if mid and mid not in seen_ids:
+            seen_ids.add(mid)
+            tmp.append(m)
+    contenedores = tmp
+
+    print(f"[DIAN] contenedores filtrados: {len(contenedores)}")
+    for i, m in enumerate(contenedores[:20], start=1):
+        print(f"[DIAN] contenedor[{i}] asunto={m.get('subject')}")
+
     if not contenedores:
-        print("[DIAN] ❌ No encontré correos contenedores con asunto tipo 'Validación(es) DIAN'.")
-        for x in msgs[:10]:
-            print(f"   - subj: {x.get('subject','')!r}")
+        print("[DIAN] ❌ No encontré correos contenedores con asunto tipo validación dian.")
+        print("[DIAN] ================= FIN BÚSQUEDA DIAN =================\n")
         return None, None, None
+
+    revisados = 0
 
     for m in contenedores:
         mid = m.get("id")
+        subj = m.get("subject") or ""
+
         if not mid:
             continue
 
-        pdfs = listar_adjuntos_pdf(mid)
+        print(f"\n[DIAN] Revisando contenedor: {subj} | id={mid}")
+
+        pdfs = listar_adjuntos_pdf(mid) or []
+        print(f"[DIAN] PDFs adjuntos en contenedor: {len(pdfs)}")
+
         if not pdfs:
             continue
 
         for att in pdfs:
+            revisados += 1
             aname = att.get("name") or f"{att.get('id')}.pdf"
             aid = att.get("id")
-            local = os.path.join(TMP_DIR, "dian_pdf_only", aname)
-
-            ok = descargar_adjunto_por_id(mid, aid, local)
-            if not ok:
+            if not aid:
                 continue
 
-            try:
-                txt = extraer_texto_pdf(local)
-                ident = parse_identificadores_pdf(txt)
-            except Exception:
-                ident = {}
+            aname_alnum = _solo_alnum(Path(aname).stem)
+
+            nombre_sugiere_match = False
+            for tk in tokens_obj:
+                if tk and tk in aname_alnum:
+                    nombre_sugiere_match = True
+                    break
+
+            safe_name = re.sub(r"[^A-Za-z0-9_. -]", "_", aname)
+            local = os.path.join(dian_tmp, f"{mid[:8]}_{aid[:8]}_{safe_name}")
+
+            ok = descargar_adjunto_por_id(mid, aid, local)
+            if not ok or not os.path.exists(local):
+                print(f"[DIAN] ⚠️ No pude descargar adjunto PDF: {aname}")
+                try:
+                    if os.path.exists(local):
+                        os.remove(local)
+                except Exception:
+                    pass
+                continue
+
+            ident = _safe_pdf_ident(local)
+
+            print(
+                f"[DIAN] PDF revisado: {aname} | "
+                f"CUFE={ident.get('CUFE')} | "
+                f"NUMERO={ident.get('NUMERO')} | "
+                f"NUMERO_APROB={ident.get('NUMERO_APROB')} | "
+                f"FECHA={ident.get('FECHA')} | "
+                f"nombre_sugiere_match={nombre_sugiere_match}"
+            )
 
             if _match_pdf_candidate(target_ident, target_pdf_name, ident, aname):
                 print(f"[DIAN] ✅ Match PDF dentro de correo contenedor: {aname}")
+                print(f"[DIAN] revisados_total={revisados}")
+                print("[DIAN] ================= FIN BÚSQUEDA DIAN =================\n")
+                return local, mid, aid
+
+            if nombre_sugiere_match:
+                print(f"[DIAN] ✅ Match por nombre candidato DIAN: {aname}")
+                print(f"[DIAN] revisados_total={revisados}")
+                print("[DIAN] ================= FIN BÚSQUEDA DIAN =================\n")
                 return local, mid, aid
 
             try:
@@ -565,7 +1393,9 @@ def _buscar_pdf_en_correo_validaciones_dian(
             except Exception:
                 pass
 
-    print("[DIAN] ❌ No encontré PDF coincidente dentro de los correos contenedores.")
+    print(f"[DIAN] ❌ No encontré PDF coincidente dentro de los correos contenedores.")
+    print(f"[DIAN] revisados_total={revisados}")
+    print("[DIAN] ================= FIN BÚSQUEDA DIAN =================\n")
     return None, None, None
 
 
@@ -653,10 +1483,6 @@ def _extraer_descripciones_items_pdf(texto: str) -> str:
 
 
 def _generar_registro_pdf_only(pdf_local_path: str, pdf_name: str) -> Dict[str, object]:
-    """
-    Genera 1 registro estilo "XML" usando solo el PDF.
-    IMPORTANTE: el campo Archivo debe ser el que realmente quieras ver y filtrar en Excel/SharePoint.
-    """
     texto = extraer_texto_pdf(pdf_local_path)
     ident = parse_identificadores_pdf(texto)
 
@@ -697,111 +1523,12 @@ def _generar_registro_pdf_only(pdf_local_path: str, pdf_name: str) -> Dict[str, 
     }
 
 
-def _score_pdf_candidate(pdf_name: str, ident: Dict[str, str]) -> int:
-    score = 0
-    name = (pdf_name or "")
-
-    if _is_acta_filename(name):
-        score -= 200
-
-    low = name.lower()
-    if "factura" in low:
-        score += 15
-    if "representacion" in low or "representación" in low:
-        score += 5
-    if "dian" in low:
-        score += 3
-
-    cufe = ident.get("CUFE") or ""
-    if _cufe_is_valid(cufe):
-        score += 150
-    elif cufe:
-        score += 10
-
-    num = (ident.get("NUMERO") or "").strip()
-    if num:
-        if _is_generic_or_non_invoice_numero(num):
-            score -= 15
-        else:
-            score += 25
-
-    fec = (ident.get("FECHA") or "").strip()
-    if fec:
-        score += 10
-
-    if re.search(r"\bproyecto\b", (num or "").lower()):
-        score -= 50
-
-    return score
-
-
-def _seleccionar_mejor_pdf(msg_id: str, subj: str, pdf_atts: List[dict]) -> Tuple[Optional[dict], Optional[str], Optional[dict]]:
-    os.makedirs(TMP_DIR, exist_ok=True)
-
-    subj_num = _numero_from_subject(subj)
-    best_att = None
-    best_path = None
-    best_ident = None
-    best_score = -10**9
-
-    for i, att in enumerate(pdf_atts, start=1):
-        aid = att.get("id")
-        if not aid:
-            continue
-
-        aname = att.get("name") or f"{aid}.pdf"
-        safe_name = re.sub(r"[^A-Za-z0-9_.\- ]", "_", aname)
-        tmp_path = os.path.join(TMP_DIR, f"{msg_id[:8]}_{i}_{safe_name}")
-
-        ok = descargar_adjunto_por_id(msg_id, aid, tmp_path)
-        if not ok or not os.path.exists(tmp_path):
-            try:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            except Exception:
-                pass
-            continue
-
-        try:
-            texto = extraer_texto_pdf(tmp_path)
-            ident = parse_identificadores_pdf(texto)
-
-            best_num = _prefer_subject_numero(ident.get("NUMERO"), subj_num)
-            if best_num:
-                ident["NUMERO"] = best_num
-
-            if not ident.get("FECHA"):
-                ident.setdefault("FECHA", _fecha_from_subject(subj))
-
-            sc = _score_pdf_candidate(aname, ident)
-        except Exception:
-            ident = {}
-            sc = -10**6
-
-        if sc > best_score:
-            if best_path and best_path != tmp_path:
-                try:
-                    os.remove(best_path)
-                except Exception:
-                    pass
-
-            best_score = sc
-            best_att = att
-            best_path = tmp_path
-            best_ident = ident
-        else:
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
-
-    return best_att, best_path, best_ident
-
-
-# ============================================================
-# ✅ Helper: subir por replace con reintentos (solo para archivos NO bloqueados)
-# ============================================================
-def _upload_replace_with_retries(local_path: str, sp_path: str, retries: int = 2, sleep_s: float = 1.5) -> bool:
+def _upload_replace_with_retries(
+    local_path: str,
+    sp_path: str,
+    retries: int = 2,
+    sleep_s: float = 1.5
+) -> bool:
     last = None
     for i in range(retries + 1):
         try:
@@ -820,17 +1547,18 @@ def _upload_replace_with_retries(local_path: str, sp_path: str, retries: int = 2
             if i < retries:
                 time.sleep(sleep_s * (2 ** i))
                 continue
+
             print(f"⚠️ No se pudo reemplazar {sp_path}: {last}")
             return False
+
     return False
 
 
-def _subir_excels_a_sharepoint(sp_excel_root: str, hubo_cambios_excel: bool, historial_actualizado: bool):
-    """
-    ✅ FIX DEFINITIVO 423:
-    - facturas.xlsx NO se reemplaza jamás por /content (se actualiza por Workbook API).
-    - Solo se sube historial_ejecuciones.xlsx por replace.
-    """
+def _subir_excels_a_sharepoint(
+    sp_excel_root: str,
+    hubo_cambios_excel: bool,
+    historial_actualizado: bool
+):
     try:
         ensure_folder(sp_excel_root)
     except Exception as e:
@@ -854,14 +1582,11 @@ def _subir_excels_a_sharepoint(sp_excel_root: str, hubo_cambios_excel: bool, his
 
 
 def _expand_archivos_ref(archivos_ref: set[str]) -> set[str]:
-    """
-    Expande posibles variantes para que obtener_filas_por_archivos encuentre filas
-    aunque el 'Archivo' guardado difiera (PDF vs XML, mayúsculas/minúsculas, stem, etc.).
-    """
     out = set()
     for a in (archivos_ref or set()):
         if not a:
             continue
+
         a = str(a).strip()
         if not a:
             continue
@@ -876,33 +1601,32 @@ def _expand_archivos_ref(archivos_ref: set[str]) -> set[str]:
             out.add(stem)
             out.add(stem.lower())
             out.add(stem.upper())
-
-            # Variantes típicas
             out.add(f"{stem}.xml")
             out.add(f"{stem}.pdf")
             out.add(f"{stem}.zip")
             out.add(f"{stem}.XML")
             out.add(f"{stem}.PDF")
             out.add(f"{stem}.ZIP")
+
     return out
 
 
-def _try_workbook_append(sp_excel_root: str, archivos_ref: set[str], table_name: str = "TblFacturas") -> int:
-    """
-    Inserta filas nuevas en TblFacturas usando Workbook API (dedup).
-    """
+def _try_workbook_append(
+    sp_excel_root: str,
+    archivos_ref: set[str],
+    table_name: str = "TblFacturas"
+) -> int:
     if not archivos_ref:
         return 0
 
     archivos_ref = _expand_archivos_ref(set(archivos_ref))
-
     filas = obtener_filas_por_archivos(archivos_ref)
     if not filas:
         return 0
 
     sp_facturas_path = f"{sp_excel_root}/facturas.xlsx".strip("/")
-
     xl = ExcelWorkbookGraph(sp_facturas_path)
+
     insertadas = xl.append_rows_dedup(
         table_name=table_name,
         rows_dicts=filas,
@@ -915,7 +1639,9 @@ def _try_workbook_append(sp_excel_root: str, archivos_ref: set[str], table_name:
 def run_desde_aprobadas(
     max_aprobados: int = 50,
     max_zip_buscar: int = 150,
-    since_days: int | None = None
+    since_days: Optional[int] = None,
+    unread_only: Optional[bool] = None,
+    usar_processed_store: bool = True,
 ):
     if since_days is None:
         since_days = APROB_SEARCH_SINCE_DAYS
@@ -952,12 +1678,19 @@ def run_desde_aprobadas(
             pass
         return
 
-    print(f"📬 Leyendo carpeta de aprobadas (solo NO leídos): {APROB_FOLDER_NAME}")
-    msgs = listar_mensajes_en_carpeta(folder_id, top=max_aprobados)
+    modo_lectura = "solo NO leídos" if (unread_only is True or unread_only is None) else "todos"
+    print(f"📬 Leyendo carpeta de aprobadas ({modo_lectura}): {APROB_FOLDER_NAME}")
+
+    msgs = listar_mensajes_en_carpeta(
+        folder_id,
+        top=max_aprobados,
+        unread_only=unread_only,
+        since_days=since_days,
+    )
     msgs_leidos = len(msgs) if msgs else 0
 
     if not msgs:
-        print("ℹ️ No hay mensajes no leídos con aprobaciones recientes.")
+        print("ℹ️ No hay mensajes para procesar en la carpeta de aprobadas.")
         total_secs = time.perf_counter() - t0_total
         print(f"⏱️ Tiempo total real: {total_secs:.2f} s")
         try:
@@ -966,17 +1699,22 @@ def run_desde_aprobadas(
             pass
         return
 
-    # Performance: filtrar por store ANTES de prefetch ZIPs
     msgs_pendientes = []
     for m in msgs:
         mid = m.get("id")
-        if mid and (not store.is_processed(mid)):
+        if not mid:
+            continue
+
+        if usar_processed_store:
+            if not store.is_processed(mid):
+                msgs_pendientes.append(m)
+        else:
             msgs_pendientes.append(m)
 
     msgs_pendientes_count = len(msgs_pendientes)
 
     if not msgs_pendientes:
-        print("✅ No hay mensajes nuevos para procesar (todos ya estaban en ProcessedStore). Salgo sin prefetch.")
+        print("✅ No hay mensajes nuevos para procesar según ProcessedStore.")
         try:
             n = borrar_pdfs_en_arbol(TMP_DIR)
             print(f"🧹 Limpieza temp_check: borrados {n} PDF(s).")
@@ -993,11 +1731,18 @@ def run_desde_aprobadas(
 
     msgs = msgs_pendientes
 
-    idx_cufe, idx_nf = _build_zip_index(since_days=since_days, max_zip_buscar=max_zip_buscar, aidx=aidx)
+    idx_cufe, idx_num, idx_num_match = _build_zip_index(
+        since_days=since_days,
+        max_zip_buscar=max_zip_buscar,
+        aidx=aidx
+    )
 
     cufes_existentes = obtener_cufes_existentes()
     norm_cufes_existentes = {_norm_cufe(x) for x in cufes_existentes}
     print(f"ℹ️ CUFEs ya registrados en facturas.xlsx: {len(cufes_existentes)}")
+    if len(cufes_existentes) == 0:
+        print("⚠️ ALERTA: obtener_cufes_existentes() devolvió 0. Revisa si ARCHIVO_EXCEL apunta al archivo correcto o si el Excel está vacío.")
+        print(f"⚠️ ARCHIVO_EXCEL={ARCHIVO_EXCEL}")
 
     fecha_local = datetime.datetime.now().strftime("%Y-%m-%d")
     hora_local = datetime.datetime.now().strftime("%H:%M:%S")
@@ -1025,13 +1770,14 @@ def run_desde_aprobadas(
         msg_id = msg["id"]
         subj = msg.get("subject") or ""
 
-        if store.is_processed(msg_id):
+        if usar_processed_store and store.is_processed(msg_id):
             print(f"⏭️  Mensaje ya procesado (store). Se omite. id={msg_id}")
             continue
 
         pdf_atts = listar_adjuntos_pdf(msg_id)
         if not pdf_atts:
-            store.mark_processed(msg_id, {"status": "sin_pdf"})
+            if usar_processed_store:
+                store.mark_processed(msg_id, {"status": "sin_pdf"})
             cnt_sin_pdf += 1
             msgs_procesados += 1
 
@@ -1042,7 +1788,6 @@ def run_desde_aprobadas(
             )
             continue
 
-        # Elegir mejor PDF si hay múltiples
         pdf = None
         pdf_tmp = None
         ident_pdf = {}
@@ -1054,7 +1799,8 @@ def run_desde_aprobadas(
 
             if not descargar_adjunto_por_id(msg_id, pdf["id"], pdf_tmp):
                 print(f"[APROB] No pude descargar PDF {pdf_name}")
-                store.mark_processed(msg_id, {"status": "error_descarga_pdf", "pdf": pdf_name})
+                if usar_processed_store:
+                    store.mark_processed(msg_id, {"status": "error_descarga_pdf", "pdf": pdf_name})
                 cnt_err += 1
                 msgs_procesados += 1
 
@@ -1068,16 +1814,18 @@ def run_desde_aprobadas(
                 continue
 
             texto = extraer_texto_pdf(pdf_tmp)
-            ident_pdf = parse_identificadores_pdf(texto)
+            ident_pdf = parse_identificadores_pdf(texto) or {}
         else:
             pdf, pdf_tmp, ident_pdf = _seleccionar_mejor_pdf(msg_id, subj, pdf_atts)
             if not pdf or not pdf_tmp:
                 pdf = pdf_atts[0]
                 pdf_name = pdf.get("name") or f"{pdf['id']}.pdf"
                 pdf_tmp = os.path.join(TMP_DIR, pdf_name)
+
                 if not descargar_adjunto_por_id(msg_id, pdf["id"], pdf_tmp):
                     print(f"[APROB] No pude descargar PDF (fallback) {pdf_name}")
-                    store.mark_processed(msg_id, {"status": "error_descarga_pdf", "pdf": pdf_name})
+                    if usar_processed_store:
+                        store.mark_processed(msg_id, {"status": "error_descarga_pdf", "pdf": pdf_name})
                     cnt_err += 1
                     msgs_procesados += 1
 
@@ -1089,8 +1837,9 @@ def run_desde_aprobadas(
                         error="No se pudo descargar PDF (fallback)"
                     )
                     continue
+
                 texto = extraer_texto_pdf(pdf_tmp)
-                ident_pdf = parse_identificadores_pdf(texto)
+                ident_pdf = parse_identificadores_pdf(texto) or {}
 
         pdf_name = pdf.get("name") or f"{pdf['id']}.pdf"
 
@@ -1100,9 +1849,11 @@ def run_desde_aprobadas(
             ident_pdf["NUMERO"] = best_num
 
         numero_aprob = (ident_pdf.get("NUMERO_APROB") or "").strip()
-        if not numero_aprob:
-            if subj_num and subj_num.strip() and subj_num.strip() != (ident_pdf.get("NUMERO") or "").strip():
-                numero_aprob = subj_num.strip()
+        if not numero_aprob and subj_num and subj_num.strip() and subj_num.strip() != (ident_pdf.get("NUMERO") or "").strip():
+            numero_aprob = subj_num.strip()
+
+        if numero_aprob:
+            ident_pdf["NUMERO_APROB"] = numero_aprob
 
         if not ident_pdf.get("FECHA"):
             ident_pdf.setdefault("FECHA", _fecha_from_subject(subj))
@@ -1116,27 +1867,60 @@ def run_desde_aprobadas(
         print(f"→ PDF elegido: {pdf_name}")
         print(f"→ CUFE detectado: {ident_pdf.get('CUFE')}")
         print(f"→ NUMERO detectado: {ident_pdf.get('NUMERO')}")
-        print(f"→ NUMERO_APROB detectado: {numero_aprob or None}")
+        print(f"→ NUMERO_APROB detectado: {ident_pdf.get('NUMERO_APROB')}")
         print(f"→ FECHA detectada: {ident_pdf.get('FECHA')}")
         print("===========================\n")
 
-        # ============================================================
-        # FLUJO ESPECIAL DIAN
-        # ============================================================
+        numero_principal = _elegir_numero_principal(ident_pdf, subj, pdf_name)
+
+        if numero_principal and not ident_pdf.get("NUMERO_APROB"):
+            ident_pdf["NUMERO_APROB"] = numero_principal
+
+        if not _es_probable_factura_electronica(subj, pdf_name, ident_pdf):
+            print(f"⏭️ Se omite PDF no probable factura electrónica: {pdf_name}")
+            secs = time.perf_counter() - t0
+            resumen.append((pdf_name, secs, "omitido no factura", 0))
+
+            if usar_processed_store:
+                store.mark_processed(msg_id, {
+                    "status": "omitido_no_factura",
+                    "pdf": pdf_name,
+                    "cufe": cufe_pdf,
+                })
+
+            _push_detalle(
+                detalle_rows, run_id, msg_id, subj,
+                pdf_name=pdf_name,
+                cufe=cufe_pdf,
+                numero=ident_pdf.get("NUMERO_APROB") or ident_pdf.get("NUMERO") or "",
+                fecha_factura=fecha_pdf,
+                estado="omitido_no_factura",
+                duracion_s=(time.perf_counter() - t0),
+                fuente="FILTRO"
+            )
+
+            msgs_procesados += 1
+            procesados += 1
+            continue
+
+        # =========================================================
+        # RAMA DIAN
+        # =========================================================
         if _is_dian_trigger_message(msg):
-            print(f"[DIAN] Detectado mensaje DIAN en aprobadas (asunto+cuerpo): {subj!r}")
+            print(f"[DIAN] Detectado mensaje DIAN en aprobadas (asunto/cuerpo): {subj!r}")
 
             pdf_real_path, mid_src, aid_src = _buscar_pdf_en_correo_validaciones_dian(
                 target_ident=ident_pdf,
                 target_pdf_name=pdf_name,
                 since_days=since_days,
-                top_msgs=80
+                top_msgs=400
             )
 
             if not pdf_real_path:
                 secs = time.perf_counter() - t0
                 resumen.append((pdf_name, secs, "sin match dian", 0))
-                store.mark_processed(msg_id, {"status": "sin_match_dian", "pdf": pdf_name, "cufe": cufe_pdf})
+                if usar_processed_store:
+                    store.mark_processed(msg_id, {"status": "sin_match_dian", "pdf": pdf_name, "cufe": cufe_pdf})
                 cnt_sin_match += 1
                 msgs_procesados += 1
                 sin_match_consec += 1
@@ -1147,7 +1931,7 @@ def run_desde_aprobadas(
                     detalle_rows, run_id, msg_id, subj,
                     pdf_name=pdf_name,
                     cufe=cufe_pdf,
-                    numero=ident_pdf.get("NUMERO") or "",
+                    numero=ident_pdf.get("NUMERO_APROB") or ident_pdf.get("NUMERO") or "",
                     fecha_factura=fecha_pdf,
                     estado="sin_match_dian",
                     duracion_s=(time.perf_counter() - t0),
@@ -1155,10 +1939,10 @@ def run_desde_aprobadas(
                 )
                 continue
 
-            # ✅ IMPORTANTE: Archivo debe coincidir con lo que realmente subes a SP y lo que quieres filtrar
             pdf_real_name = os.path.basename(pdf_real_path)
             reg = _generar_registro_pdf_only(pdf_real_path, pdf_real_name)
-            if numero_aprob and len(numero_aprob) >= 5:
+
+            if numero_aprob and len(numero_aprob) >= 3:
                 reg["Número de factura"] = numero_aprob
 
             total_nuevos = guardar_en_excel([reg])
@@ -1183,37 +1967,49 @@ def run_desde_aprobadas(
             print("☁️  Subiendo a SharePoint (DIAN / PDF-only)...")
             sp_ext_root = f"{BASE_SP}/extraidos/dian_pdf_only"
             sp_excel = f"{BASE_SP}/excel"
-            ensure_folder(sp_ext_root)
-            ensure_folder(sp_excel)
 
+            sp_disponible = True
             try:
-                upload_small_file(pdf_real_path, f"{sp_ext_root}/{pdf_real_name}", mode="skip")
+                ensure_folder(sp_ext_root)
+                ensure_folder(sp_excel)
             except Exception as e:
-                print(f"[DIAN] No pude subir PDF real: {e}")
+                sp_disponible = False
+                print(f"⚠️ SharePoint no disponible en rama DIAN: {e}")
+
+            if sp_disponible:
+                try:
+                    upload_small_file(pdf_real_path, f"{sp_ext_root}/{pdf_real_name}", mode="skip")
+                except Exception as e:
+                    print(f"[DIAN] No pude subir PDF real: {e}")
+            else:
+                print("[DIAN] ⚠️ Se omite subida a SharePoint por error temporal.")
 
             hubo_cambios_excel = (total_nuevos > 0) or (enriquecidas > 0)
 
             insertadas = 0
-            if hubo_cambios_excel:
+            if sp_disponible and hubo_cambios_excel:
                 try:
-                    # ✅ usar exactamente el "Archivo" real que quedó en Excel
                     archivos_ref = {str(reg.get("Archivo") or pdf_real_name)}
                     insertadas = _try_workbook_append(sp_excel, archivos_ref, table_name="TblFacturas")
                     print(f"✅ Workbook API (DIAN): +{insertadas} fila(s) nuevas en TblFacturas.")
                 except Exception as e:
                     print(f"⚠️ Workbook API falló (DIAN): {e}")
 
-            _subir_excels_a_sharepoint(sp_excel, hubo_cambios_excel, historial_actualizado)
+            if sp_disponible:
+                _subir_excels_a_sharepoint(sp_excel, hubo_cambios_excel, historial_actualizado)
+            else:
+                print("[DIAN] ⚠️ No se suben excels a SharePoint en esta iteración.")
 
-            store.mark_processed(msg_id, {
-                "status": "ok_dian_pdf_only",
-                "pdf": pdf_name,
-                "nuevos": int(total_nuevos),
-                "enriquecidas": int(enriquecidas),
-                "cufe": cufe_pdf,
-                "src_msg": mid_src,
-                "src_att": aid_src,
-            })
+            if usar_processed_store:
+                store.mark_processed(msg_id, {
+                    "status": "ok_dian_pdf_only",
+                    "pdf": pdf_name,
+                    "nuevos": int(total_nuevos),
+                    "enriquecidas": int(enriquecidas),
+                    "cufe": cufe_pdf,
+                    "src_msg": mid_src,
+                    "src_att": aid_src,
+                })
 
             try:
                 marcar_mensaje_como_leido(msg_id)
@@ -1247,14 +2043,15 @@ def run_desde_aprobadas(
             procesados += 1
             continue
 
-        # ------------------------------------------------------------
-        # FLUJO NORMAL (ZIP/XML)
-        # ------------------------------------------------------------
+        # =========================================================
+        # YA REGISTRADO
+        # =========================================================
         if cufe_pdf and cufe_pdf in norm_cufes_existentes:
             print(f"🔁 Factura ya registrada (CUFE en Excel). Se omite búsqueda de ZIP para {pdf_name}.")
             secs = time.perf_counter() - t0
             resumen.append((pdf_name, secs, "ya registrado", 0))
-            store.mark_processed(msg_id, {"status": "ya_registrado", "pdf": pdf_name, "cufe": cufe_pdf})
+            if usar_processed_store:
+                store.mark_processed(msg_id, {"status": "ya_registrado", "pdf": pdf_name, "cufe": cufe_pdf})
 
             _push_detalle(
                 detalle_rows, run_id, msg_id, subj,
@@ -1277,11 +2074,15 @@ def run_desde_aprobadas(
                 marcar_mensaje_como_leido(msg_id)
             except Exception as e:
                 print(f"⚠️ No se pudo marcar como leído: {e}")
+
             if (procesados >= AUTO_STOP_MIN_PROCESADOS) and (sin_nuevos_consec >= AUTO_STOP_SIN_NUEVOS_CONSEC):
-                print("🛑 Deteniendo flujo: varios PDFs ya registrados/sin nuevos (optimización de tiempo).")
+                print("🛑 Deteniendo flujo: varios PDFs ya registrados/sin nuevos.")
                 break
             continue
 
+        # =========================================================
+        # MATCH NORMAL PDF ↔ ZIP
+        # =========================================================
         found_match = False
         found_zip_name = None
         found_zip_bytes = None
@@ -1290,43 +2091,149 @@ def run_desde_aprobadas(
         if cufe_pdf and cufe_pdf in idx_cufe:
             found_zip_name, found_zip_bytes = idx_cufe[cufe_pdf]
             found_match = True
-        else:
-            num_pdf = (ident_pdf.get("NUMERO") or "").strip()
-            if num_pdf and fecha_pdf:
-                for k in claves_normalizadas_factura(num_pdf):
-                    key = (k, fecha_pdf)
-                    if key in idx_nf:
-                        found_zip_name, found_zip_bytes = idx_nf[key]
-                        found_match = True
-                        break
+            fuente_match = "CUFE"
+
+        if not found_match:
+            num_pdf = ident_pdf.get("NUMERO") or ""
+            num_aprob = ident_pdf.get("NUMERO_APROB") or ""
+            num_asunto = subj_num or ""
+            num_principal = numero_principal or ""
+
+            found_zip_name, found_zip_bytes, variante = _buscar_zip_por_numero_match(
+                idx_num_match,
+                num_aprob,
+                num_asunto,
+                num_principal,
+                num_pdf,
+            )
+            if found_zip_name and found_zip_bytes:
+                found_match = True
+                fuente_match = f"NUM_MATCH:{variante}"
+
+        if not found_match:
+            num_pdf = ident_pdf.get("NUMERO") or ""
+            num_aprob = ident_pdf.get("NUMERO_APROB") or ""
+            num_asunto = subj_num or ""
+
+            found_zip_name, found_zip_bytes, variante = _buscar_zip_por_numero(
+                idx_num,
+                num_aprob,
+                num_asunto,
+                num_pdf,
+            )
+            if found_zip_name and found_zip_bytes:
+                found_match = True
+                fuente_match = f"NUMERO:{variante}"
+
+        # tokens del nombre del PDF SOLO si el nombre NO es UUID/GUID
+        if not found_match and not _is_uuid_like_name(pdf_name):
+            for tk in _tokens_match_from_text(Path(pdf_name).stem):
+                if not _token_es_util_para_match(tk):
+                    continue
+                found_zip_name, found_zip_bytes, variante = _buscar_zip_por_numero_match(
+                    idx_num_match, tk
+                )
+                if found_zip_name and found_zip_bytes:
+                    found_match = True
+                    fuente_match = f"PDF_TOKEN:{variante}"
+                    break
 
         if not found_match:
             pdf_base = Path(pdf_name).stem.lower()
-            pdf_clean = re.sub(r"[^a-z0-9]", "", pdf_base)
 
-            vistos = set()
-            for zn, zbytes in list(idx_cufe.values()) + list(idx_nf.values()):
-                if zn in vistos:
-                    continue
-                vistos.add(zn)
-                zbase = Path(zn).stem.lower()
-                zclean = re.sub(r"[^a-z0-9]", "", zbase)
-                if pdf_clean == zclean or pdf_clean in zclean or zclean in pdf_clean:
-                    found_zip_name, found_zip_bytes = zn, zbytes
-                    found_match = True
-                    print(f"🔄 Emparejado por nombre: {pdf_name} ↔ {zn}")
-                    break
+            # evita match por nombre cuando el PDF parece GUID
+            if not _is_uuid_like_name(pdf_name):
+                pdf_clean = re.sub(r"[^a-z0-9]", "", pdf_base)
+
+                vistos = set()
+                for zn, zbytes in list(idx_cufe.values()) + list(idx_num.values()) + list(idx_num_match.values()):
+                    if zn in vistos:
+                        continue
+                    vistos.add(zn)
+
+                    zbase = Path(zn).stem.lower()
+                    zclean = re.sub(r"[^a-z0-9]", "", zbase)
+
+                    if len(pdf_clean) >= 8 and (pdf_clean == zclean or pdf_clean in zclean or zclean in pdf_clean):
+                        found_zip_name, found_zip_bytes = zn, zbytes
+                        found_match = True
+                        fuente_match = "NOMBRE"
+                        print(f"🔄 Emparejado por nombre: {pdf_name} ↔ {zn}")
+                        break
+
+        print("\n[MATCH DEBUG] =====================================")
+        print(f"[MATCH DEBUG] PDF: {pdf_name}")
+        print(f"[MATCH DEBUG] ASUNTO: {subj}")
+        print(f"[MATCH DEBUG] CUFE PDF: {cufe_pdf}")
+        print(f"[MATCH DEBUG] FECHA PDF: {fecha_pdf}")
+        print(f"[MATCH DEBUG] NUMERO PDF: {ident_pdf.get('NUMERO')}")
+        print(f"[MATCH DEBUG] NUMERO_APROB: {ident_pdf.get('NUMERO_APROB')}")
+        print(f"[MATCH DEBUG] NUMERO PRINCIPAL: {numero_principal}")
+        print(f"[MATCH DEBUG] SUBJECT NUM: {subj_num}")
+        print(f"[MATCH DEBUG] found_match={found_match}")
+        print(f"[MATCH DEBUG] found_zip_name={found_zip_name}")
+        print(f"[MATCH DEBUG] fuente_match={fuente_match}")
+        print(f"[MATCH DEBUG] idx_cufe_size={len(idx_cufe)} | idx_num_size={len(idx_num)} | idx_num_match_size={len(idx_num_match)}")
+
+        if cufe_pdf:
+            print(f"[MATCH DEBUG] cufe_pdf_en_idx_cufe={cufe_pdf in idx_cufe}")
+
+        for base_num in [
+            ident_pdf.get("NUMERO_APROB") or "",
+            subj_num or "",
+            numero_principal or "",
+            ident_pdf.get("NUMERO") or "",
+        ]:
+            if base_num:
+                print(f"[MATCH DEBUG] numero base={base_num}")
+                print(f"[MATCH DEBUG] variantes numero={_numero_variantes(base_num)}")
+                print(f"[MATCH DEBUG] variantes match={_variantes_match_numero(base_num)}")
+                _debug_top_similares_idx(idx_num, base_num, limite=10)
+
+        print("[MATCH DEBUG] =====================================\n")
 
         if not found_match or not found_zip_name or not found_zip_bytes:
             entry = None
 
             if cufe_pdf:
-                entry = aidx.find_zip_by_cufe(cufe_pdf)
+                try:
+                    entry = aidx.find_zip_by_cufe(cufe_pdf)
+                except Exception:
+                    entry = None
 
             if not entry:
-                num_pdf = (ident_pdf.get("NUMERO") or "").strip()
-                if num_pdf and fecha_pdf:
-                    entry = aidx.find_zip_by_num_fecha(num_pdf, fecha_pdf)
+                try:
+                    num_pdf = ident_pdf.get("NUMERO") or ""
+                    num_aprob = ident_pdf.get("NUMERO_APROB") or ""
+                    num_asunto = subj_num or ""
+
+                    for n in [num_aprob, num_asunto, numero_principal, num_pdf]:
+                        if not n:
+                            continue
+
+                        print(f"[AIDX DEBUG BUSQ] buscando por numero base={n}")
+
+                        variantes = _numero_variantes(n)
+                        variantes_match = _variantes_match_numero(n)
+                        todas = []
+
+                        for x in variantes + variantes_match + [n]:
+                            if x and x not in todas:
+                                todas.append(x)
+
+                        print(f"[AIDX DEBUG BUSQ] variantes={todas}")
+
+                        for vn in todas:
+                            entry = aidx.find_zip_by_numero(vn)
+                            if entry:
+                                print(f"[AIDX DEBUG BUSQ] MATCH AIDX por numero={vn} -> {entry.get('att_name')}")
+                                break
+
+                        if entry:
+                            break
+                except Exception as e:
+                    print(f"[AIDX DEBUG BUSQ] error buscando en AIDX: {e}")
+                    entry = None
 
             if entry:
                 try:
@@ -1336,11 +2243,12 @@ def run_desde_aprobadas(
 
                     if mid and aid:
                         print(f"🧠 [AIDX] Encontré ZIP histórico: {zname} (descargando directo por IDs)...")
-                        tmp_zip = os.path.join(TMP_DIR, f"aidx_{zname}")
+                        tmp_zip = os.path.join(TMP_DIR, f"aidx_{re.sub(r'[^A-Za-z0-9_. -]', '_', zname)}")
                         ok = descargar_adjunto_por_id(mid, aid, tmp_zip)
                         if ok and os.path.exists(tmp_zip):
                             with open(tmp_zip, "rb") as f:
                                 found_zip_bytes = f.read()
+
                             try:
                                 os.remove(tmp_zip)
                             except Exception:
@@ -1357,15 +2265,32 @@ def run_desde_aprobadas(
             print(f"❌ No se encontró ZIP que coincida para PDF {pdf_name}.")
             secs = time.perf_counter() - t0
             resumen.append((pdf_name, secs, "sin match", 0))
-            store.mark_processed(msg_id, {"status": "sin_match", "pdf": pdf_name, "cufe": cufe_pdf})
+
+            motivo_sin_match = "sin_match"
+            num_candidato = ident_pdf.get("NUMERO_APROB") or ident_pdf.get("NUMERO") or ""
+            if not num_candidato and not cufe_pdf:
+                motivo_sin_match = "sin_match_sin_identificadores"
+            elif num_candidato and not _numero_parece_valido(num_candidato):
+                motivo_sin_match = "sin_match_numero_no_valido"
+            elif cufe_pdf and not _cufe_is_valid(cufe_pdf):
+                motivo_sin_match = "sin_match_cufe_debil"
+            else:
+                motivo_sin_match = "sin_match_no_zip"
+
+            if usar_processed_store:
+                store.mark_processed(msg_id, {
+                    "status": motivo_sin_match,
+                    "pdf": pdf_name,
+                    "cufe": cufe_pdf
+                })
 
             _push_detalle(
                 detalle_rows, run_id, msg_id, subj,
                 pdf_name=pdf_name,
                 cufe=cufe_pdf,
-                numero=ident_pdf.get("NUMERO") or "",
+                numero=ident_pdf.get("NUMERO_APROB") or ident_pdf.get("NUMERO") or "",
                 fecha_factura=fecha_pdf,
-                estado="sin_match",
+                estado=motivo_sin_match,
                 duracion_s=(time.perf_counter() - t0),
                 fuente=fuente_match
             )
@@ -1378,10 +2303,13 @@ def run_desde_aprobadas(
             procesados += 1
 
             if (procesados >= AUTO_STOP_MIN_PROCESADOS) and (sin_match_consec >= AUTO_STOP_SIN_MATCH_CONSEC):
-                print("🛑 Deteniendo flujo: varios PDFs consecutivos sin match (optimización de tiempo).")
+                print("🛑 Deteniendo flujo: varios PDFs consecutivos sin match.")
                 break
             continue
 
+        # =========================================================
+        # PROCESAMIENTO DEL ZIP
+        # =========================================================
         b1 = _limpiar_adj_hoy()
         if b1:
             print(f"🧹 Limpieza ADJ_HOY: borrados {b1} ZIP(s) viejos.")
@@ -1402,8 +2330,6 @@ def run_desde_aprobadas(
         total_nuevos = 0
         carpeta_obj = None
         ruta_obj = None
-
-        # ✅ Aquí guardamos los "Archivo" reales que quedaron en regs (para subir a Workbook sí o sí)
         archivos_realmente_guardados: set[str] = set()
 
         for zip_name, carpeta in resultados:
@@ -1423,10 +2349,9 @@ def run_desde_aprobadas(
             if regs and numero_aprob:
                 for dct in regs:
                     old = str(dct.get("Número de factura", "")).strip()
-                    if old != numero_aprob and len(numero_aprob) >= 5:
+                    if old != numero_aprob and len(numero_aprob) >= 3:
                         dct["Número de factura"] = numero_aprob
 
-            # Capturar "Archivo" antes de guardar (si existe)
             if regs:
                 for dct in regs:
                     av = dct.get("Archivo")
@@ -1467,26 +2392,35 @@ def run_desde_aprobadas(
             sp_ext_root = f"{BASE_SP}/extraidos"
         sp_excel = f"{BASE_SP}/excel"
 
-        ensure_folder(sp_adj_root)
-        ensure_folder(sp_ext_root)
-        ensure_folder(sp_excel)
-
+        sp_disponible = True
         try:
-            upload_small_file(str(zip_local_path), f"{sp_adj_root}/{found_zip_name}", mode="skip")
+            ensure_folder(sp_adj_root)
+            ensure_folder(sp_ext_root)
+            ensure_folder(sp_excel)
         except Exception as e:
-            print(f"⚠️ Error subiendo ZIP a SharePoint: {e}")
+            sp_disponible = False
+            print(f"⚠️ SharePoint no disponible en este momento: {e}")
 
-        try:
-            if carpeta_obj and ruta_obj and os.path.exists(ruta_obj):
-                upload_directory(ruta_obj, f"{sp_ext_root}/{carpeta_obj}", mode="skip")
-            else:
-                upload_directory(EXT_HOY, sp_ext_root, mode="skip")
-        except Exception as e:
-            print(f"⚠️ Error subiendo extraídos a SharePoint: {e}")
+        if sp_disponible:
+            try:
+                upload_small_file(str(zip_local_path), f"{sp_adj_root}/{found_zip_name}", mode="skip")
+            except Exception as e:
+                print(f"⚠️ Error subiendo ZIP a SharePoint: {e}")
+
+            try:
+                if carpeta_obj and ruta_obj and os.path.exists(ruta_obj):
+                    upload_directory(ruta_obj, f"{sp_ext_root}/{carpeta_obj}", mode="skip")
+                else:
+                    upload_directory(EXT_HOY, sp_ext_root, mode="skip")
+            except Exception as e:
+                print(f"⚠️ Error subiendo extraídos a SharePoint: {e}")
+        else:
+            print("⚠️ Se omite subida a SharePoint para este correo por error temporal.")
+
         hubo_cambios_excel = (total_nuevos > 0) or (enriquecidas > 0)
 
         insertadas = 0
-        if hubo_cambios_excel:
+        if sp_disponible and hubo_cambios_excel:
             try:
                 archivos_xml = set()
                 if ruta_obj and os.path.isdir(ruta_obj):
@@ -1494,7 +2428,6 @@ def run_desde_aprobadas(
                         if fn.lower().endswith(".xml"):
                             archivos_xml.add(fn)
 
-                # ✅ mezcla robusta: (1) lo real guardado, (2) xmls detectados, (3) pdf y zip
                 archivos_ref = set(archivos_realmente_guardados)
                 archivos_ref |= set(archivos_xml)
                 archivos_ref.add(os.path.basename(pdf_name))
@@ -1505,21 +2438,27 @@ def run_desde_aprobadas(
                 print(f"✅ Workbook API: +{insertadas} fila(s) nuevas en TblFacturas.")
             except Exception as e:
                 print(f"⚠️ Workbook API falló: {e}")
+        elif hubo_cambios_excel:
+            print("⚠️ Workbook API omitida por indisponibilidad temporal de SharePoint.")
 
-        _subir_excels_a_sharepoint(sp_excel, hubo_cambios_excel, historial_actualizado)
+        if sp_disponible:
+            _subir_excels_a_sharepoint(sp_excel, hubo_cambios_excel, historial_actualizado)
+        else:
+            print("⚠️ No se suben excels a SharePoint en esta iteración.")
 
         print("🎉 Proceso por aprobadas finalizado para:", found_zip_name)
         secs = time.perf_counter() - t0
         resumen.append((pdf_name, secs, "match", total_nuevos))
 
-        store.mark_processed(msg_id, {
-            "status": "ok",
-            "pdf": pdf_name,
-            "zip": found_zip_name,
-            "nuevos": int(total_nuevos),
-            "enriquecidas": int(enriquecidas),
-            "cufe": cufe_pdf,
-        })
+        if usar_processed_store:
+            store.mark_processed(msg_id, {
+                "status": "ok",
+                "pdf": pdf_name,
+                "zip": found_zip_name,
+                "nuevos": int(total_nuevos),
+                "enriquecidas": int(enriquecidas),
+                "cufe": cufe_pdf,
+            })
 
         try:
             marcar_mensaje_como_leido(msg_id)
@@ -1530,7 +2469,7 @@ def run_desde_aprobadas(
             detalle_rows, run_id, msg_id, subj,
             pdf_name=pdf_name,
             cufe=cufe_pdf,
-            numero=ident_pdf.get("NUMERO") or "",
+            numero=ident_pdf.get("NUMERO_APROB") or ident_pdf.get("NUMERO") or "",
             fecha_factura=fecha_pdf,
             zip_match=found_zip_name,
             estado="ok",
@@ -1556,14 +2495,14 @@ def run_desde_aprobadas(
 
         procesados += 1
         if (procesados >= AUTO_STOP_MIN_PROCESADOS) and (sin_nuevos_consec >= AUTO_STOP_SIN_NUEVOS_CONSEC):
-            print("🛑 Deteniendo flujo: varios PDFs con match pero sin nuevos registros (optimización de tiempo).")
+            print("🛑 Deteniendo flujo: varios PDFs con match pero sin nuevos registros.")
             break
 
     try:
         n = borrar_pdfs_en_arbol(TMP_DIR)
         print(f"🧹 Limpieza temp_check: borrados {n} PDF(s).")
     except Exception:
-        print("⚠️ Limpieza temp_check: no se pudo completar (continuo).")
+        print("⚠️ Limpieza temp_check: no se pudo completar.")
 
     total_secs = time.perf_counter() - t0_total
     fin_dt = datetime.datetime.now().isoformat(timespec="seconds")
@@ -1596,7 +2535,7 @@ def run_desde_aprobadas(
                 "dian_pdf_only": cnt_dian,
                 "nuevos_total": nuevos_total,
                 "enriquecidas_total": enriq_total,
-                "nota": ""
+                "nota": "",
             })
         except Exception as e:
             print(f"⚠️ No pude escribir audit runs CSV: {e}")
@@ -1611,27 +2550,3 @@ def run_desde_aprobadas(
         lock.release()
     except Exception:
         pass
-
-
-def _numero_from_subject(subj: str) -> str | None:
-    m = re.search(
-        r"(?:Factura|#|N[o°\.]?)[^\w]*([A-Za-z]{1,6}\s*[-–—]?\s*\d{2,20}|[A-Za-z0-9\-\/\.]{3,})",
-        subj or "",
-        flags=re.IGNORECASE
-    )
-    if not m:
-        return None
-    s = (m.group(1) or "").strip()
-    s = s.replace("–", "-").replace("—", "-")
-    s = re.sub(r"\s*-\s*", "-", s)
-    s = re.sub(r"\s+", "", s) if re.match(r"^[A-Za-z]{2,6}\s*\d{2,20}$", s) else s
-    return s.strip() or None
-
-
-def _fecha_from_subject(subj: str) -> str | None:
-    for pat in [r"(\d{4}[-/]\d{2}[-/]\d{2})", r"(\d{2}[-/]\d{2}[-/]\d{4})"]:
-        m = re.search(pat, subj or "")
-        if m:
-            s = m.group(1)
-            return normalizar_fecha(s) or s
-    return None
