@@ -1,2 +1,2 @@
 run_id,inicio,fin,duracion_s,carpeta,since_days,max_aprobados,max_zip_buscar,msgs_leidos,msgs_pendientes,msgs_procesados,ok,sin_match,ya_registrado,sin_pdf,errores,dian_pdf_only,nuevos_total,enriquecidas_total,nota
-20260318_103523_fc1cfba5,2026-03-18T10:35:23,2026-03-18T13:13:49,9505.59,solo aprobadas,90,200,15000,200,200,200,168,20,0,4,0,8,1141,1092,
+20260324_154756_1b5c28e5,2026-03-24T15:47:56,2026-03-25T09:30:24,63755.483,solo aprobadas,90,300,20000,300,300,300,269,5,0,4,0,21,1883,1722,

@@ -52,6 +52,10 @@ INBOX_DIAN_SUBJECT_CANDIDATES = [
     "VALIDACION DIAN JOYCO",
     "VALIDACIONES DIAN JOYCO",
     "DIAN VIAL",
+    "VALIDACION JOYCO",
+    "VALIDACIONES JOYCO",
+    "VALIDACION JOYCO SAS",
+    "VALIDACIONES JOYCO SAS",
 ]
 
 # True = si hay preview, también valida ahí; si no hay, cae a asunto

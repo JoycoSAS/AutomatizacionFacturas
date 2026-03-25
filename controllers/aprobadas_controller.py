@@ -224,7 +224,6 @@ def _token_es_util_para_match(token: str) -> bool:
     if not t:
         return False
 
-    # permitir números puros útiles
     if re.fullmatch(r"\d{4,20}", t):
         return True
 
@@ -234,7 +233,6 @@ def _token_es_util_para_match(token: str) -> bool:
     if _is_hex_like_token(t):
         return False
 
-    # evita tokens demasiado cortos tipo FE10, NO89, IK17 si salen aislados
     if re.fullmatch(r"[A-Z]{1,3}\d{1,2}", t):
         return False
 
@@ -271,7 +269,6 @@ def _numero_variantes(numero: str) -> List[str]:
         add(f"{pref}{dig}")
         add(f"{pref} {dig}")
 
-    # caso FVE-1-16704 -> FVE116704
     m3 = re.match(r"^([A-Z]+)-(\d+)-(\d+)$", n)
     if m3:
         a, b, c = m3.groups()
@@ -329,19 +326,10 @@ def _tokens_match_from_text(texto: str) -> List[str]:
         return []
 
     patrones = [
-        # Prefijo + número
         r"[A-Z]{1,10}\s*[-]?\s*\d{2,20}",
-
-        # Prefijo + bloque + número
         r"[A-Z]{1,10}\s*[-]?\s*\d{1,10}\s*[-]?\s*\d{2,20}",
-
-        # Número + sufijo letras
         r"\d{2,20}\s*[-]?\s*[A-Z]{1,6}",
-
-        # Compactos tipo COL1106
         r"[A-Z]{2,20}\d{2,20}",
-
-        # Números puros útiles
         r"\b\d{4,20}\b",
     ]
 
@@ -355,11 +343,9 @@ def _tokens_match_from_text(texto: str) -> List[str]:
             if not k:
                 continue
 
-            # descarta números ridículamente cortos
             if re.fullmatch(r"\d{1,3}", k):
                 continue
 
-            # si es numérico puro y tiene longitud razonable, permitirlo
             if re.fullmatch(r"\d{4,20}", k):
                 if k not in seen:
                     seen.add(k)
@@ -408,7 +394,6 @@ def _elegir_numero_principal(ident_pdf: Dict[str, str], subj: str, pdf_name: str
         if _numero_parece_valido(c):
             return c
 
-    # solo usar nombre del archivo si NO parece uuid/guid
     if not _is_uuid_like_name(pdf_name):
         toks = _tokens_match_from_text(Path(pdf_name).stem)
         for t in toks:
@@ -464,6 +449,61 @@ def _contains_dian(text: str) -> bool:
     return normalize_text(APROB_DIAN_KEYWORD) in normalize_text(text or "")
 
 
+def _contains_validacion(text: str) -> bool:
+    s = normalize_text(text or "")
+    return ("validacion" in s) or ("validaciones" in s)
+
+
+def _is_validation_like_subject(subj: str) -> bool:
+    s = normalize_text(subj or "")
+    if not s:
+        return False
+
+    reglas_directas = [
+        "02-validacion dian",
+        "02 validacion dian",
+        "02-validaciones dian",
+        "02 validaciones dian",
+        "validacion dian",
+        "validaciones dian",
+        "validacion dian joyco",
+        "validaciones dian joyco",
+        "dian vial",
+        "correo validacion dian",
+        "correo validaciones dian",
+        "validacion joyco",
+        "validaciones joyco",
+        "validacion joyco sas",
+        "validaciones joyco sas",
+        "validacion joyco s a s",
+        "validaciones joyco s a s",
+        "02-validacion joyco",
+        "02 validacion joyco",
+        "02-validaciones joyco",
+        "02 validaciones joyco",
+        "correo validacion joyco",
+        "correo validaciones joyco",
+    ]
+
+    if any(x in s for x in reglas_directas):
+        return True
+
+    tiene_dian = "dian" in s
+    tiene_joyco = "joyco" in s
+    tiene_validacion = _contains_validacion(s)
+
+    if tiene_validacion and (tiene_dian or tiene_joyco):
+        return True
+
+    try:
+        if any(normalize_text(c) in s for c in INBOX_DIAN_SUBJECT_CANDIDATES):
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
 def _is_inbox_dian_container_subject(subj: str) -> bool:
     s = normalize_text(subj or "")
     if not s:
@@ -481,6 +521,12 @@ def _is_inbox_dian_container_subject(subj: str) -> bool:
         "dian vial",
         "correo validacion dian",
         "correo validaciones dian",
+        "validacion joyco",
+        "validaciones joyco",
+        "validacion joyco sas",
+        "validaciones joyco sas",
+        "validacion joyco s a s",
+        "validaciones joyco s a s",
     ]
 
     if any(x in s for x in reglas_directas):
@@ -488,8 +534,9 @@ def _is_inbox_dian_container_subject(subj: str) -> bool:
 
     tiene_dian = "dian" in s
     tiene_validacion = ("validacion" in s) or ("validaciones" in s)
+    tiene_joyco = "joyco" in s
 
-    if tiene_dian and tiene_validacion:
+    if tiene_validacion and (tiene_dian or tiene_joyco):
         return True
 
     try:
@@ -504,18 +551,40 @@ def _is_inbox_dian_container_subject(subj: str) -> bool:
 def _is_dian_trigger_message(msg: dict) -> bool:
     subj = msg.get("subject") or ""
     subj_norm = normalize_text(subj)
-    if "dian" in subj_norm:
-        return True
 
     preview = (msg.get("bodyPreview") or msg.get("body_preview") or "")
     preview_norm = normalize_text(preview)
 
+    # 1) Casos claramente DIAN / validación
+    if _is_validation_like_subject(subj):
+        return True
+
+    # 2) Si el asunto dice DIAN pero también es un correo típico de aprobadas,
+    # NO lo mandamos automáticamente por rama DIAN
+    asunto_aprobado = (
+        ("aprobado" in subj_norm)
+        and ("factura" in subj_norm)
+        and ("radicado" in subj_norm)
+    )
+
+    if "dian" in subj_norm and not asunto_aprobado:
+        return True
+
+    # 3) Revisión por cuerpo / preview
     if REQUIRE_DIAN_IN_BODY_PREVIEW:
         if preview:
-            return "dian" in preview_norm
-        return "dian" in subj_norm
+            if "dian" in preview_norm and not asunto_aprobado:
+                return True
+            if _contains_validacion(preview_norm) and "joyco" in preview_norm:
+                return True
+            return False
 
-    if "dian" in preview_norm:
+        return _is_validation_like_subject(subj)
+
+    if "dian" in preview_norm and not asunto_aprobado:
+        return True
+
+    if _contains_validacion(preview_norm) and "joyco" in preview_norm:
         return True
 
     return False
@@ -907,7 +976,6 @@ def _seleccionar_mejor_pdf(
 
             sc = _score_pdf_candidate(aname, ident)
 
-            # si el nombre parece UUID/GUID, no lo premiamos como fuente de número
             if _is_uuid_like_name(aname):
                 sc -= 5
 
@@ -1146,7 +1214,6 @@ def _build_zip_index(
                 if _token_es_util_para_match(tk) and tk not in idx_num_match:
                     idx_num_match[tk] = (zname, zip_bytes)
 
-            # indexar nombre del zip solo si NO parece uuid/guid
             if not _is_uuid_like_name(zname):
                 for tk in _tokens_match_from_text(Path(zname).stem):
                     if _token_es_util_para_match(tk) and tk not in idx_num_match:
@@ -1284,7 +1351,16 @@ def _buscar_pdf_en_correo_validaciones_dian(
 
     candidatos_totales = []
 
-    busquedas = ["DIAN", "Validacion", "Validaciones", ""]
+    busquedas = [
+        "DIAN",
+        "Validacion",
+        "Validaciones",
+        "JOYCO",
+        "VALIDACION JOYCO",
+        "VALIDACION JOYCO SAS",
+        "",
+    ]
+
     for term in busquedas:
         try:
             lote = buscar_mensajes_inbox_por_asunto(
@@ -1323,11 +1399,9 @@ def _buscar_pdf_en_correo_validaciones_dian(
             contenedores.append(m)
             continue
 
-        if "dian" in subj_norm:
-            for tk in tokens_obj:
-                if tk and tk in subj_alnum:
-                    contenedores.append(m)
-                    break
+        if ("dian" in subj_norm) or ("joyco" in subj_norm) or _contains_validacion(subj_norm):
+            if any(tk and tk in subj_alnum for tk in tokens_obj):
+                contenedores.append(m)
 
     tmp = []
     seen_ids = set()
@@ -1343,11 +1417,12 @@ def _buscar_pdf_en_correo_validaciones_dian(
         print(f"[DIAN] contenedor[{i}] asunto={m.get('subject')}")
 
     if not contenedores:
-        print("[DIAN] ❌ No encontré correos contenedores con asunto tipo validación dian.")
+        print("[DIAN] ❌ No encontré correos contenedores con asunto tipo validación dian/joyco.")
         print("[DIAN] ================= FIN BÚSQUEDA DIAN =================\n")
         return None, None, None
 
     revisados = 0
+    target_pdf_clean = _solo_alnum(Path(target_pdf_name).stem)
 
     for m in contenedores:
         mid = m.get("id")
@@ -1364,6 +1439,20 @@ def _buscar_pdf_en_correo_validaciones_dian(
         if not pdfs:
             continue
 
+        def _prio(att: dict) -> int:
+            aname = att.get("name") or ""
+            clean = _solo_alnum(Path(aname).stem)
+            p = 0
+            if target_pdf_clean and clean == target_pdf_clean:
+                p += 1000
+            if target_pdf_clean and target_pdf_clean in clean:
+                p += 400
+            if any(tk and tk in clean for tk in tokens_obj):
+                p += 200
+            return -p
+
+        pdfs = sorted(pdfs, key=_prio)
+
         for att in pdfs:
             revisados += 1
             aname = att.get("name") or f"{att.get('id')}.pdf"
@@ -1374,10 +1463,18 @@ def _buscar_pdf_en_correo_validaciones_dian(
             aname_alnum = _solo_alnum(Path(aname).stem)
 
             nombre_sugiere_match = False
-            for tk in tokens_obj:
-                if tk and tk in aname_alnum:
-                    nombre_sugiere_match = True
-                    break
+            if target_pdf_clean and (
+                aname_alnum == target_pdf_clean or
+                target_pdf_clean in aname_alnum or
+                aname_alnum in target_pdf_clean
+            ):
+                nombre_sugiere_match = True
+
+            if not nombre_sugiere_match:
+                for tk in tokens_obj:
+                    if tk and tk in aname_alnum:
+                        nombre_sugiere_match = True
+                        break
 
             safe_name = re.sub(r"[^A-Za-z0-9_. -]", "_", aname)
             local = os.path.join(dian_tmp, f"{mid[:8]}_{aid[:8]}_{safe_name}")
@@ -1424,6 +1521,198 @@ def _buscar_pdf_en_correo_validaciones_dian(
     print(f"[DIAN] revisados_total={revisados}")
     print("[DIAN] ================= FIN BÚSQUEDA DIAN =================\n")
     return None, None, None
+
+
+def _buscar_zip_en_correo_validaciones_dian(
+    target_ident: Dict[str, str],
+    target_pdf_name: str,
+    since_days: int,
+    top_msgs: int = 200
+) -> Tuple[Optional[str], Optional[bytes], Optional[str], Optional[str]]:
+    print("\n[DIAN ZIP] ================ INICIO BÚSQUEDA ZIP DIAN ================")
+    print(f"[DIAN ZIP] target_pdf_name={target_pdf_name}")
+    print(f"[DIAN ZIP] target CUFE={target_ident.get('CUFE')}")
+    print(f"[DIAN ZIP] target NUMERO={target_ident.get('NUMERO')}")
+    print(f"[DIAN ZIP] target NUMERO_APROB={target_ident.get('NUMERO_APROB')}")
+
+    tokens_obj = _tokens_dian_objetivo(target_ident, target_pdf_name)
+    print(f"[DIAN ZIP] tokens objetivo={tokens_obj}")
+
+    candidatos_totales = []
+
+    busquedas = [
+        "DIAN",
+        "Validacion",
+        "Validaciones",
+        "JOYCO",
+        "VALIDACION JOYCO",
+        "VALIDACION JOYCO SAS",
+        "",
+    ]
+
+    for term in busquedas:
+        try:
+            lote = buscar_mensajes_inbox_por_asunto(
+                asunto_contiene=term,
+                top=top_msgs,
+                since_days=since_days
+            ) or []
+            candidatos_totales.extend(lote)
+            print(f"[DIAN ZIP] candidatos búsqueda {term!r}: {len(lote)}")
+        except Exception as e:
+            print(f"[DIAN ZIP] Error buscando {term!r}: {e}")
+
+    msgs = []
+    seen = set()
+    for m in candidatos_totales:
+        mid = m.get("id")
+        if not mid or mid in seen:
+            continue
+        seen.add(mid)
+        msgs.append(m)
+
+    if not msgs:
+        print("[DIAN ZIP] ❌ No se encontraron mensajes candidatos.")
+        print("[DIAN ZIP] ================ FIN BÚSQUEDA ZIP DIAN ================\n")
+        return None, None, None, None
+
+    contenedores = []
+    for m in msgs:
+        subj = m.get("subject") or ""
+        subj_norm = normalize_text(subj)
+        subj_alnum = _solo_alnum(subj)
+
+        if _is_inbox_dian_container_subject(subj):
+            contenedores.append(m)
+            continue
+
+        if ("dian" in subj_norm) or ("joyco" in subj_norm) or _contains_validacion(subj_norm):
+            if any(tk and tk in subj_alnum for tk in tokens_obj):
+                contenedores.append(m)
+
+    dedup_cont = []
+    seen_ids = set()
+    for m in contenedores:
+        mid = m.get("id")
+        if mid and mid not in seen_ids:
+            seen_ids.add(mid)
+            dedup_cont.append(m)
+    contenedores = dedup_cont
+
+    print(f"[DIAN ZIP] contenedores filtrados: {len(contenedores)}")
+
+    if not contenedores:
+        print("[DIAN ZIP] ❌ No encontré correos contenedores DIAN/JOYCO.")
+        print("[DIAN ZIP] ================ FIN BÚSQUEDA ZIP DIAN ================\n")
+        return None, None, None, None
+
+    revisados = 0
+    target_pdf_clean = _solo_alnum(Path(target_pdf_name).stem)
+
+    for m in contenedores:
+        mid = m.get("id")
+        subj = m.get("subject") or ""
+
+        if not mid:
+            continue
+
+        print(f"\n[DIAN ZIP] Revisando contenedor: {subj} | id={mid}")
+
+        try:
+            zips = listar_adjuntos_zip(mid) or []
+        except Exception as e:
+            print(f"[DIAN ZIP] Error listando ZIPs en {mid}: {e}")
+            zips = []
+
+        print(f"[DIAN ZIP] ZIPs adjuntos en contenedor: {len(zips)}")
+
+        if not zips:
+            continue
+
+        def _prio_zip(att: dict) -> int:
+            zname = att.get("name") or ""
+            clean = _solo_alnum(Path(zname).stem)
+            p = 0
+            if target_pdf_clean and target_pdf_clean in clean:
+                p += 400
+            if any(tk and tk in clean for tk in tokens_obj):
+                p += 200
+            return -p
+
+        zips = sorted(zips, key=_prio_zip)
+
+        for att in zips:
+            revisados += 1
+            aid = att.get("id")
+            zname = att.get("name") or f"{aid}.zip"
+
+            if not aid:
+                continue
+
+            tmp_zip = os.path.join(
+                TMP_DIR,
+                f"dian_zip_{uuid.uuid4().hex}_{re.sub(r'[^A-Za-z0-9_. -]', '_', zname)}"
+            )
+
+            ok = descargar_adjunto_por_id(mid, aid, tmp_zip)
+            if not ok or not os.path.exists(tmp_zip):
+                print(f"[DIAN ZIP] ⚠️ No pude descargar ZIP: {zname}")
+                try:
+                    if os.path.exists(tmp_zip):
+                        os.remove(tmp_zip)
+                except Exception:
+                    pass
+                continue
+
+            try:
+                with open(tmp_zip, "rb") as f:
+                    zip_bytes = f.read()
+            finally:
+                try:
+                    os.remove(tmp_zip)
+                except Exception:
+                    pass
+
+            idents_xml = _peek_ident_xml_from_zip_bytes(zip_bytes)
+            print(f"[DIAN ZIP] ZIP revisado: {zname} | xmls_detectados={len(idents_xml)}")
+
+            target_cufe = _norm_cufe(target_ident.get("CUFE") or "")
+            if target_cufe:
+                for ident_xml in idents_xml:
+                    cufe_xml = _norm_cufe(ident_xml.get("CUFE") or "")
+                    if cufe_xml and cufe_xml == target_cufe:
+                        print(f"[DIAN ZIP] ✅ Match por CUFE en ZIP: {zname}")
+                        print("[DIAN ZIP] ================ FIN BÚSQUEDA ZIP DIAN ================\n")
+                        return zname, zip_bytes, mid, aid
+
+            target_nums = _build_num_set(target_ident)
+            for ident_xml in idents_xml:
+                xml_nums = _build_num_set({
+                    "NUMERO": ident_xml.get("NUMERO") or "",
+                    "NUMERO_APROB": ident_xml.get("NUMERO") or "",
+                })
+                inter = target_nums & xml_nums
+                if inter:
+                    print(f"[DIAN ZIP] ✅ Match por número en ZIP: {zname} | inter={sorted(list(inter))[:5]}")
+                    print("[DIAN ZIP] ================ FIN BÚSQUEDA ZIP DIAN ================\n")
+                    return zname, zip_bytes, mid, aid
+
+            zname_alnum = _solo_alnum(Path(zname).stem)
+
+            if target_pdf_clean and target_pdf_clean in zname_alnum:
+                print(f"[DIAN ZIP] ✅ Match por nombre ZIP: {zname}")
+                print("[DIAN ZIP] ================ FIN BÚSQUEDA ZIP DIAN ================\n")
+                return zname, zip_bytes, mid, aid
+
+            for tk in tokens_obj:
+                if tk and tk in zname_alnum:
+                    print(f"[DIAN ZIP] ✅ Match por token en nombre ZIP: {zname}")
+                    print("[DIAN ZIP] ================ FIN BÚSQUEDA ZIP DIAN ================\n")
+                    return zname, zip_bytes, mid, aid
+
+    print(f"[DIAN ZIP] ❌ No encontré ZIP coincidente dentro de contenedores DIAN. revisados={revisados}")
+    print("[DIAN ZIP] ================ FIN BÚSQUEDA ZIP DIAN ================\n")
+    return None, None, None, None
 
 
 def _extraer_descripciones_items_pdf(texto: str) -> str:
@@ -1661,6 +1950,332 @@ def _try_workbook_append(
         require_table=True,
     )
     return int(insertadas or 0)
+
+def _registrar_desde_pdf_aprobado_fallback(
+    *,
+    msg_id: str,
+    subj: str,
+    pdf_name: str,
+    pdf_tmp: str,
+    ident_pdf: Dict[str, str],
+    fecha_pdf: str,
+    cufe_pdf: str,
+    numero_aprob: str,
+    fecha_local: str,
+    hora_local: str,
+    run_id: str,
+    detalle_rows: List[Dict[str, object]],
+    resumen: List[Tuple[str, float, str, int]],
+    t0: float,
+    usar_processed_store: bool,
+    store: ProcessedStore,
+    cufes_existentes: set,
+    norm_cufes_existentes: set,
+) -> Tuple[bool, int, int]:
+    """
+    Último recurso:
+    si no hubo ZIP ni PDF externo y el PDF aprobado tiene CUFE válido,
+    registrar directamente desde ese mismo PDF.
+    Retorna: (aplico_fallback, total_nuevos, enriquecidas)
+    """
+    if not cufe_pdf or not _cufe_is_valid(cufe_pdf):
+        print(f"⛔ Fallback PDF_APROBADAS no aplica para {pdf_name}: PDF sin CUFE válido.")
+        return False, 0, 0
+
+    print(f"✅ Fallback PDF_APROBADAS habilitado para {pdf_name} (CUFE válido).")
+
+    try:
+        reg = _generar_registro_pdf_only(pdf_tmp, pdf_name)
+
+        numero_final = (
+            ident_pdf.get("NUMERO_APROB")
+            or ident_pdf.get("NUMERO")
+            or reg.get("Número de factura")
+            or ""
+        )
+        if numero_final and len(str(numero_final).strip()) >= 3:
+            reg["Número de factura"] = str(numero_final).strip()
+
+        total_nuevos = guardar_en_excel([reg])
+
+        historial_actualizado = False
+        if total_nuevos > 0:
+            registrar_historial_por_zip([{
+                "Fecha": fecha_local,
+                "Hora": hora_local,
+                "Archivo ZIP": "(PDF_APROBADAS_FALLBACK)",
+                "Nuevos XML guardados": total_nuevos,
+                "Errores encontrados": 0
+            }])
+            historial_actualizado = True
+
+        enriquecidas = 0
+        try:
+            enriquecidas = sincronizar_aprobaciones_en_facturas()
+        except Exception as e:
+            print(f"[APROB] Error al sincronizar aprobaciones: {e}")
+
+        print("☁️  Subiendo a SharePoint (fallback PDF aprobadas)...")
+        sp_ext_root = f"{BASE_SP}/extraidos/pdf_aprobadas_fallback"
+        sp_excel = f"{BASE_SP}/excel"
+
+        sp_disponible = True
+        try:
+            ensure_folder(sp_ext_root)
+            ensure_folder(sp_excel)
+        except Exception as e:
+            sp_disponible = False
+            print(f"⚠️ SharePoint no disponible en fallback PDF aprobadas: {e}")
+
+        if sp_disponible:
+            try:
+                upload_small_file(pdf_tmp, f"{sp_ext_root}/{os.path.basename(pdf_name)}", mode="skip")
+            except Exception as e:
+                print(f"⚠️ No pude subir PDF fallback a SharePoint: {e}")
+        else:
+            print("⚠️ Se omite subida a SharePoint por error temporal.")
+
+        hubo_cambios_excel = (total_nuevos > 0) or (enriquecidas > 0)
+
+        insertadas = 0
+        if sp_disponible and hubo_cambios_excel:
+            try:
+                archivos_ref = {
+                    os.path.basename(pdf_name),
+                    str(reg.get("Archivo") or os.path.basename(pdf_name)),
+                }
+                insertadas = _try_workbook_append(sp_excel, archivos_ref, table_name="TblFacturas")
+                print(f"✅ Workbook API (PDF_APROBADAS_FALLBACK): +{insertadas} fila(s) nuevas en TblFacturas.")
+            except Exception as e:
+                print(f"⚠️ Workbook API falló (PDF_APROBADAS_FALLBACK): {e}")
+        elif hubo_cambios_excel:
+            print("⚠️ Workbook API omitida por indisponibilidad temporal de SharePoint.")
+
+        if sp_disponible:
+            _subir_excels_a_sharepoint(sp_excel, hubo_cambios_excel, historial_actualizado)
+        else:
+            print("⚠️ No se suben excels a SharePoint en esta iteración.")
+
+        if usar_processed_store:
+            store.mark_processed(msg_id, {
+                "status": "ok_pdf_aprobadas_fallback",
+                "pdf": pdf_name,
+                "nuevos": int(total_nuevos),
+                "enriquecidas": int(enriquecidas),
+                "cufe": cufe_pdf,
+            })
+
+        try:
+            marcar_mensaje_como_leido(msg_id)
+        except Exception as e:
+            print(f"⚠️ No se pudo marcar como leído: {e}")
+
+        secs = time.perf_counter() - t0
+        resumen.append((pdf_name, secs, "fallback pdf aprobadas", total_nuevos))
+
+        _push_detalle(
+            detalle_rows, run_id, msg_id, subj,
+            pdf_name=pdf_name,
+            cufe=cufe_pdf,
+            numero=reg.get("Número de factura") or "",
+            fecha_factura=ident_pdf.get("FECHA") or fecha_pdf,
+            zip_match="(PDF_APROBADAS_FALLBACK)",
+            estado="ok_pdf_aprobadas_fallback",
+            duracion_s=secs,
+            nuevos=int(total_nuevos or 0),
+            enriquecidas=int(enriquecidas or 0),
+            fuente="PDF_APROBADAS"
+        )
+
+        if total_nuevos > 0 and cufe_pdf:
+            cufes_existentes.add(cufe_pdf)
+            norm_cufes_existentes.add(cufe_pdf)
+
+        return True, int(total_nuevos or 0), int(enriquecidas or 0)
+
+    except Exception as e:
+        print(f"⚠️ Falló fallback PDF_APROBADAS para {pdf_name}: {e}")
+        return False, 0, 0
+
+def _procesar_pdf_aprobadas_como_ultimo_recurso(
+    *,
+    msg_id: str,
+    subj: str,
+    pdf_name: str,
+    pdf_tmp: str,
+    ident_pdf: Dict[str, str],
+    fecha_pdf: str,
+    fecha_local: str,
+    hora_local: str,
+    cufe_pdf: str,
+    numero_aprob: str,
+    detalle_rows: list,
+    run_id: str,
+    t0: float,
+    usar_processed_store: bool,
+    store,
+):
+    """
+    Último último recurso:
+    usa el MISMO PDF de solo aprobadas como fuente de registro,
+    únicamente si el PDF tiene CUFE válido.
+
+    Retorna:
+    {
+        "handled": bool,
+        "ok": bool,
+        "nuevos": int,
+        "enriquecidas": int,
+        "estado": str
+    }
+    """
+
+    if not cufe_pdf or not _cufe_is_valid(cufe_pdf):
+        estado = "sin_match_pdf_aprobadas_sin_cufe"
+        print(f"❌ Fallback PDF_APROBADAS NO aplicado para {pdf_name}: el PDF no tiene CUFE válido.")
+
+        if usar_processed_store:
+            store.mark_processed(msg_id, {
+                "status": estado,
+                "pdf": pdf_name,
+                "cufe": cufe_pdf or "",
+            })
+
+        _push_detalle(
+            detalle_rows, run_id, msg_id, subj,
+            pdf_name=pdf_name,
+            cufe=cufe_pdf or "",
+            numero=ident_pdf.get("NUMERO_APROB") or ident_pdf.get("NUMERO") or "",
+            fecha_factura=ident_pdf.get("FECHA") or fecha_pdf,
+            zip_match="(PDF_APROBADAS_FALLBACK_NO_CUFE)",
+            estado=estado,
+            duracion_s=(time.perf_counter() - t0),
+            nuevos=0,
+            enriquecidas=0,
+            fuente="PDF_APROBADAS",
+            error="No se pudo leer por solo PDF porque no se encontró CUFE válido"
+        )
+
+        return {
+            "handled": True,
+            "ok": False,
+            "nuevos": 0,
+            "enriquecidas": 0,
+            "estado": estado,
+        }
+
+    print(f"✅ Fallback PDF_APROBADAS habilitado para {pdf_name} (CUFE válido).")
+
+    reg = _generar_registro_pdf_only(pdf_tmp, pdf_name)
+
+    numero_final = (
+        ident_pdf.get("NUMERO_APROB")
+        or ident_pdf.get("NUMERO")
+        or reg.get("Número de factura")
+        or ""
+    )
+
+    if numero_aprob and len(str(numero_aprob).strip()) >= 3:
+        numero_final = str(numero_aprob).strip()
+
+    if numero_final and len(str(numero_final).strip()) >= 3:
+        reg["Número de factura"] = str(numero_final).strip()
+
+    total_nuevos = guardar_en_excel([reg])
+
+    historial_actualizado = False
+    if total_nuevos > 0:
+        registrar_historial_por_zip([{
+            "Fecha": fecha_local,
+            "Hora": hora_local,
+            "Archivo ZIP": "(PDF_APROBADAS_FALLBACK)",
+            "Nuevos XML guardados": total_nuevos,
+            "Errores encontrados": 0
+        }])
+        historial_actualizado = True
+
+    enriquecidas = 0
+    try:
+        enriquecidas = sincronizar_aprobaciones_en_facturas()
+    except Exception as e:
+        print(f"[APROB] Error al sincronizar aprobaciones: {e}")
+
+    print("☁️  Subiendo a SharePoint (fallback PDF aprobadas)...")
+    sp_ext_root = f"{BASE_SP}/extraidos/pdf_aprobadas_fallback"
+    sp_excel = f"{BASE_SP}/excel"
+
+    sp_disponible = True
+    try:
+        ensure_folder(sp_ext_root)
+        ensure_folder(sp_excel)
+    except Exception as e:
+        sp_disponible = False
+        print(f"⚠️ SharePoint no disponible en fallback PDF aprobadas: {e}")
+
+    if sp_disponible:
+        try:
+            upload_small_file(pdf_tmp, f"{sp_ext_root}/{os.path.basename(pdf_name)}", mode="skip")
+        except Exception as e:
+            print(f"⚠️ No pude subir PDF fallback a SharePoint: {e}")
+    else:
+        print("⚠️ Se omite subida a SharePoint por error temporal.")
+
+    hubo_cambios_excel = (total_nuevos > 0) or (enriquecidas > 0)
+
+    insertadas = 0
+    if sp_disponible and hubo_cambios_excel:
+        try:
+            archivos_ref = {
+                os.path.basename(pdf_name),
+                str(reg.get("Archivo") or os.path.basename(pdf_name)),
+            }
+            insertadas = _try_workbook_append(sp_excel, archivos_ref, table_name="TblFacturas")
+            print(f"✅ Workbook API (PDF_APROBADAS_FALLBACK): +{insertadas} fila(s) nuevas en TblFacturas.")
+        except Exception as e:
+            print(f"⚠️ Workbook API falló (PDF_APROBADAS_FALLBACK): {e}")
+    elif hubo_cambios_excel:
+        print("⚠️ Workbook API omitida por indisponibilidad temporal de SharePoint.")
+
+    if sp_disponible:
+        _subir_excels_a_sharepoint(sp_excel, hubo_cambios_excel, historial_actualizado)
+    else:
+        print("⚠️ No se suben excels a SharePoint en esta iteración.")
+
+    if usar_processed_store:
+        store.mark_processed(msg_id, {
+            "status": "ok_pdf_aprobadas_fallback",
+            "pdf": pdf_name,
+            "nuevos": int(total_nuevos),
+            "enriquecidas": int(enriquecidas),
+            "cufe": cufe_pdf,
+        })
+
+    try:
+        marcar_mensaje_como_leido(msg_id)
+    except Exception as e:
+        print(f"⚠️ No se pudo marcar como leído: {e}")
+
+    _push_detalle(
+        detalle_rows, run_id, msg_id, subj,
+        pdf_name=pdf_name,
+        cufe=cufe_pdf,
+        numero=reg.get("Número de factura") or "",
+        fecha_factura=ident_pdf.get("FECHA") or fecha_pdf,
+        zip_match="(PDF_APROBADAS_FALLBACK)",
+        estado="ok_pdf_aprobadas_fallback",
+        duracion_s=(time.perf_counter() - t0),
+        nuevos=int(total_nuevos or 0),
+        enriquecidas=int(enriquecidas or 0),
+        fuente="PDF_APROBADAS"
+    )
+
+    return {
+        "handled": True,
+        "ok": True,
+        "nuevos": int(total_nuevos or 0),
+        "enriquecidas": int(enriquecidas or 0),
+        "estado": "ok_pdf_aprobadas_fallback",
+    }
 
 
 def run_desde_aprobadas(
@@ -1930,11 +2545,8 @@ def run_desde_aprobadas(
             procesados += 1
             continue
 
-        # =========================================================
-        # RAMA DIAN
-        # =========================================================
         if _is_dian_trigger_message(msg):
-            print(f"[DIAN] Detectado mensaje DIAN en aprobadas (asunto/cuerpo): {subj!r}")
+            print(f"[DIAN] Detectado mensaje DIAN/JOYCO-validación en aprobadas (asunto/cuerpo): {subj!r}")
 
             pdf_real_path, mid_src, aid_src = _buscar_pdf_en_correo_validaciones_dian(
                 target_ident=ident_pdf,
@@ -1943,16 +2555,289 @@ def run_desde_aprobadas(
                 top_msgs=400
             )
 
+            zip_dian_name = None
+            zip_dian_bytes = None
+            zip_mid_src = None
+            zip_aid_src = None
+
             if not pdf_real_path:
-                secs = time.perf_counter() - t0
-                resumen.append((pdf_name, secs, "sin match dian", 0))
+                zip_dian_name, zip_dian_bytes, zip_mid_src, zip_aid_src = _buscar_zip_en_correo_validaciones_dian(
+                    target_ident=ident_pdf,
+                    target_pdf_name=pdf_name,
+                    since_days=since_days,
+                    top_msgs=400
+                )
+
+            # -------------------------------------------------
+            # 1) Si encontró PDF externo DIAN -> procesa PDF-only DIAN
+            # -------------------------------------------------
+            if pdf_real_path:
+                pdf_real_name = os.path.basename(pdf_real_path)
+                reg = _generar_registro_pdf_only(pdf_real_path, pdf_real_name)
+
+                if numero_aprob and len(numero_aprob) >= 3:
+                    reg["Número de factura"] = numero_aprob
+
+                total_nuevos = guardar_en_excel([reg])
+
+                historial_actualizado = False
+                if total_nuevos > 0:
+                    registrar_historial_por_zip([{
+                        "Fecha": fecha_local,
+                        "Hora": hora_local,
+                        "Archivo ZIP": "(PDF-ONLY) VALIDACIONES DIAN",
+                        "Nuevos XML guardados": total_nuevos,
+                        "Errores encontrados": 0
+                    }])
+                    historial_actualizado = True
+
+                enriquecidas = 0
+                try:
+                    enriquecidas = sincronizar_aprobaciones_en_facturas()
+                except Exception as e:
+                    print(f"[APROB] Error al sincronizar aprobaciones: {e}")
+
+                print("☁️  Subiendo a SharePoint (DIAN / PDF-only)...")
+                sp_ext_root = f"{BASE_SP}/extraidos/dian_pdf_only"
+                sp_excel = f"{BASE_SP}/excel"
+
+                sp_disponible = True
+                try:
+                    ensure_folder(sp_ext_root)
+                    ensure_folder(sp_excel)
+                except Exception as e:
+                    sp_disponible = False
+                    print(f"⚠️ SharePoint no disponible en rama DIAN: {e}")
+
+                if sp_disponible:
+                    try:
+                        upload_small_file(pdf_real_path, f"{sp_ext_root}/{pdf_real_name}", mode="skip")
+                    except Exception as e:
+                        print(f"[DIAN] No pude subir PDF real: {e}")
+                else:
+                    print("[DIAN] ⚠️ Se omite subida a SharePoint por error temporal.")
+
+                hubo_cambios_excel = (total_nuevos > 0) or (enriquecidas > 0)
+
+                insertadas = 0
+                if sp_disponible and hubo_cambios_excel:
+                    try:
+                        archivos_ref = {str(reg.get("Archivo") or pdf_real_name)}
+                        insertadas = _try_workbook_append(sp_excel, archivos_ref, table_name="TblFacturas")
+                        print(f"✅ Workbook API (DIAN/PDF): +{insertadas} fila(s) nuevas en TblFacturas.")
+                    except Exception as e:
+                        print(f"⚠️ Workbook API falló (DIAN/PDF): {e}")
+
+                if sp_disponible:
+                    _subir_excels_a_sharepoint(sp_excel, hubo_cambios_excel, historial_actualizado)
+                else:
+                    print("[DIAN] ⚠️ No se suben excels a SharePoint en esta iteración.")
+
                 if usar_processed_store:
-                    store.mark_processed(msg_id, {"status": "sin_match_dian", "pdf": pdf_name, "cufe": cufe_pdf})
-                cnt_sin_match += 1
+                    store.mark_processed(msg_id, {
+                        "status": "ok_dian_pdf_only",
+                        "pdf": pdf_name,
+                        "nuevos": int(total_nuevos),
+                        "enriquecidas": int(enriquecidas),
+                        "cufe": cufe_pdf,
+                        "src_msg": mid_src,
+                        "src_att": aid_src,
+                    })
+
+                try:
+                    marcar_mensaje_como_leido(msg_id)
+                except Exception as e:
+                    print(f"⚠️ No se pudo marcar como leído: {e}")
+
+                secs = time.perf_counter() - t0
+                resumen.append((pdf_name, secs, "match dian pdf", total_nuevos))
+
+                _push_detalle(
+                    detalle_rows, run_id, msg_id, subj,
+                    pdf_name=pdf_name,
+                    cufe=cufe_pdf,
+                    numero=reg.get("Número de factura") or "",
+                    fecha_factura=ident_pdf.get("FECHA") or fecha_pdf,
+                    zip_match="(PDF-ONLY) VALIDACIONES DIAN",
+                    estado="ok_dian_pdf_only",
+                    duracion_s=secs,
+                    nuevos=int(total_nuevos or 0),
+                    enriquecidas=int(enriquecidas or 0),
+                    fuente="DIAN_PDF"
+                )
+
+                cnt_dian += 1
                 msgs_procesados += 1
-                sin_match_consec += 1
-                sin_nuevos_consec = 0
+                nuevos_total += int(total_nuevos or 0)
+                enriq_total += int(enriquecidas or 0)
+
+                sin_match_consec = 0
+                sin_nuevos_consec = 0 if total_nuevos > 0 else (sin_nuevos_consec + 1)
                 procesados += 1
+                continue
+
+            # -------------------------------------------------
+            # 2) Si encontró ZIP externo DIAN -> procesa ZIP DIAN
+            # -------------------------------------------------
+            if zip_dian_name and zip_dian_bytes:
+                b1 = _limpiar_adj_hoy()
+                if b1:
+                    print(f"🧹 Limpieza ADJ_HOY: borrados {b1} ZIP(s) viejos.")
+
+                b2 = _limpiar_ext_hoy()
+                if b2:
+                    print(f"🧹 Limpieza EXT_HOY: borrados {b2} elemento(s) viejos.")
+
+                found_zip_name = zip_dian_name
+                found_zip_bytes = zip_dian_bytes
+
+                zip_local_path = Path(ADJ_HOY) / found_zip_name
+                with open(zip_local_path, "wb") as f:
+                    f.write(found_zip_bytes)
+
+                print(f"🗜️  Extrayendo ZIP DIAN {found_zip_name} ...")
+                resultados = extraer_por_zip(ADJ_HOY, EXT_HOY)
+                print("🧾 Procesando XMLs DIAN...")
+
+                historial_rows = []
+                total_nuevos = 0
+                carpeta_obj = None
+                ruta_obj = None
+                archivos_realmente_guardados: set[str] = set()
+
+                for zip_name, carpeta in resultados:
+                    if zip_name != found_zip_name:
+                        continue
+
+                    ruta = os.path.join(EXT_HOY, carpeta)
+                    done_marker = os.path.join(ruta, ".done")
+                    carpeta_obj = carpeta
+                    ruta_obj = ruta
+
+                    if os.path.exists(done_marker):
+                        continue
+
+                    regs, errores_zip = procesar_xml_en_carpeta(ruta)
+
+                    if regs and numero_aprob:
+                        for dct in regs:
+                            old = str(dct.get("Número de factura", "")).strip()
+                            if old != numero_aprob and len(numero_aprob) >= 3:
+                                dct["Número de factura"] = numero_aprob
+
+                    if regs:
+                        for dct in regs:
+                            av = dct.get("Archivo")
+                            if av:
+                                archivos_realmente_guardados.add(str(av).strip())
+
+                    nuevos = guardar_en_excel(regs) if regs else 0
+                    total_nuevos += nuevos
+
+                    if nuevos > 0 or errores_zip > 0:
+                        historial_rows.append({
+                            "Fecha": fecha_local,
+                            "Hora": hora_local,
+                            "Archivo ZIP": zip_name,
+                            "Nuevos XML guardados": nuevos,
+                            "Errores encontrados": errores_zip
+                        })
+
+                print(f"✅ Excel local actualizado por ZIP DIAN (+{total_nuevos}): {ARCHIVO_EXCEL}")
+
+                historial_actualizado = False
+                if historial_rows:
+                    registrar_historial_por_zip(historial_rows)
+                    historial_actualizado = True
+
+                enriquecidas = 0
+                try:
+                    enriquecidas = sincronizar_aprobaciones_en_facturas()
+                except Exception as e:
+                    print(f"[APROB] Error al sincronizar aprobaciones: {e}")
+
+                print("☁️  Subiendo a SharePoint (DIAN / ZIP)...")
+                if USE_DATE_SUBFOLDERS:
+                    sp_adj_root = f"{BASE_SP}/adjuntos/{fecha_local}"
+                    sp_ext_root = f"{BASE_SP}/extraidos/{fecha_local}"
+                else:
+                    sp_adj_root = f"{BASE_SP}/adjuntos"
+                    sp_ext_root = f"{BASE_SP}/extraidos"
+                sp_excel = f"{BASE_SP}/excel"
+
+                sp_disponible = True
+                try:
+                    ensure_folder(sp_adj_root)
+                    ensure_folder(sp_ext_root)
+                    ensure_folder(sp_excel)
+                except Exception as e:
+                    sp_disponible = False
+                    print(f"⚠️ SharePoint no disponible en rama DIAN ZIP: {e}")
+
+                if sp_disponible:
+                    try:
+                        upload_small_file(str(zip_local_path), f"{sp_adj_root}/{found_zip_name}", mode="skip")
+                    except Exception as e:
+                        print(f"⚠️ Error subiendo ZIP DIAN a SharePoint: {e}")
+
+                    try:
+                        if carpeta_obj and ruta_obj and os.path.exists(ruta_obj):
+                            upload_directory(ruta_obj, f"{sp_ext_root}/{carpeta_obj}", mode="skip")
+                        else:
+                            upload_directory(EXT_HOY, sp_ext_root, mode="skip")
+                    except Exception as e:
+                        print(f"⚠️ Error subiendo extraídos DIAN a SharePoint: {e}")
+                else:
+                    print("⚠️ Se omite subida a SharePoint para ZIP DIAN por error temporal.")
+
+                hubo_cambios_excel = (total_nuevos > 0) or (enriquecidas > 0)
+
+                insertadas = 0
+                if sp_disponible and hubo_cambios_excel:
+                    try:
+                        archivos_xml = set()
+                        if ruta_obj and os.path.isdir(ruta_obj):
+                            for fn in os.listdir(ruta_obj):
+                                if fn.lower().endswith(".xml"):
+                                    archivos_xml.add(fn)
+
+                        archivos_ref = set(archivos_realmente_guardados)
+                        archivos_ref |= set(archivos_xml)
+                        archivos_ref.add(os.path.basename(pdf_name))
+                        if found_zip_name:
+                            archivos_ref.add(os.path.basename(found_zip_name))
+
+                        insertadas = _try_workbook_append(sp_excel, archivos_ref, table_name="TblFacturas")
+                        print(f"✅ Workbook API (DIAN/ZIP): +{insertadas} fila(s) nuevas en TblFacturas.")
+                    except Exception as e:
+                        print(f"⚠️ Workbook API falló (DIAN/ZIP): {e}")
+                elif hubo_cambios_excel:
+                    print("⚠️ Workbook API DIAN/ZIP omitida por indisponibilidad temporal de SharePoint.")
+
+                if sp_disponible:
+                    _subir_excels_a_sharepoint(sp_excel, hubo_cambios_excel, historial_actualizado)
+                else:
+                    print("⚠️ No se suben excels a SharePoint en esta iteración DIAN/ZIP.")
+
+                if usar_processed_store:
+                    store.mark_processed(msg_id, {
+                        "status": "ok_dian_zip",
+                        "pdf": pdf_name,
+                        "zip": found_zip_name,
+                        "nuevos": int(total_nuevos),
+                        "enriquecidas": int(enriquecidas),
+                        "cufe": cufe_pdf,
+                        "src_msg": zip_mid_src,
+                        "src_att": zip_aid_src,
+                    })
+
+                try:
+                    marcar_mensaje_como_leido(msg_id)
+                except Exception as e:
+                    print(f"⚠️ No se pudo marcar como leído: {e}")
+
+                secs = time.perf_counter() - t0
+                resumen.append((pdf_name, secs, "match dian zip", total_nuevos))
 
                 _push_detalle(
                     detalle_rows, run_id, msg_id, subj,
@@ -1960,156 +2845,110 @@ def run_desde_aprobadas(
                     cufe=cufe_pdf,
                     numero=ident_pdf.get("NUMERO_APROB") or ident_pdf.get("NUMERO") or "",
                     fecha_factura=fecha_pdf,
-                    estado="sin_match_dian",
-                    duracion_s=(time.perf_counter() - t0),
-                    fuente="DIAN"
+                    zip_match=found_zip_name,
+                    estado="ok_dian_zip",
+                    duracion_s=secs,
+                    nuevos=int(total_nuevos or 0),
+                    enriquecidas=int(enriquecidas or 0),
+                    fuente="DIAN_ZIP"
                 )
+
+                cnt_dian += 1
+                msgs_procesados += 1
+                nuevos_total += int(total_nuevos or 0)
+                enriq_total += int(enriquecidas or 0)
+
+                sin_match_consec = 0
+                if total_nuevos == 0:
+                    sin_nuevos_consec += 1
+                else:
+                    sin_nuevos_consec = 0
+                    if cufe_pdf:
+                        cufes_existentes.add(cufe_pdf)
+                        norm_cufes_existentes.add(cufe_pdf)
+
+                procesados += 1
                 continue
 
-            pdf_real_name = os.path.basename(pdf_real_path)
-            reg = _generar_registro_pdf_only(pdf_real_path, pdf_real_name)
+            # -------------------------------------------------
+            # 3) Si NO encontró ni PDF DIAN ni ZIP DIAN,
+            # aplicar también el fallback final del mismo PDF aprobado
+            # -------------------------------------------------
+            print(f"[DIAN] No encontré PDF/ZIP externo para {pdf_name}. Intentando fallback con el mismo PDF aprobado...")
 
-            if numero_aprob and len(numero_aprob) >= 3:
-                reg["Número de factura"] = numero_aprob
+            aplico_fallback, total_nuevos, enriquecidas = _registrar_desde_pdf_aprobado_fallback(
+                msg_id=msg_id,
+                subj=subj,
+                pdf_name=pdf_name,
+                pdf_tmp=pdf_tmp,
+                ident_pdf=ident_pdf,
+                fecha_pdf=fecha_pdf,
+                cufe_pdf=cufe_pdf,
+                numero_aprob=numero_aprob,
+                fecha_local=fecha_local,
+                hora_local=hora_local,
+                run_id=run_id,
+                detalle_rows=detalle_rows,
+                resumen=resumen,
+                t0=t0,
+                usar_processed_store=usar_processed_store,
+                store=store,
+                cufes_existentes=cufes_existentes,
+                norm_cufes_existentes=norm_cufes_existentes,
+            )
 
-            total_nuevos = guardar_en_excel([reg])
+            if aplico_fallback:
+                cnt_dian += 1
+                msgs_procesados += 1
+                nuevos_total += int(total_nuevos or 0)
+                enriq_total += int(enriquecidas or 0)
 
-            historial_actualizado = False
-            if total_nuevos > 0:
-                registrar_historial_por_zip([{
-                    "Fecha": fecha_local,
-                    "Hora": hora_local,
-                    "Archivo ZIP": "(PDF-ONLY) VALIDACIONES DIAN",
-                    "Nuevos XML guardados": total_nuevos,
-                    "Errores encontrados": 0
-                }])
-                historial_actualizado = True
+                sin_match_consec = 0
+                if total_nuevos == 0:
+                    sin_nuevos_consec += 1
+                else:
+                    sin_nuevos_consec = 0
 
-            enriquecidas = 0
-            try:
-                enriquecidas = sincronizar_aprobaciones_en_facturas()
-            except Exception as e:
-                print(f"[APROB] Error al sincronizar aprobaciones: {e}")
+                procesados += 1
+                continue
 
-            print("☁️  Subiendo a SharePoint (DIAN / PDF-only)...")
-            sp_ext_root = f"{BASE_SP}/extraidos/dian_pdf_only"
-            sp_excel = f"{BASE_SP}/excel"
+            # -------------------------------------------------
+            # 4) Si tampoco aplicó fallback, cerrar como sin_match_dian
+            # -------------------------------------------------
+            secs = time.perf_counter() - t0
+            resumen.append((pdf_name, secs, "sin match dian", 0))
 
-            sp_disponible = True
-            try:
-                ensure_folder(sp_ext_root)
-                ensure_folder(sp_excel)
-            except Exception as e:
-                sp_disponible = False
-                print(f"⚠️ SharePoint no disponible en rama DIAN: {e}")
-
-            if sp_disponible:
-                try:
-                    upload_small_file(pdf_real_path, f"{sp_ext_root}/{pdf_real_name}", mode="skip")
-                except Exception as e:
-                    print(f"[DIAN] No pude subir PDF real: {e}")
-            else:
-                print("[DIAN] ⚠️ Se omite subida a SharePoint por error temporal.")
-
-            hubo_cambios_excel = (total_nuevos > 0) or (enriquecidas > 0)
-
-            insertadas = 0
-            if sp_disponible and hubo_cambios_excel:
-                try:
-                    archivos_ref = {str(reg.get("Archivo") or pdf_real_name)}
-                    insertadas = _try_workbook_append(sp_excel, archivos_ref, table_name="TblFacturas")
-                    print(f"✅ Workbook API (DIAN): +{insertadas} fila(s) nuevas en TblFacturas.")
-                except Exception as e:
-                    print(f"⚠️ Workbook API falló (DIAN): {e}")
-
-            if sp_disponible:
-                _subir_excels_a_sharepoint(sp_excel, hubo_cambios_excel, historial_actualizado)
-            else:
-                print("[DIAN] ⚠️ No se suben excels a SharePoint en esta iteración.")
+            motivo_dian = "sin_match_dian"
+            if not cufe_pdf:
+                motivo_dian = "sin_match_dian_pdf_sin_cufe"
+            elif cufe_pdf and not _cufe_is_valid(cufe_pdf):
+                motivo_dian = "sin_match_dian_cufe_debil"
 
             if usar_processed_store:
                 store.mark_processed(msg_id, {
-                    "status": "ok_dian_pdf_only",
+                    "status": motivo_dian,
                     "pdf": pdf_name,
-                    "nuevos": int(total_nuevos),
-                    "enriquecidas": int(enriquecidas),
-                    "cufe": cufe_pdf,
-                    "src_msg": mid_src,
-                    "src_att": aid_src,
+                    "cufe": cufe_pdf
                 })
 
-            try:
-                marcar_mensaje_como_leido(msg_id)
-            except Exception as e:
-                print(f"⚠️ No se pudo marcar como leído: {e}")
-
-            secs = time.perf_counter() - t0
-            resumen.append((pdf_name, secs, "match dian", total_nuevos))
+            cnt_sin_match += 1
+            msgs_procesados += 1
+            sin_match_consec += 1
+            sin_nuevos_consec = 0
+            procesados += 1
 
             _push_detalle(
                 detalle_rows, run_id, msg_id, subj,
                 pdf_name=pdf_name,
                 cufe=cufe_pdf,
-                numero=reg.get("Número de factura") or "",
-                fecha_factura=ident_pdf.get("FECHA") or fecha_pdf,
-                zip_match="(PDF-ONLY) VALIDACIONES DIAN",
-                estado="ok_dian_pdf_only",
-                duracion_s=(time.perf_counter() - t0),
-                nuevos=int(total_nuevos or 0),
-                enriquecidas=int(enriquecidas or 0),
+                numero=ident_pdf.get("NUMERO_APROB") or ident_pdf.get("NUMERO") or "",
+                fecha_factura=fecha_pdf,
+                estado=motivo_dian,
+                duracion_s=secs,
                 fuente="DIAN"
             )
-
-            cnt_dian += 1
-            msgs_procesados += 1
-            nuevos_total += int(total_nuevos or 0)
-            enriq_total += int(enriquecidas or 0)
-
-            sin_match_consec = 0
-            sin_nuevos_consec = 0 if total_nuevos > 0 else (sin_nuevos_consec + 1)
-            procesados += 1
             continue
 
-        # =========================================================
-        # YA REGISTRADO
-        # =========================================================
-        if cufe_pdf and cufe_pdf in norm_cufes_existentes:
-            print(f"🔁 Factura ya registrada (CUFE en Excel). Se omite búsqueda de ZIP para {pdf_name}.")
-            secs = time.perf_counter() - t0
-            resumen.append((pdf_name, secs, "ya registrado", 0))
-            if usar_processed_store:
-                store.mark_processed(msg_id, {"status": "ya_registrado", "pdf": pdf_name, "cufe": cufe_pdf})
-
-            _push_detalle(
-                detalle_rows, run_id, msg_id, subj,
-                pdf_name=pdf_name,
-                cufe=cufe_pdf,
-                numero=ident_pdf.get("NUMERO") or "",
-                fecha_factura=fecha_pdf,
-                estado="ya_registrado",
-                duracion_s=(time.perf_counter() - t0)
-            )
-
-            cnt_ya_reg += 1
-            msgs_procesados += 1
-
-            sin_match_consec = 0
-            sin_nuevos_consec += 1
-            procesados += 1
-
-            try:
-                marcar_mensaje_como_leido(msg_id)
-            except Exception as e:
-                print(f"⚠️ No se pudo marcar como leído: {e}")
-
-            if (procesados >= AUTO_STOP_MIN_PROCESADOS) and (sin_nuevos_consec >= AUTO_STOP_SIN_NUEVOS_CONSEC):
-                print("🛑 Deteniendo flujo: varios PDFs ya registrados/sin nuevos.")
-                break
-            continue
-
-        # =========================================================
-        # MATCH NORMAL PDF ↔ ZIP
-        # =========================================================
         found_match = False
         found_zip_name = None
         found_zip_bytes = None
@@ -2152,7 +2991,6 @@ def run_desde_aprobadas(
                 found_match = True
                 fuente_match = f"NUMERO:{variante}"
 
-        # tokens del nombre del PDF SOLO si el nombre NO es UUID/GUID
         if not found_match and not _is_uuid_like_name(pdf_name):
             for tk in _tokens_match_from_text(Path(pdf_name).stem):
                 if not _token_es_util_para_match(tk):
@@ -2168,7 +3006,6 @@ def run_desde_aprobadas(
         if not found_match:
             pdf_base = Path(pdf_name).stem.lower()
 
-            # evita match por nombre cuando el PDF parece GUID
             if not _is_uuid_like_name(pdf_name):
                 pdf_clean = re.sub(r"[^a-z0-9]", "", pdf_base)
 
@@ -2290,17 +3127,81 @@ def run_desde_aprobadas(
 
         if not found_match or not found_zip_name or not found_zip_bytes:
             print(f"❌ No se encontró ZIP que coincida para PDF {pdf_name}.")
+            print("🔁 Intentando último recurso con el MISMO PDF de solo aprobadas...")
+
+            try:
+                resultado_fallback = _procesar_pdf_aprobadas_como_ultimo_recurso(
+                    msg_id=msg_id,
+                    subj=subj,
+                    pdf_name=pdf_name,
+                    pdf_tmp=pdf_tmp,
+                    ident_pdf=ident_pdf,
+                    fecha_pdf=fecha_pdf,
+                    fecha_local=fecha_local,
+                    hora_local=hora_local,
+                    cufe_pdf=cufe_pdf,
+                    numero_aprob=numero_aprob,
+                    detalle_rows=detalle_rows,
+                    run_id=run_id,
+                    t0=t0,
+                    usar_processed_store=usar_processed_store,
+                    store=store,
+                )
+
+                if resultado_fallback["handled"]:
+                    secs = time.perf_counter() - t0
+
+                    if resultado_fallback["ok"]:
+                        resumen.append((pdf_name, secs, "fallback pdf aprobadas", resultado_fallback["nuevos"]))
+
+                        cnt_ok += 1
+                        msgs_procesados += 1
+                        nuevos_total += int(resultado_fallback["nuevos"] or 0)
+                        enriq_total += int(resultado_fallback["enriquecidas"] or 0)
+
+                        sin_match_consec = 0
+                        if int(resultado_fallback["nuevos"] or 0) == 0:
+                            sin_nuevos_consec += 1
+                        else:
+                            sin_nuevos_consec = 0
+                            if cufe_pdf:
+                                cufes_existentes.add(cufe_pdf)
+                                norm_cufes_existentes.add(cufe_pdf)
+
+                        procesados += 1
+                        continue
+
+                    else:
+                        resumen.append((pdf_name, secs, "sin match pdf aprobadas sin cufe", 0))
+
+                        cnt_sin_match += 1
+                        msgs_procesados += 1
+                        sin_match_consec += 1
+                        sin_nuevos_consec = 0
+                        procesados += 1
+
+                        if (procesados >= AUTO_STOP_MIN_PROCESADOS) and (sin_match_consec >= AUTO_STOP_SIN_MATCH_CONSEC):
+                            print("🛑 Deteniendo flujo: varios PDFs consecutivos sin match.")
+                            break
+                        continue
+
+            except Exception as e:
+                print(f"⚠️ Falló el último recurso PDF_APROBADAS para {pdf_name}: {e}")
+
             secs = time.perf_counter() - t0
             resumen.append((pdf_name, secs, "sin match", 0))
 
             motivo_sin_match = "sin_match"
             num_candidato = ident_pdf.get("NUMERO_APROB") or ident_pdf.get("NUMERO") or ""
-            if not num_candidato and not cufe_pdf:
+
+            if cufe_pdf and not _cufe_is_valid(cufe_pdf):
+                motivo_sin_match = "sin_match_pdf_sin_cufe"
+            elif not cufe_pdf:
+                motivo_sin_match = "sin_match_pdf_sin_cufe"
+            elif not num_candidato and not cufe_pdf:
                 motivo_sin_match = "sin_match_sin_identificadores"
             elif num_candidato and not _numero_parece_valido(num_candidato):
                 motivo_sin_match = "sin_match_numero_no_valido"
-            elif cufe_pdf and not _cufe_is_valid(cufe_pdf):
-                motivo_sin_match = "sin_match_cufe_debil"
             else:
                 motivo_sin_match = "sin_match_no_zip"
 
@@ -2319,7 +3220,8 @@ def run_desde_aprobadas(
                 fecha_factura=fecha_pdf,
                 estado=motivo_sin_match,
                 duracion_s=(time.perf_counter() - t0),
-                fuente=fuente_match
+                fuente=fuente_match,
+                error="No encontró ZIP, no encontró DIAN y no pudo cerrarse por fallback PDF_APROBADAS"
             )
 
             cnt_sin_match += 1
@@ -2334,9 +3236,6 @@ def run_desde_aprobadas(
                 break
             continue
 
-        # =========================================================
-        # PROCESAMIENTO DEL ZIP
-        # =========================================================
         b1 = _limpiar_adj_hoy()
         if b1:
             print(f"🧹 Limpieza ADJ_HOY: borrados {b1} ZIP(s) viejos.")
