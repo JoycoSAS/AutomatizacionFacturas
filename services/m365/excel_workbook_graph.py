@@ -62,8 +62,6 @@ class ExcelWorkbookGraph:
         return sid
 
     def close_session(self, session_id: str) -> None:
-        # Cerrar no es obligatorio; Graph a veces la expira igual.
-        # Pero lo dejamos por orden.
         try:
             url = f"{self.base}/closeSession"
             _SESSION.post(
@@ -150,7 +148,6 @@ class ExcelWorkbookGraph:
             i1 = header.index(key_cols[0])
             i2 = header.index(key_cols[1])
         except ValueError:
-            # Si no están las columnas, no podemos dedupe => devolvemos vacío
             return set()
 
         existing: Set[Tuple[str, str]] = set()
@@ -163,7 +160,6 @@ class ExcelWorkbookGraph:
 
     @staticmethod
     def _align_rows_to_table(header: List[str], rows_dicts: List[Dict[str, Any]]) -> List[List[Any]]:
-        # Alinea a columnas existentes de la tabla; las faltantes van vacío
         return [[d.get(col, "") for col in header] for d in rows_dicts]
 
     # ---------------------------
@@ -186,6 +182,7 @@ class ExcelWorkbookGraph:
         5) Inserta solo nuevas
         """
         if not rows_dicts:
+            print("[Workbook] append_rows_dedup: rows_dicts vacío")
             return 0
 
         session_id = self.create_session(persist_changes=True)
@@ -207,28 +204,56 @@ class ExcelWorkbookGraph:
 
             existing = self._build_existing_keys(table_values, key_cols)
 
-            filtered = []
+            # Si solo existe el encabezado, no hay filas reales
+            if len(table_values) <= 1:
+                existing = set()
+
+            filtered: List[Dict[str, Any]] = []
+            seen_new: Set[Tuple[str, str]] = set()
+
             for d in rows_dicts:
                 k = (
                     str(d.get(key_cols[0], "")).strip(),
                     str(d.get(key_cols[1], "")).strip(),
                 )
-                if k[0] and k[1] and k not in existing:
+
+                # Si no tiene ambas claves, no la bloqueamos por dedupe
+                if not k[0] or not k[1]:
                     filtered.append(d)
+                    continue
+
+                # Evitar duplicados dentro del mismo lote
+                if k in seen_new:
+                    continue
+
+                # Si no existe en la tabla actual, se inserta
+                if k not in existing:
+                    filtered.append(d)
+                    seen_new.add(k)
+
+            print(
+                f"[Workbook] Tabla={table_name} | "
+                f"rows_dicts={len(rows_dicts)} | "
+                f"table_rows={max(len(table_values) - 1, 0)} | "
+                f"existing_keys={len(existing)} | "
+                f"filtered={len(filtered)}"
+            )
 
             if not filtered:
+                print("[Workbook] No hay filas nuevas para insertar.")
                 return 0
 
             rows_values = self._align_rows_to_table(header, filtered)
 
-            # Insert con reintentos (a veces Graph devuelve 429/5xx)
             last_err: Optional[Exception] = None
             for attempt in range(retries + 1):
                 try:
                     self.add_rows(session_id, table_name, rows_values)
+                    print(f"[Workbook] Insertadas correctamente: {len(filtered)} fila(s)")
                     return len(filtered)
                 except Exception as e:
                     last_err = e
+                    print(f"[Workbook] Error insert attempt={attempt + 1}: {e}")
                     if attempt < retries:
                         time.sleep(retry_sleep * (2 ** attempt))
                         continue

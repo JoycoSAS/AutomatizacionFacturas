@@ -1951,6 +1951,7 @@ def _try_workbook_append(
     )
     return int(insertadas or 0)
 
+
 def _registrar_desde_pdf_aprobado_fallback(
     *,
     msg_id: str,
@@ -1971,16 +1972,18 @@ def _registrar_desde_pdf_aprobado_fallback(
     store: ProcessedStore,
     cufes_existentes: set,
     norm_cufes_existentes: set,
-) -> Tuple[bool, int, int]:
+) -> Tuple[bool, int, int, int]:
     """
     Último recurso:
     si no hubo ZIP ni PDF externo y el PDF aprobado tiene CUFE válido,
     registrar directamente desde ese mismo PDF.
-    Retorna: (aplico_fallback, total_nuevos, enriquecidas)
+
+    Retorna:
+        (aplico_fallback, total_nuevos, enriquecidas, insertadas_web)
     """
     if not cufe_pdf or not _cufe_is_valid(cufe_pdf):
         print(f"⛔ Fallback PDF_APROBADAS no aplica para {pdf_name}: PDF sin CUFE válido.")
-        return False, 0, 0
+        return False, 0, 0, 0
 
     print(f"✅ Fallback PDF_APROBADAS habilitado para {pdf_name} (CUFE válido).")
 
@@ -2091,11 +2094,11 @@ def _registrar_desde_pdf_aprobado_fallback(
             cufes_existentes.add(cufe_pdf)
             norm_cufes_existentes.add(cufe_pdf)
 
-        return True, int(total_nuevos or 0), int(enriquecidas or 0)
+        return True, int(total_nuevos or 0), int(enriquecidas or 0), int(insertadas or 0)
 
     except Exception as e:
         print(f"⚠️ Falló fallback PDF_APROBADAS para {pdf_name}: {e}")
-        return False, 0, 0
+        return False, 0, 0, 0
 
 def _procesar_pdf_aprobadas_como_ultimo_recurso(
     *,
@@ -2126,6 +2129,7 @@ def _procesar_pdf_aprobadas_como_ultimo_recurso(
         "ok": bool,
         "nuevos": int,
         "enriquecidas": int,
+        "insertadas": int,
         "estado": str
     }
     """
@@ -2161,6 +2165,7 @@ def _procesar_pdf_aprobadas_como_ultimo_recurso(
             "ok": False,
             "nuevos": 0,
             "enriquecidas": 0,
+            "insertadas": 0,
             "estado": estado,
         }
 
@@ -2229,7 +2234,11 @@ def _procesar_pdf_aprobadas_como_ultimo_recurso(
                 os.path.basename(pdf_name),
                 str(reg.get("Archivo") or os.path.basename(pdf_name)),
             }
-            insertadas = _try_workbook_append(sp_excel, archivos_ref, table_name="TblFacturas")
+            insertadas = _try_workbook_append(
+                sp_excel,
+                archivos_ref,
+                table_name="TblFacturas"
+            )
             print(f"✅ Workbook API (PDF_APROBADAS_FALLBACK): +{insertadas} fila(s) nuevas en TblFacturas.")
         except Exception as e:
             print(f"⚠️ Workbook API falló (PDF_APROBADAS_FALLBACK): {e}")
@@ -2274,9 +2283,29 @@ def _procesar_pdf_aprobadas_como_ultimo_recurso(
         "ok": True,
         "nuevos": int(total_nuevos or 0),
         "enriquecidas": int(enriquecidas or 0),
+        "insertadas": int(insertadas or 0),
         "estado": "ok_pdf_aprobadas_fallback",
     }
 
+
+def _try_workbook_append_rows(
+    sp_excel_root: str,
+    rows_dicts: List[Dict[str, object]],
+    table_name: str = "TblFacturas"
+) -> int:
+    if not rows_dicts:
+        return 0
+
+    sp_facturas_path = f"{sp_excel_root}/facturas.xlsx".strip("/")
+    xl = ExcelWorkbookGraph(sp_facturas_path)
+
+    insertadas = xl.append_rows_dedup(
+        table_name=table_name,
+        rows_dicts=rows_dicts,
+        key_cols=("Archivo", "Concepto"),
+        require_table=True,
+    )
+    return int(insertadas or 0)
 
 def run_desde_aprobadas(
     max_aprobados: int = 50,
@@ -2400,6 +2429,8 @@ def run_desde_aprobadas(
     cnt_dian = 0
     nuevos_total = 0
     enriq_total = 0
+    filas_local_total = 0
+    filas_web_total = 0
 
     detalle_rows: List[Dict[str, object]] = []
 
@@ -2568,9 +2599,6 @@ def run_desde_aprobadas(
                     top_msgs=400
                 )
 
-            # -------------------------------------------------
-            # 1) Si encontró PDF externo DIAN -> procesa PDF-only DIAN
-            # -------------------------------------------------
             if pdf_real_path:
                 pdf_real_name = os.path.basename(pdf_real_path)
                 reg = _generar_registro_pdf_only(pdf_real_path, pdf_real_name)
@@ -2622,8 +2650,16 @@ def run_desde_aprobadas(
                 insertadas = 0
                 if sp_disponible and hubo_cambios_excel:
                     try:
-                        archivos_ref = {str(reg.get("Archivo") or pdf_real_name)}
-                        insertadas = _try_workbook_append(sp_excel, archivos_ref, table_name="TblFacturas")
+                        archivos_ref = {
+                            os.path.basename(pdf_real_name),
+                            str(reg.get("Archivo") or pdf_real_name),
+                            os.path.basename(pdf_name),
+                        }
+                        insertadas = _try_workbook_append(
+                            sp_excel,
+                            archivos_ref,
+                            table_name="TblFacturas"
+                        )
                         print(f"✅ Workbook API (DIAN/PDF): +{insertadas} fila(s) nuevas en TblFacturas.")
                     except Exception as e:
                         print(f"⚠️ Workbook API falló (DIAN/PDF): {e}")
@@ -2670,15 +2706,14 @@ def run_desde_aprobadas(
                 msgs_procesados += 1
                 nuevos_total += int(total_nuevos or 0)
                 enriq_total += int(enriquecidas or 0)
+                filas_local_total += int(total_nuevos or 0)
+                filas_web_total += int(insertadas or 0)
 
                 sin_match_consec = 0
                 sin_nuevos_consec = 0 if total_nuevos > 0 else (sin_nuevos_consec + 1)
                 procesados += 1
                 continue
 
-            # -------------------------------------------------
-            # 2) Si encontró ZIP externo DIAN -> procesa ZIP DIAN
-            # -------------------------------------------------
             if zip_dian_name and zip_dian_bytes:
                 b1 = _limpiar_adj_hoy()
                 if b1:
@@ -2704,6 +2739,7 @@ def run_desde_aprobadas(
                 carpeta_obj = None
                 ruta_obj = None
                 archivos_realmente_guardados: set[str] = set()
+                regs_para_sharepoint: List[Dict[str, object]] = []
 
                 for zip_name, carpeta in resultados:
                     if zip_name != found_zip_name:
@@ -2724,6 +2760,9 @@ def run_desde_aprobadas(
                             old = str(dct.get("Número de factura", "")).strip()
                             if old != numero_aprob and len(numero_aprob) >= 3:
                                 dct["Número de factura"] = numero_aprob
+
+                    if regs:
+                        regs_para_sharepoint.extend(regs)
 
                     if regs:
                         for dct in regs:
@@ -2807,7 +2846,11 @@ def run_desde_aprobadas(
                         if found_zip_name:
                             archivos_ref.add(os.path.basename(found_zip_name))
 
-                        insertadas = _try_workbook_append(sp_excel, archivos_ref, table_name="TblFacturas")
+                        insertadas = _try_workbook_append(
+                            sp_excel,
+                            archivos_ref,
+                            table_name="TblFacturas"
+                        )
                         print(f"✅ Workbook API (DIAN/ZIP): +{insertadas} fila(s) nuevas en TblFacturas.")
                     except Exception as e:
                         print(f"⚠️ Workbook API falló (DIAN/ZIP): {e}")
@@ -2857,6 +2900,8 @@ def run_desde_aprobadas(
                 msgs_procesados += 1
                 nuevos_total += int(total_nuevos or 0)
                 enriq_total += int(enriquecidas or 0)
+                filas_local_total += int(total_nuevos or 0)
+                filas_web_total += int(insertadas or 0)
 
                 sin_match_consec = 0
                 if total_nuevos == 0:
@@ -2870,13 +2915,9 @@ def run_desde_aprobadas(
                 procesados += 1
                 continue
 
-            # -------------------------------------------------
-            # 3) Si NO encontró ni PDF DIAN ni ZIP DIAN,
-            # aplicar también el fallback final del mismo PDF aprobado
-            # -------------------------------------------------
             print(f"[DIAN] No encontré PDF/ZIP externo para {pdf_name}. Intentando fallback con el mismo PDF aprobado...")
 
-            aplico_fallback, total_nuevos, enriquecidas = _registrar_desde_pdf_aprobado_fallback(
+            aplico_fallback, total_nuevos, enriquecidas, insertadas = _registrar_desde_pdf_aprobado_fallback(
                 msg_id=msg_id,
                 subj=subj,
                 pdf_name=pdf_name,
@@ -2902,6 +2943,8 @@ def run_desde_aprobadas(
                 msgs_procesados += 1
                 nuevos_total += int(total_nuevos or 0)
                 enriq_total += int(enriquecidas or 0)
+                filas_local_total += int(total_nuevos or 0)
+                filas_web_total += int(insertadas or 0)
 
                 sin_match_consec = 0
                 if total_nuevos == 0:
@@ -2912,9 +2955,6 @@ def run_desde_aprobadas(
                 procesados += 1
                 continue
 
-            # -------------------------------------------------
-            # 4) Si tampoco aplicó fallback, cerrar como sin_match_dian
-            # -------------------------------------------------
             secs = time.perf_counter() - t0
             resumen.append((pdf_name, secs, "sin match dian", 0))
 
@@ -3156,11 +3196,13 @@ def run_desde_aprobadas(
 
                         cnt_ok += 1
                         msgs_procesados += 1
-                        nuevos_total += int(resultado_fallback["nuevos"] or 0)
-                        enriq_total += int(resultado_fallback["enriquecidas"] or 0)
+                        nuevos_total += int(resultado_fallback.get("nuevos", 0) or 0)
+                        enriq_total += int(resultado_fallback.get("enriquecidas", 0) or 0)
+                        filas_local_total += int(resultado_fallback.get("nuevos", 0) or 0)
+                        filas_web_total += int(resultado_fallback.get("insertadas", 0) or 0)
 
                         sin_match_consec = 0
-                        if int(resultado_fallback["nuevos"] or 0) == 0:
+                        if int(resultado_fallback.get("nuevos", 0) or 0) == 0:
                             sin_nuevos_consec += 1
                         else:
                             sin_nuevos_consec = 0
@@ -3226,7 +3268,6 @@ def run_desde_aprobadas(
 
             cnt_sin_match += 1
             msgs_procesados += 1
-
             sin_match_consec += 1
             sin_nuevos_consec = 0
             procesados += 1
@@ -3257,6 +3298,7 @@ def run_desde_aprobadas(
         carpeta_obj = None
         ruta_obj = None
         archivos_realmente_guardados: set[str] = set()
+        regs_para_sharepoint: List[Dict[str, object]] = []
 
         for zip_name, carpeta in resultados:
             if zip_name != found_zip_name:
@@ -3277,6 +3319,9 @@ def run_desde_aprobadas(
                     old = str(dct.get("Número de factura", "")).strip()
                     if old != numero_aprob and len(numero_aprob) >= 3:
                         dct["Número de factura"] = numero_aprob
+
+            if regs:
+                regs_para_sharepoint.extend(regs)
 
             if regs:
                 for dct in regs:
@@ -3360,10 +3405,14 @@ def run_desde_aprobadas(
                 if found_zip_name:
                     archivos_ref.add(os.path.basename(found_zip_name))
 
-                insertadas = _try_workbook_append(sp_excel, archivos_ref, table_name="TblFacturas")
-                print(f"✅ Workbook API: +{insertadas} fila(s) nuevas en TblFacturas.")
+                insertadas = _try_workbook_append(
+                    sp_excel,
+                    archivos_ref,
+                    table_name="TblFacturas"
+                )
+                print(f"✅ Workbook API (NORMAL/ZIP): +{insertadas} fila(s) nuevas en TblFacturas.")
             except Exception as e:
-                print(f"⚠️ Workbook API falló: {e}")
+                print(f"⚠️ Workbook API falló (NORMAL/ZIP): {e}")
         elif hubo_cambios_excel:
             print("⚠️ Workbook API omitida por indisponibilidad temporal de SharePoint.")
 
@@ -3409,6 +3458,8 @@ def run_desde_aprobadas(
         msgs_procesados += 1
         nuevos_total += int(total_nuevos or 0)
         enriq_total += int(enriquecidas or 0)
+        filas_local_total += int(total_nuevos or 0)
+        filas_web_total += int(insertadas or 0)
 
         sin_match_consec = 0
         if total_nuevos == 0:
@@ -3461,6 +3512,8 @@ def run_desde_aprobadas(
                 "dian_pdf_only": cnt_dian,
                 "nuevos_total": nuevos_total,
                 "enriquecidas_total": enriq_total,
+                "filas_local_total": filas_local_total,
+                "filas_web_total": filas_web_total,
                 "nota": "",
             })
         except Exception as e:
