@@ -3,18 +3,15 @@
 Sincroniza Radicado / ProyectoProceso desde el Excel de Radicados (SharePoint)
 hacia facturas.xlsx.
 
-✅ FIX CLAVE:
-- Ya NO detecta columnas con heurísticas propias.
+MEJORAS:
 - Descarga el Excel de radicados al RADICADOS_LOCAL_PATH.
-- Reutiliza la lógica robusta de services/radicados_service.cargar_mapa_radicados().
-- FIX del error:
-    'list' object has no attribute 'add'
-  causado por:
-    ws._tables = []
-  Eso ya NO se usa.
+- Reutiliza cargar_mapa_radicados().
+- Recrea la tabla TblFacturas sin usar ws._tables = [].
+- Hace match robusto por múltiples variantes del "Número de factura":
+    original, sin espacios, sin guiones, solo alfanumérico, etc.
 
 Resultado:
-- Si existe match por "Número de factura" (normalizado), llena:
+- Si existe match por "Número de factura", llena:
     Radicado, ProyectoProceso
 - Si no existe match, NO rompe, solo no actualiza.
 """
@@ -22,6 +19,7 @@ Resultado:
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -73,9 +71,7 @@ def _ensure_column(ws, header_name: str) -> int:
 def _recrear_tabla_facturas(ws) -> None:
     """
     Elimina tablas existentes de forma segura y recrea TblFacturas.
-    ✅ NO usar ws._tables = []
     """
-    # Borrar tablas existentes correctamente
     try:
         for table_name in list(ws.tables.keys()):
             del ws.tables[table_name]
@@ -134,6 +130,70 @@ def _ordenar_y_formatear_facturas():
 
 
 # -------------------------------------------------
+# Helpers (match robusto de factura)
+# -------------------------------------------------
+def _build_possible_factura_keys(val: str) -> list[str]:
+    """
+    Genera varias claves posibles para aumentar el match entre
+    Número de factura en facturas.xlsx y el mapa de radicados.
+    """
+    raw = str(val or "").strip().upper()
+    if not raw:
+        return []
+
+    keys = []
+    seen = set()
+
+    def add(x: str):
+        x = str(x or "").strip().upper()
+        if x and x not in seen:
+            seen.add(x)
+            keys.append(x)
+
+    add(raw)
+    add(raw.replace(" ", ""))
+    add(raw.replace("-", ""))
+    add(raw.replace("_", ""))
+    add(raw.replace(" ", "").replace("-", ""))
+    add(raw.replace(" ", "").replace("_", ""))
+    add(raw.replace("-", "").replace("_", ""))
+    add(raw.replace(" ", "").replace("-", "").replace("_", ""))
+
+    # solo alfanumérico
+    limpio = re.sub(r"[^A-Z0-9]", "", raw)
+    add(limpio)
+
+    # variantes comunes con separadores
+    m = re.match(r"^([A-Z]+)(\d+)$", limpio)
+    if m:
+        pref, dig = m.groups()
+        add(f"{pref}{dig}")
+        add(f"{pref}-{dig}")
+        add(f"{pref} {dig}")
+        add(f"{pref}_{dig}")
+
+    m2 = re.match(r"^([A-Z]+)-(\d+)$", raw)
+    if m2:
+        pref, dig = m2.groups()
+        add(f"{pref}{dig}")
+        add(f"{pref} {dig}")
+        add(f"{pref}_{dig}")
+
+    return keys
+
+
+def _find_match_in_mapa(val: str, mapa: dict) -> tuple[str, str] | None:
+    """
+    Busca coincidencia del número de factura contra el mapa de radicados
+    usando múltiples variantes.
+    """
+    for key in _build_possible_factura_keys(val):
+        if key in mapa:
+            return mapa[key]
+    return None
+
+
+# -------------------------------------------------
 # FUNCIÓN PRINCIPAL
 # -------------------------------------------------
 def sincronizar_aprobaciones_en_facturas(force_reload_radicados: bool = True) -> int:
@@ -185,21 +245,16 @@ def sincronizar_aprobaciones_en_facturas(force_reload_radicados: bool = True) ->
 
         updated = 0
 
-        from services.radicados_service import _norm_factura as _norm_fact
-
         for r in range(2, ws_f.max_row + 1):
             val = ws_f.cell(row=r, column=col_num).value
             if not val:
                 continue
 
-            key = _norm_fact(str(val))
-            if not key:
+            match = _find_match_in_mapa(str(val), mapa)
+            if not match:
                 continue
 
-            if key not in mapa:
-                continue
-
-            rad, proy = mapa[key]
+            rad, proy = match
             changed = False
 
             cell_rad = ws_f.cell(row=r, column=col_rad_f)

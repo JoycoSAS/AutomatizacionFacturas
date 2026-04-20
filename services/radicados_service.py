@@ -18,12 +18,13 @@ from config import (
 # Cache en memoria para no releer el Excel cada vez
 _CACHE_MAP: Optional[Dict[str, Tuple[str, str]]] = None
 
+
 # =========================
 # Normalización
 # =========================
 
 def _norm_text(s: str) -> str:
-    """Normaliza texto para comparar headers (sin espacios raros, lower)."""
+    """Normaliza texto para comparar headers."""
     if s is None:
         return ""
     s = str(s).replace("\u00A0", " ").strip().lower()
@@ -33,37 +34,91 @@ def _norm_text(s: str) -> str:
 
 def _norm_factura(num: str) -> str:
     """
-    Normaliza un número de factura a una clave.
-    - FEED6164 -> FEED6164
-    - FVE-2080 -> FVE2080
-    - FE 266 -> FE266
-    - N0761734 -> N0761734 (y se usará también 0761734 como alias)
+    Normaliza número de factura para usarlo como clave de match.
+    Conserva letras y números, elimina espacios/guiones/símbolos.
     """
     if num is None:
         return ""
-    s = str(num).upper().strip()
+
+    s = str(num).strip().upper()
+    if not s:
+        return ""
+
     s = s.replace("\u00A0", " ")
     s = re.sub(r"\s+", " ", s).strip()
-    # deja solo A-Z0-9
+
+    # reparar posible notación científica si llega dañada
+    sci = s.replace(",", ".")
+    if "E+" in sci or "E-" in sci:
+        try:
+            s = "{:.0f}".format(float(sci))
+        except Exception:
+            pass
+
     s = re.sub(r"[^A-Z0-9]", "", s)
     return s
 
 
+def _build_possible_keys(num: str) -> list[str]:
+    """
+    Genera varias claves posibles para aumentar la probabilidad de match.
+    """
+    raw = str(num or "").strip().upper()
+    if not raw:
+        return []
+
+    keys = []
+    seen = set()
+
+    def add(x: str):
+        x = str(x or "").strip().upper()
+        if not x:
+            return
+        if x not in seen:
+            seen.add(x)
+            keys.append(x)
+
+    add(raw)
+    add(raw.replace(" ", ""))
+    add(raw.replace("-", ""))
+    add(raw.replace("_", ""))
+    add(re.sub(r"[^A-Z0-9]", "", raw))
+
+    limpio = re.sub(r"[^A-Z0-9]", "", raw)
+
+    # alias N0761734 -> 0761734
+    if re.fullmatch(r"N\d{4,}", limpio):
+        add(limpio[1:])
+
+    # FE-1245 -> FE1245
+    m = re.match(r"^([A-Z]+)(\d+)$", limpio)
+    if m:
+        pref, dig = m.groups()
+        add(f"{pref}{dig}")
+        add(f"{pref}-{dig}")
+        add(f"{pref} {dig}")
+
+    return keys
+
+
 def _alias_keys(key: str) -> list[str]:
     """
-    Devuelve posibles alias de la clave (para casos tipo N0761734 vs 0761734).
+    Devuelve posibles alias de una clave ya normalizada.
     """
-    keys = []
-    if key:
-        keys.append(key)
-        # Si es N + dígitos, agrega alias sin la N
-        if re.fullmatch(r"N\d{4,}", key):
-            keys.append(key[1:])
-    # únicos conservando orden
     out = []
-    for k in keys:
-        if k and k not in out:
-            out.append(k)
+    seen = set()
+
+    def add(x: str):
+        x = str(x or "").strip().upper()
+        if x and x not in seen:
+            seen.add(x)
+            out.append(x)
+
+    add(key)
+
+    if re.fullmatch(r"N\d{4,}", key):
+        add(key[1:])
+
     return out
 
 
@@ -73,12 +128,7 @@ def _alias_keys(key: str) -> list[str]:
 
 def _extract_numero_factura_from_asunto(asunto: str) -> str:
     """
-    Extrae el "número de factura" desde el campo Asunto del Excel de radicados.
-    Espera cosas tipo:
-      - "Factura: FEED6164 - ..."
-      - "Factura: N0761734"
-      - "Factura FE 1943 - ..."
-      - "FACTURA:F-002-1943 - ..."
+    Extrae el número de factura desde el campo Asunto del Excel de radicados.
     """
     if asunto is None:
         return ""
@@ -87,33 +137,29 @@ def _extract_numero_factura_from_asunto(asunto: str) -> str:
     if not s:
         return ""
 
-    # 1) Caso principal: contiene la palabra "Factura"
     m = re.search(r"(?i)\bfactura\b\s*[:\-]?\s*(.+)$", s)
     if not m:
         return ""
 
     tail = m.group(1).strip()
 
-    # si está separado por " - ", nos quedamos con lo primero
     if " - " in tail:
         tail = tail.split(" - ", 1)[0].strip()
 
-    # Si tiene "Radicado ..." después, cortar
     tail = re.split(r"(?i)\bradicad[oa]\b", tail)[0].strip()
-
     tail = tail.replace("\u00A0", " ")
     tail = re.sub(r"\s+", " ", tail).strip()
+
     return tail
 
 
 # =========================
-# Header detection (fila real)
+# Header detection
 # =========================
 
 def _find_header_row(df_raw: pd.DataFrame, required_headers: list[str], max_scan_rows: int = 120) -> int:
     """
     Busca la fila donde aparecen los headers reales.
-    df_raw viene con header=None (valores crudos).
     """
     req = [_norm_text(h) for h in required_headers]
     scan_rows = min(max_scan_rows, len(df_raw))
@@ -134,7 +180,6 @@ def cargar_mapa_radicados(force_reload: bool = False) -> Dict[str, Tuple[str, st
     """
     Lee el Excel de radicados y construye mapa:
       KEY(normalizada) -> (radicado, proyecto)
-    También guarda alias para Nxxxx -> xxxx.
     """
     global _CACHE_MAP
 
@@ -146,7 +191,6 @@ def cargar_mapa_radicados(force_reload: bool = False) -> Dict[str, Tuple[str, st
 
     required = [RAD_COL_ASUNTO, RAD_COL_RADICADO, RAD_COL_PROY]
 
-    # 1) leer crudo sin header
     df_raw = pd.read_excel(
         RADICADOS_LOCAL_PATH,
         sheet_name=RADICADOS_SHEET_NAME,
@@ -154,7 +198,6 @@ def cargar_mapa_radicados(force_reload: bool = False) -> Dict[str, Tuple[str, st
         engine="openpyxl",
     )
 
-    # 2) encontrar fila header real
     header_row = _find_header_row(df_raw, required_headers=required, max_scan_rows=120)
     if header_row == -1:
         preview = df_raw.head(20).fillna("").astype(str).values.tolist()
@@ -163,14 +206,12 @@ def cargar_mapa_radicados(force_reload: bool = False) -> Dict[str, Tuple[str, st
             f"Busqué: {required}. Preview primeras 20 filas: {preview}"
         )
 
-    # 3) construir df ya con headers
     headers = df_raw.iloc[header_row].tolist()
-    df = df_raw.iloc[header_row + 1 :].copy()
+    df = df_raw.iloc[header_row + 1:].copy()
     df.columns = [str(c).replace("\u00A0", " ").strip() for c in headers]
     df = df.reset_index(drop=True)
 
-    # 4) validar columnas requeridas (por nombre normalizado)
-    df_cols_norm = {_norm_text(c): c for c in df.columns}  # norm -> real
+    df_cols_norm = {_norm_text(c): c for c in df.columns}
     missing = [h for h in required if _norm_text(h) not in df_cols_norm]
     if missing:
         raise ValueError(
@@ -189,8 +230,7 @@ def cargar_mapa_radicados(force_reload: bool = False) -> Dict[str, Tuple[str, st
         proy = row.get(col_proy, "")
 
         num_raw = _extract_numero_factura_from_asunto(asunto)
-        key = _norm_factura(num_raw)
-        if not key:
+        if not num_raw:
             continue
 
         rad_str = "" if pd.isna(radicado) else str(radicado).strip()
@@ -199,15 +239,23 @@ def cargar_mapa_radicados(force_reload: bool = False) -> Dict[str, Tuple[str, st
         if not (rad_str or proy_str):
             continue
 
-        # guarda key + alias (Nxxxx -> xxxx)
-        for k in _alias_keys(key):
-            # Si ya existe, no sobre-escribimos a menos que el nuevo tenga info y el viejo esté vacío
-            if k not in mapa:
-                mapa[k] = (rad_str, proy_str)
+        for k in _build_possible_keys(num_raw):
+            key_norm = _norm_factura(k)
+            if not key_norm:
+                continue
+
+            if key_norm not in mapa:
+                mapa[key_norm] = (rad_str, proy_str)
             else:
-                old_rad, old_proy = mapa[k]
+                old_rad, old_proy = mapa[key_norm]
                 if (not old_rad and rad_str) or (not old_proy and proy_str):
-                    mapa[k] = (rad_str or old_rad, proy_str or old_proy)
+                    mapa[key_norm] = (rad_str or old_rad, proy_str or old_proy)
+
+        # alias adicionales para claves ya limpias
+        key_main = _norm_factura(num_raw)
+        for alias in _alias_keys(key_main):
+            if alias and alias not in mapa:
+                mapa[alias] = (rad_str, proy_str)
 
     _CACHE_MAP = mapa
     return mapa
@@ -216,13 +264,28 @@ def cargar_mapa_radicados(force_reload: bool = False) -> Dict[str, Tuple[str, st
 def buscar_radicado_y_proyecto(numero_factura: str, force_reload: bool = False) -> Tuple[str, str]:
     """
     Busca (radicado, proyecto) por numero_factura.
-    Intenta key normal y alias (Nxxxx -> xxxx) automáticamente.
+    Intenta varios alias automáticamente.
     """
     mapa = cargar_mapa_radicados(force_reload=force_reload)
-    key = _norm_factura(numero_factura)
 
-    for k in _alias_keys(key):
-        if k in mapa:
-            return mapa[k]
+    posibles = _build_possible_keys(numero_factura)
+    for p in posibles:
+        key = _norm_factura(p)
+        if key in mapa:
+            return mapa[key]
+
+    key = _norm_factura(numero_factura)
+    for alias in _alias_keys(key):
+        if alias in mapa:
+            return mapa[alias]
+
+    # match flexible por contención
+    key_clean = _norm_factura(numero_factura)
+    if key_clean:
+        for mk, val in mapa.items():
+            if key_clean == mk:
+                return val
+            if len(key_clean) >= 5 and (key_clean in mk or mk in key_clean):
+                return val
 
     return ("", "")

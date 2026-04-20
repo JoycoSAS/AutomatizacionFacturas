@@ -1,0 +1,2 @@
+﻿run_id,inicio,fin,duracion_s,carpeta,since_days,max_aprobados,max_zip_buscar,msgs_leidos,msgs_pendientes,msgs_procesados,ok,sin_match,ya_registrado,sin_pdf,errores,dian_pdf_only,nuevos_total,enriquecidas_total,match_total,ok_match,dian_match,facturas_con_filas,facturas_sin_filas,ok_con_filas,ok_sin_filas,dian_con_filas,dian_sin_filas,nota
+20260420_140658_d6ba5bd9,2026-04-20T14:06:58,2026-04-20T15:58:27,6689.782,solo aprobadas,90,200,100,200,200,200,197,0,0,0,0,3,1400,1400,200,197,3,200,0,197,0,3,0,

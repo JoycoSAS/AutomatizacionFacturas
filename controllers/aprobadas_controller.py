@@ -66,6 +66,216 @@ from services.aprobaciones_service import sincronizar_aprobaciones_en_facturas
 from services.m365.excel_workbook_graph import ExcelWorkbookGraph
 
 
+CONCEPTOS_BASE_FIJOS = (
+    "Subtotal",
+    "IVA 5%",
+    "IVA 19%",
+    "Retención de IVA",
+    "Retención de ICA",
+    "Retención en la fuente",
+    "Total",
+)
+
+
+def _float_seguro(valor) -> float:
+    if valor is None:
+        return 0.0
+    if isinstance(valor, (int, float)):
+        try:
+            return float(valor)
+        except Exception:
+            return 0.0
+
+    s = str(valor).strip()
+    if not s:
+        return 0.0
+
+    s = s.replace("\xa0", " ").replace("$", "").replace("COP", "")
+    s = s.replace(" ", "")
+
+    if "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif "," in s:
+        s = s.replace(".", "").replace(",", ".")
+
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
+def _forzar_texto_numero_factura(valor) -> str:
+    """
+    Fuerza el número de factura a texto para evitar notación científica
+    o conversión rara al subir filas al Excel web.
+    """
+    if valor is None:
+        return ""
+
+    if isinstance(valor, str):
+        s = valor.strip()
+    else:
+        s = str(valor).strip()
+
+    if not s:
+        return ""
+
+    s_upper = s.upper().replace(",", ".")
+
+    if "E+" in s_upper or "E-" in s_upper:
+        try:
+            num = float(s_upper)
+            return "{:.0f}".format(num)
+        except Exception:
+            return s
+
+    if re.fullmatch(r"\d+\.0", s):
+        try:
+            return str(int(float(s)))
+        except Exception:
+            return s
+
+    return s
+
+def _asegurar_reg_7_conceptos(reg: Dict[str, object]) -> Dict[str, object]:
+    """
+    Garantiza que cada registro registrable tenga SIEMPRE los 7 conceptos base
+    que usa guardar_en_excel para expandir la factura.
+    """
+    if not reg:
+        reg = {}
+
+    out = dict(reg)
+
+    # Campos de texto que no deberían faltar nunca
+    for k in (
+        "Archivo", "Empresa emisora", "CUFE", "Ciudad emisora", "Código ciudad",
+        "NIT", "Cliente", "Número de factura", "Año", "Mes", "Día",
+        "Tipo de contribuyente", "Actividad económica", "DescripcionLineas",
+        "Radicado", "ProyectoProceso",
+    ):
+        out.setdefault(k, "")
+
+    # Conceptos numéricos fijos
+    for concepto in CONCEPTOS_BASE_FIJOS:
+        out[concepto] = _float_seguro(out.get(concepto, 0.0))
+
+    return out
+
+
+def _asegurar_regs_registrables_7_conceptos(regs: Optional[List[Dict[str, object]]]) -> List[Dict[str, object]]:
+    if not regs:
+        return []
+
+    salida: List[Dict[str, object]] = []
+    for reg in regs:
+        salida.append(_asegurar_reg_7_conceptos(reg or {}))
+    return salida
+
+
+def _normalizar_numero_para_match_local(s: str) -> str:
+    return _solo_alnum(_normalizar_numero_match(s or ""))
+
+
+def _forzar_campos_obligatorios_en_excel_local(
+    excel_path: str,
+    *,
+    archivos_ref: Optional[set[str]] = None,
+    numeros_ref: Optional[set[str]] = None,
+    radicado: str = "",
+    proyecto: str = "",
+) -> Tuple[int, int]:
+    """
+    Fuerza Radicado y ProyectoProceso en el Excel local para TODAS las filas
+    recién guardadas de la factura actual.
+    """
+    if not excel_path or not os.path.exists(excel_path):
+        return 0, 0
+
+    radicado = str(radicado or "").strip()
+    proyecto = str(proyecto or "").strip()
+    if not radicado and not proyecto:
+        return 0, 0
+
+    archivos_ref = {str(x).strip() for x in (archivos_ref or set()) if str(x).strip()}
+    archivos_ref = _expand_archivos_ref(archivos_ref) if archivos_ref else set()
+
+    nums_norm = set()
+    for n in (numeros_ref or set()):
+        nn = _normalizar_numero_para_match_local(str(n or "").strip())
+        if nn:
+            nums_norm.add(nn)
+
+    if not archivos_ref and not nums_norm:
+        return 0, 0
+
+    try:
+        from openpyxl import load_workbook
+
+        wb = load_workbook(excel_path)
+        ws = wb["Facturas"] if "Facturas" in wb.sheetnames else wb.active
+
+        headers = {}
+        for c in range(1, ws.max_column + 1):
+            key = str(ws.cell(row=1, column=c).value or "").strip()
+            if key:
+                headers[key] = c
+
+        col_arc = headers.get("Archivo")
+        col_num = headers.get("Número de factura")
+        col_rad = headers.get("Radicado")
+        col_pro = headers.get("ProyectoProceso")
+
+        if not col_rad or not col_pro:
+            return 0, 0
+
+        filas_match = 0
+        filas_upd = 0
+
+        for r in range(2, ws.max_row + 1):
+            arc_val = str(ws.cell(r, col_arc).value or "").strip() if col_arc else ""
+            num_val = str(ws.cell(r, col_num).value or "").strip() if col_num else ""
+
+            arc_hit = False
+            num_hit = False
+
+            if archivos_ref and arc_val:
+                arc_hit = (arc_val in archivos_ref) or (os.path.basename(arc_val) in archivos_ref)
+
+            if nums_norm and num_val:
+                num_hit = _normalizar_numero_para_match_local(num_val) in nums_norm
+
+            if not arc_hit and not num_hit:
+                continue
+
+            filas_match += 1
+
+            cell_rad = ws.cell(r, col_rad)
+            cell_pro = ws.cell(r, col_pro)
+            cambio = False
+
+            if radicado and not str(cell_rad.value or "").strip():
+                cell_rad.value = radicado
+                cambio = True
+
+            if proyecto and not str(cell_pro.value or "").strip():
+                cell_pro.value = proyecto
+                cambio = True
+
+            if cambio:
+                filas_upd += 1
+
+        if filas_upd > 0:
+            wb.save(excel_path)
+
+        return filas_match, filas_upd
+
+    except Exception as e:
+        print(f"[LOCAL FORCE] Error forzando campos obligatorios en Excel local: {e}")
+        return 0, 0
+
+
 ADJ_HOY = os.path.join(DATA_DIR, "adjuntos", "hoy")
 EXT_HOY = os.path.join(DATA_DIR, "extraidos", "hoy")
 
@@ -74,6 +284,57 @@ USE_DATE_SUBFOLDERS = False
 _CTRL_REGEX = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
 _AMP_FIX = re.compile(r"&(?!(?:[a-zA-Z]+|#\d+|#x[0-9A-Fa-f]+);)")
 _NON_INVOICE_PREFIXES = {"DDI", "RAD", "RDI", "RDC", "REC", "RCP", "DOC", "REF"}
+
+
+def _clasificar_auditoria_detalle(
+    *,
+    estado: str = "",
+    nuevos: int = 0,
+    pdf_name: str = "",
+    subj: str = "",
+    error: str = "",
+) -> Tuple[str, int, str]:
+    """
+    Clasificación operativa para audit_detalle SIN tocar la lógica de negocio
+    ya aprobada de nuevos/enriquecidas.
+    """
+    estado_norm = str(estado or "").strip().lower()
+    nuevos_i = int(nuevos or 0)
+    s = normalize_text(f"{subj or ''} {pdf_name or ''} {error or ''}")
+
+    if nuevos_i > 0:
+        if estado_norm == "ok_dian_pdf_only":
+            return "DIAN_PDF_ONLY_REGISTRADA", nuevos_i, ""
+        if estado_norm == "ok_dian_zip":
+            return "DIAN_ZIP_REGISTRADA", nuevos_i, ""
+        if estado_norm == "ok_pdf_aprobadas_fallback":
+            return "OK_REGISTRADA_FALLBACK_PDF", nuevos_i, ""
+        if estado_norm == "ok":
+            return "OK_REGISTRADA", nuevos_i, ""
+        return "REGISTRADA", nuevos_i, ""
+
+    # nuevos == 0
+    if estado_norm in {"ok", "ok_pdf_aprobadas_fallback", "ok_dian_pdf_only", "ok_dian_zip", "ok_registro_minimo"}:
+        motivo = "SIN_DATOS_REGISTRABLES"
+        if any(x in s for x in ["etb", "enel", "tigo", "claro", "movistar", "gas", "energia", "energía", "acueducto", "telefonia", "telefonía"]):
+            motivo = "SERVICIO_PUBLICO"
+        elif any(x in s for x in ["tv", "television", "televisión", "internet", "celular", "plan movil", "plan móvil"]):
+            motivo = "SERVICIO_TECNOLOGIA"
+        return "OK_NO_REGISTRABLE", 0, motivo
+
+    if estado_norm == "omitido_no_factura":
+        return "OMITIDO_NO_FACTURA", 0, "NO_FACTURA"
+
+    if estado_norm == "sin_pdf":
+        return "SIN_PDF", 0, ""
+
+    if "sin_match" in estado_norm:
+        return "SIN_MATCH", 0, ""
+
+    if "error" in estado_norm:
+        return "ERROR", 0, (error or "")[:120]
+
+    return "OTRO", 0, ""
 
 
 def _push_detalle(
@@ -91,8 +352,27 @@ def _push_detalle(
     nuevos: int = 0,
     enriquecidas: int = 0,
     fuente: str = "",
-    error: str = ""
+    error: str = "",
+    tipo_resultado: str = "",
+    filas_generadas: Optional[int] = None,
+    motivo_no_registro: str = "",
 ):
+    if not tipo_resultado:
+        tipo_resultado, filas_generadas_auto, motivo_auto = _clasificar_auditoria_detalle(
+            estado=estado,
+            nuevos=int(nuevos or 0),
+            pdf_name=pdf_name,
+            subj=subj,
+            error=error,
+        )
+        if filas_generadas is None:
+            filas_generadas = filas_generadas_auto
+        if not motivo_no_registro:
+            motivo_no_registro = motivo_auto
+
+    if filas_generadas is None:
+        filas_generadas = int(nuevos or 0)
+
     detalle_rows.append({
         "run_id": run_id,
         "fecha_hora": datetime.datetime.now().isoformat(timespec="seconds"),
@@ -104,12 +384,57 @@ def _push_detalle(
         "fecha_factura": fecha_factura or "",
         "zip_match": zip_match or "",
         "estado": estado or "",
+        "tipo_resultado": tipo_resultado or "",
+        "filas_generadas": int(filas_generadas or 0),
+        "motivo_no_registro": motivo_no_registro or "",
         "duracion_s": round(float(duracion_s or 0.0), 3),
         "nuevos": int(nuevos or 0),
         "enriquecidas": int(enriquecidas or 0),
         "fuente": fuente or "",
         "error": (error or "")[:500],
     })
+
+def _resolver_cufe_numero_final(
+    *,
+    regs: Optional[List[Dict[str, object]]] = None,
+    reg_pdf: Optional[Dict[str, object]] = None,
+    cufe_pdf: str = "",
+    numero_pdf: str = "",
+) -> Tuple[str, str]:
+    """
+    Prioriza el CUFE/Número final real que terminó en Excel.
+    Orden:
+    1) regs del XML procesado
+    2) reg_pdf del fallback PDF
+    3) datos preliminares del PDF aprobado
+    """
+    cufe_final = ""
+    numero_final = ""
+
+    if regs:
+        for d in regs:
+            c = str(d.get("CUFE") or "").strip()
+            n = str(d.get("Número de factura") or "").strip()
+            if c and not cufe_final:
+                cufe_final = c
+            if n and not numero_final:
+                numero_final = n
+            if cufe_final and numero_final:
+                break
+
+    if reg_pdf:
+        if not cufe_final:
+            cufe_final = str(reg_pdf.get("CUFE") or "").strip()
+        if not numero_final:
+            numero_final = str(reg_pdf.get("Número de factura") or "").strip()
+
+    if not cufe_final:
+        cufe_final = str(cufe_pdf or "").strip()
+
+    if not numero_final:
+        numero_final = str(numero_pdf or "").strip()
+
+    return cufe_final, numero_final
 
 
 def _limpiar_adj_hoy() -> int:
@@ -224,7 +549,20 @@ def _token_es_util_para_match(token: str) -> bool:
     if not t:
         return False
 
+    # Evitar tokens demasiado genéricos como años puros: 2024, 2025, 2026...
+    if re.fullmatch(r"\d{4}", t):
+        try:
+            year = int(t)
+            if 1900 <= year <= 2100:
+                return False
+        except Exception:
+            pass
+
+    # Tokens puramente numéricos solo sirven si son suficientemente informativos.
+    # Rechazamos años y números muy cortos / genéricos.
     if re.fullmatch(r"\d{4,20}", t):
+        if len(t) < 5:
+            return False
         return True
 
     if len(t) < 5:
@@ -882,6 +1220,175 @@ def _numero_from_subject(subj: str) -> str | None:
 
     return None
 
+def _parse_datos_desde_subject_aprobado(subj: str) -> Dict[str, str]:
+    """
+    Extrae desde el asunto del correo aprobado:
+    - numero_subject
+    - radicado_subject
+    - proyecto_subject
+    - empresa_subject
+
+    Ejemplo:
+    Aprobado- Factura  -  FPP - 463496 - Radicado 191297 - PEOPLE PASS SAS - Joyco Consultores S.A.S. - NA
+    """
+    out = {
+        "numero_subject": "",
+        "radicado_subject": "",
+        "proyecto_subject": "",
+        "empresa_subject": "",
+    }
+
+    s = (subj or "").strip()
+    if not s:
+        return out
+
+    s = s.replace("–", "-").replace("—", "-")
+    s = re.sub(r"\s+", " ", s).strip()
+
+    # -------- Radicado --------
+    m_rad = re.search(r"Radicado\s+(\d{4,20})", s, flags=re.IGNORECASE)
+    if m_rad:
+        out["radicado_subject"] = m_rad.group(1).strip()
+
+    # -------- Número de factura desde asunto --------
+    # Captura lo que esté entre "Factura -" y "- Radicado"
+    m_num = re.search(
+        r"Factura(?:\s+de\s+servicio\s+p[uú]blico)?\s*-\s*(.*?)\s*-\s*Radicado\s+\d+",
+        s,
+        flags=re.IGNORECASE
+    )
+    if m_num:
+        numero_raw = (m_num.group(1) or "").strip()
+        numero_raw = numero_raw.replace("–", "-").replace("—", "-")
+        numero_raw = re.sub(r"\s*-\s*", "-", numero_raw)
+        numero_raw = re.sub(r"\s+", " ", numero_raw).strip()
+        out["numero_subject"] = numero_raw
+
+    # -------- Empresa / Proyecto --------
+    # Todo lo que viene después del Radicado
+    m_post = re.search(
+        r"Radicado\s+\d+\s*-\s*(.*?)\s*$",
+        s,
+        flags=re.IGNORECASE
+    )
+    if m_post:
+        cola = (m_post.group(1) or "").strip()
+        partes = [p.strip() for p in cola.split(" - ") if p.strip()]
+
+        # estructura típica:
+        # EMPRESA - PROYECTO - NA
+        if len(partes) >= 1:
+            out["empresa_subject"] = partes[0]
+
+        if len(partes) >= 2:
+            if partes[-1].upper() == "NA":
+                out["proyecto_subject"] = partes[-2].strip()
+            else:
+                out["proyecto_subject"] = partes[1].strip()
+
+    return out
+
+
+def _enriquecer_regs_desde_subject_si_falta(
+    regs: List[Dict[str, object]],
+    subj: str
+) -> Tuple[int, str, str]:
+    """
+    En memoria, llena Radicado y ProyectoProceso en los regs
+    usando el subject del correo aprobado, SOLO si vienen vacíos.
+
+    Retorna:
+        (filas_tocadas, radicado_subject, proyecto_subject)
+    """
+    if not regs:
+        return 0, "", ""
+
+    datos = _parse_datos_desde_subject_aprobado(subj)
+    rad = (datos.get("radicado_subject") or "").strip()
+    proy = (datos.get("proyecto_subject") or "").strip()
+
+    if not rad and not proy:
+        return 0, "", ""
+
+    tocadas = 0
+
+    for r in regs:
+        cambio = False
+
+        rad_actual = str(r.get("Radicado") or "").strip()
+        proy_actual = str(r.get("ProyectoProceso") or "").strip()
+
+        if rad and not rad_actual:
+            r["Radicado"] = rad
+            cambio = True
+
+        if proy and not proy_actual:
+            r["ProyectoProceso"] = proy
+            cambio = True
+
+        if cambio:
+            tocadas += 1
+
+    return tocadas, rad, proy
+
+
+def _forzar_radicado_y_proyecto_en_filas(
+    filas: List[Dict[str, object]],
+    subj: str,
+    estado: str,
+) -> Tuple[List[Dict[str, object]], int, str, str]:
+    """
+    Regla obligatoria:
+    si una factura ya quedó en estado OK y tiene filas para guardar,
+    TODAS las filas deben salir con Radicado y ProyectoProceso.
+
+    Prioridad:
+    1) lo que ya venga en la fila
+    2) subject del correo aprobado
+    3) marcadores SIN_...
+    """
+    if not filas:
+        return filas, 0, "", ""
+
+    datos = _parse_datos_desde_subject_aprobado(subj)
+    radicado_subject = str(datos.get("radicado_subject") or "").strip()
+    proyecto_subject = str(datos.get("proyecto_subject") or "").strip()
+
+    radicado_final = ""
+    proyecto_final = ""
+
+    # 1) Intentar tomar lo que ya venga en las filas
+    for f in filas:
+        if not radicado_final:
+            radicado_final = str(f.get("Radicado") or "").strip()
+        if not proyecto_final:
+            proyecto_final = str(f.get("ProyectoProceso") or "").strip()
+        if radicado_final and proyecto_final:
+            break
+
+    # 2) Completar desde subject
+    if not radicado_final:
+        radicado_final = radicado_subject
+    if not proyecto_final:
+        proyecto_final = proyecto_subject
+
+    # 3) Si sigue vacío y ya hubo match/ok, obligarlo
+    estado_norm = (estado or "").strip().lower()
+    if estado_norm in {"ok", "ok_pdf_aprobadas_fallback", "ok_dian_pdf_only", "ok_dian_zip", "ok_registro_minimo"}:
+        if not radicado_final:
+            radicado_final = "SIN_RADICADO"
+        if not proyecto_final:
+            proyecto_final = "SIN_PROYECTO"
+
+    enriquecidas = 0
+    for f in filas:
+        f["Radicado"] = radicado_final
+        f["ProyectoProceso"] = proyecto_final
+
+        if str(f.get("Radicado") or "").strip() and str(f.get("ProyectoProceso") or "").strip():
+            enriquecidas += 1
+
+    return filas, enriquecidas, radicado_final, proyecto_final
 
 def _fecha_from_subject(subj: str) -> str | None:
     for pat in [r"(\d{4}[-/]\d{2}[-/]\d{2})", r"(\d{2}[-/]\d{2}[-/]\d{4})"]:
@@ -1929,14 +2436,18 @@ def _expand_archivos_ref(archivos_ref: set[str]) -> set[str]:
 
 def _try_workbook_append(
     sp_excel_root: str,
-    archivos_ref: set[str],
-    table_name: str = "TblFacturas"
+    archivos_ref: Optional[set[str]] = None,
+    table_name: str = "TblFacturas",
+    rows_dicts: Optional[List[Dict[str, object]]] = None,
 ) -> int:
-    if not archivos_ref:
-        return 0
+    filas: List[Dict[str, object]] = []
 
-    archivos_ref = _expand_archivos_ref(set(archivos_ref))
-    filas = obtener_filas_por_archivos(archivos_ref)
+    if rows_dicts:
+        filas = [dict(x or {}) for x in rows_dicts if isinstance(x, dict)]
+    elif archivos_ref:
+        archivos_ref = _expand_archivos_ref(set(archivos_ref))
+        filas = obtener_filas_por_archivos(archivos_ref)
+
     if not filas:
         return 0
 
@@ -1988,7 +2499,7 @@ def _registrar_desde_pdf_aprobado_fallback(
     print(f"✅ Fallback PDF_APROBADAS habilitado para {pdf_name} (CUFE válido).")
 
     try:
-        reg = _generar_registro_pdf_only(pdf_tmp, pdf_name)
+        reg = _asegurar_reg_7_conceptos(_generar_registro_pdf_only(pdf_tmp, pdf_name))
 
         numero_final = (
             ident_pdf.get("NUMERO_APROB")
@@ -2001,6 +2512,24 @@ def _registrar_desde_pdf_aprobado_fallback(
 
         total_nuevos = guardar_en_excel([reg])
 
+        datos_subject_local = _parse_datos_desde_subject_aprobado(subj)
+        radicado_local_force = str(reg.get("Radicado") or datos_subject_local.get("radicado_subject") or "").strip()
+        proyecto_local_force = str(reg.get("ProyectoProceso") or datos_subject_local.get("proyecto_subject") or "").strip()
+        archivos_force = {os.path.basename(pdf_name), str(reg.get("Archivo") or os.path.basename(pdf_name))}
+        numeros_force = {str(reg.get("Número de factura") or numero_aprob or ident_pdf.get("NUMERO_APROB") or ident_pdf.get("NUMERO") or "").strip()}
+        filas_match_force, filas_upd_force = _forzar_campos_obligatorios_en_excel_local(
+            ARCHIVO_EXCEL,
+            archivos_ref=archivos_force,
+            numeros_ref=numeros_force,
+            radicado=radicado_local_force,
+            proyecto=proyecto_local_force,
+        )
+        if filas_upd_force > 0:
+            print(
+                f"[LOCAL FORCE] PDF/FALLBACK -> match={filas_match_force} | "
+                f"actualizadas={filas_upd_force} | radicado={radicado_local_force} | proyecto={proyecto_local_force}"
+            )
+
         historial_actualizado = False
         if total_nuevos > 0:
             registrar_historial_por_zip([{
@@ -2012,11 +2541,37 @@ def _registrar_desde_pdf_aprobado_fallback(
             }])
             historial_actualizado = True
 
-        enriquecidas = 0
+        enriquecidas = int(total_nuevos or 0)
         try:
-            enriquecidas = sincronizar_aprobaciones_en_facturas()
+            sincronizar_aprobaciones_en_facturas()
         except Exception as e:
             print(f"[APROB] Error al sincronizar aprobaciones: {e}")
+
+        enriquecidas_subject = 0
+        radicado_subject = ""
+        proyecto_subject = ""
+        try:
+            regs_subject = [reg]
+            enriquecidas_subject, radicado_subject, proyecto_subject = _enriquecer_regs_desde_subject_si_falta(regs_subject, subj)
+            if enriquecidas_subject > 0:
+                reg = regs_subject[0]
+                print(
+                    f"[SUBJECT] Fallback PDF_APROBADAS en memoria: "
+                    f"filas={enriquecidas_subject} | radicado={radicado_subject} | proyecto={proyecto_subject}"
+                )
+        except Exception as e:
+            print(f"[SUBJECT] Error enriqueciendo PDF_APROBADAS desde subject: {e}")
+
+        try:
+            filas_tmp, _, rad_tmp, proy_tmp = _forzar_radicado_y_proyecto_en_filas(
+                filas=[reg],
+                subj=subj,
+                estado="ok_pdf_aprobadas_fallback",
+            )
+            reg = filas_tmp[0]
+            print(f"[FORCE MEM] PDF/FALLBACK -> radicado={rad_tmp} | proyecto={proy_tmp}")
+        except Exception as e:
+            print(f"[FORCE MEM] Error reforzando obligatorios en fallback PDF: {e}")
 
         print("☁️  Subiendo a SharePoint (fallback PDF aprobadas)...")
         sp_ext_root = f"{BASE_SP}/extraidos/pdf_aprobadas_fallback"
@@ -2047,7 +2602,14 @@ def _registrar_desde_pdf_aprobado_fallback(
                     os.path.basename(pdf_name),
                     str(reg.get("Archivo") or os.path.basename(pdf_name)),
                 }
-                insertadas = _try_workbook_append(sp_excel, archivos_ref, table_name="TblFacturas")
+                insertadas = _subir_factura_a_web_desde_local(
+                    sp_excel_root=sp_excel,
+                    archivos_ref=archivos_ref,
+                    numeros_ref={str(reg.get("Número de factura") or ident_pdf.get("NUMERO_APROB") or ident_pdf.get("NUMERO") or "").strip()},
+                    expected_rows=int(total_nuevos or 0),
+                    table_name="TblFacturas",
+                    rows_dicts=[reg],
+                )
                 print(f"✅ Workbook API (PDF_APROBADAS_FALLBACK): +{insertadas} fila(s) nuevas en TblFacturas.")
             except Exception as e:
                 print(f"⚠️ Workbook API falló (PDF_APROBADAS_FALLBACK): {e}")
@@ -2076,18 +2638,24 @@ def _registrar_desde_pdf_aprobado_fallback(
         secs = time.perf_counter() - t0
         resumen.append((pdf_name, secs, "fallback pdf aprobadas", total_nuevos))
 
+        cufe_final, numero_final = _resolver_cufe_numero_final(
+            reg_pdf=reg,
+            cufe_pdf=cufe_pdf,
+            numero_pdf=reg.get("Número de factura") or ident_pdf.get("NUMERO_APROB") or ident_pdf.get("NUMERO") or "",
+        )
+
         _push_detalle(
             detalle_rows, run_id, msg_id, subj,
             pdf_name=pdf_name,
-            cufe=cufe_pdf,
-            numero=reg.get("Número de factura") or "",
+            cufe=cufe_final,
+            numero=numero_final,
             fecha_factura=ident_pdf.get("FECHA") or fecha_pdf,
             zip_match="(PDF_APROBADAS_FALLBACK)",
             estado="ok_pdf_aprobadas_fallback",
-            duracion_s=secs,
+            duracion_s=(time.perf_counter() - t0),
             nuevos=int(total_nuevos or 0),
             enriquecidas=int(enriquecidas or 0),
-            fuente="PDF_APROBADAS"
+            fuente=("PDF_APROBADAS|SUBJECT" if (radicado_subject or proyecto_subject) else "PDF_APROBADAS")
         )
 
         if total_nuevos > 0 and cufe_pdf:
@@ -2135,45 +2703,30 @@ def _procesar_pdf_aprobadas_como_ultimo_recurso(
     """
 
     if not cufe_pdf or not _cufe_is_valid(cufe_pdf):
-        estado = "sin_match_pdf_aprobadas_sin_cufe"
-        print(f"❌ Fallback PDF_APROBADAS NO aplicado para {pdf_name}: el PDF no tiene CUFE válido.")
-
-        if usar_processed_store:
-            store.mark_processed(msg_id, {
-                "status": estado,
-                "pdf": pdf_name,
-                "cufe": cufe_pdf or "",
-            })
-
-        _push_detalle(
-            detalle_rows, run_id, msg_id, subj,
+        print(f"⚠️ Fallback PDF_APROBADAS sin CUFE válido para {pdf_name}. Se aplicará registro mínimo obligatorio.")
+        return _registrar_minimo_obligatorio_desde_aprobadas(
+            msg_id=msg_id,
+            subj=subj,
             pdf_name=pdf_name,
-            cufe=cufe_pdf or "",
-            numero=ident_pdf.get("NUMERO_APROB") or ident_pdf.get("NUMERO") or "",
-            fecha_factura=ident_pdf.get("FECHA") or fecha_pdf,
-            zip_match="(PDF_APROBADAS_FALLBACK_NO_CUFE)",
-            estado=estado,
-            duracion_s=(time.perf_counter() - t0),
-            nuevos=0,
-            enriquecidas=0,
-            fuente="PDF_APROBADAS",
-            error="No se pudo leer por solo PDF porque no se encontró CUFE válido"
+            pdf_tmp=pdf_tmp,
+            ident_pdf=ident_pdf,
+            fecha_pdf=fecha_pdf,
+            fecha_local=fecha_local,
+            hora_local=hora_local,
+            numero_aprob=numero_aprob,
+            detalle_rows=detalle_rows,
+            run_id=run_id,
+            t0=t0,
+            usar_processed_store=usar_processed_store,
+            store=store,
+            motivo="sin_cufe_o_pdf_no_legible",
         )
-
-        return {
-            "handled": True,
-            "ok": False,
-            "nuevos": 0,
-            "enriquecidas": 0,
-            "insertadas": 0,
-            "estado": estado,
-        }
 
     print(f"✅ Fallback PDF_APROBADAS habilitado para {pdf_name} (CUFE válido).")
 
-    reg = _generar_registro_pdf_only(pdf_tmp, pdf_name)
+    reg = _asegurar_reg_7_conceptos(_generar_registro_pdf_only(pdf_tmp, pdf_name))
 
-    numero_final = (
+    numero_final_preferido = (
         ident_pdf.get("NUMERO_APROB")
         or ident_pdf.get("NUMERO")
         or reg.get("Número de factura")
@@ -2181,12 +2734,49 @@ def _procesar_pdf_aprobadas_como_ultimo_recurso(
     )
 
     if numero_aprob and len(str(numero_aprob).strip()) >= 3:
-        numero_final = str(numero_aprob).strip()
+        numero_final_preferido = str(numero_aprob).strip()
 
-    if numero_final and len(str(numero_final).strip()) >= 3:
-        reg["Número de factura"] = str(numero_final).strip()
+    if numero_final_preferido and len(str(numero_final_preferido).strip()) >= 3:
+        reg["Número de factura"] = str(numero_final_preferido).strip()
+
+    regs_tmp = [reg]
+    regs_tmp, enriquecidas_forzadas, radicado_final, proyecto_final = _forzar_radicado_y_proyecto_en_filas(
+        filas=regs_tmp,
+        subj=subj,
+        estado="ok_pdf_aprobadas_fallback",
+    )
+    reg = regs_tmp[0]
+
+    cufe_final, numero_final = _resolver_cufe_numero_final(
+        reg_pdf=reg,
+        cufe_pdf=cufe_pdf,
+        numero_pdf=reg.get("Número de factura") or ident_pdf.get("NUMERO_APROB") or ident_pdf.get("NUMERO") or "",
+    )
+
+    print(
+        f"[FORZADO] PDF_APROBADAS -> radicado={radicado_final} | "
+        f"proyecto={proyecto_final} | enriquecidas={enriquecidas_forzadas}"
+    )
 
     total_nuevos = guardar_en_excel([reg])
+
+    datos_subject_local = _parse_datos_desde_subject_aprobado(subj)
+    radicado_local_force = str(reg.get("Radicado") or datos_subject_local.get("radicado_subject") or "").strip()
+    proyecto_local_force = str(reg.get("ProyectoProceso") or datos_subject_local.get("proyecto_subject") or "").strip()
+    archivos_force = {os.path.basename(pdf_name), str(reg.get("Archivo") or os.path.basename(pdf_name))}
+    numeros_force = {str(reg.get("Número de factura") or numero_aprob or ident_pdf.get("NUMERO_APROB") or ident_pdf.get("NUMERO") or "").strip()}
+    filas_match_force, filas_upd_force = _forzar_campos_obligatorios_en_excel_local(
+        ARCHIVO_EXCEL,
+        archivos_ref=archivos_force,
+        numeros_ref=numeros_force,
+        radicado=radicado_local_force,
+        proyecto=proyecto_local_force,
+    )
+    if filas_upd_force > 0:
+        print(
+            f"[LOCAL FORCE] PDF/FALLBACK -> match={filas_match_force} | "
+            f"actualizadas={filas_upd_force} | radicado={radicado_local_force} | proyecto={proyecto_local_force}"
+        )
 
     historial_actualizado = False
     if total_nuevos > 0:
@@ -2199,11 +2789,26 @@ def _procesar_pdf_aprobadas_como_ultimo_recurso(
         }])
         historial_actualizado = True
 
-    enriquecidas = 0
+    enriquecidas = int(total_nuevos or 0)
     try:
-        enriquecidas = sincronizar_aprobaciones_en_facturas()
+        sincronizar_aprobaciones_en_facturas()
     except Exception as e:
         print(f"[APROB] Error al sincronizar aprobaciones: {e}")
+
+    enriquecidas_subject = 0
+    radicado_subject = ""
+    proyecto_subject = ""
+    try:
+        regs_subject = [reg]
+        enriquecidas_subject, radicado_subject, proyecto_subject = _enriquecer_regs_desde_subject_si_falta(regs_subject, subj)
+        if enriquecidas_subject > 0:
+            reg = regs_subject[0]
+            print(
+                f"[SUBJECT] Fallback último recurso PDF_APROBADAS en memoria: "
+                f"filas={enriquecidas_subject} | radicado={radicado_subject} | proyecto={proyecto_subject}"
+            )
+    except Exception as e:
+        print(f"[SUBJECT] Error enriqueciendo último recurso desde subject: {e}")
 
     print("☁️  Subiendo a SharePoint (fallback PDF aprobadas)...")
     sp_ext_root = f"{BASE_SP}/extraidos/pdf_aprobadas_fallback"
@@ -2234,10 +2839,13 @@ def _procesar_pdf_aprobadas_como_ultimo_recurso(
                 os.path.basename(pdf_name),
                 str(reg.get("Archivo") or os.path.basename(pdf_name)),
             }
-            insertadas = _try_workbook_append(
-                sp_excel,
-                archivos_ref,
-                table_name="TblFacturas"
+            insertadas = _subir_factura_a_web_desde_local(
+                sp_excel_root=sp_excel,
+                archivos_ref=archivos_ref,
+                numeros_ref={str(reg.get("Número de factura") or numero_aprob or ident_pdf.get("NUMERO_APROB") or ident_pdf.get("NUMERO") or "").strip()},
+                expected_rows=int(total_nuevos or 0),
+                table_name="TblFacturas",
+                rows_dicts=[reg],
             )
             print(f"✅ Workbook API (PDF_APROBADAS_FALLBACK): +{insertadas} fila(s) nuevas en TblFacturas.")
         except Exception as e:
@@ -2256,7 +2864,7 @@ def _procesar_pdf_aprobadas_como_ultimo_recurso(
             "pdf": pdf_name,
             "nuevos": int(total_nuevos),
             "enriquecidas": int(enriquecidas),
-            "cufe": cufe_pdf,
+            "cufe": cufe_final,
         })
 
     try:
@@ -2267,15 +2875,15 @@ def _procesar_pdf_aprobadas_como_ultimo_recurso(
     _push_detalle(
         detalle_rows, run_id, msg_id, subj,
         pdf_name=pdf_name,
-        cufe=cufe_pdf,
-        numero=reg.get("Número de factura") or "",
+        cufe=cufe_final,
+        numero=numero_final,
         fecha_factura=ident_pdf.get("FECHA") or fecha_pdf,
         zip_match="(PDF_APROBADAS_FALLBACK)",
         estado="ok_pdf_aprobadas_fallback",
         duracion_s=(time.perf_counter() - t0),
         nuevos=int(total_nuevos or 0),
         enriquecidas=int(enriquecidas or 0),
-        fuente="PDF_APROBADAS"
+        fuente=("PDF_APROBADAS|SUBJECT" if (radicado_subject or proyecto_subject) else "PDF_APROBADAS")
     )
 
     return {
@@ -2288,6 +2896,486 @@ def _procesar_pdf_aprobadas_como_ultimo_recurso(
     }
 
 
+
+def _buscar_correo_origen_con_pdf_unico(
+    *,
+    msg_id_aprobado: str,
+    subj_aprobado: str,
+    ident_pdf: Dict[str, str],
+    since_days: int,
+    top_msgs: int = 80,
+) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """
+    Busca en Bandeja de entrada el correo origen correspondiente a la factura aprobada.
+    Si encuentra un correo con EXACTAMENTE 1 PDF y 0 ZIPs, retorna ese PDF como fuente origen.
+    """
+    datos_subj = _parse_datos_desde_subject_aprobado(subj_aprobado)
+    terminos = []
+    for t in [
+        ident_pdf.get("NUMERO_APROB") or "",
+        ident_pdf.get("NUMERO") or "",
+        datos_subj.get("radicado_subject") or "",
+        _numero_from_subject(subj_aprobado) or "",
+        Path((subj_aprobado or "")).stem,
+    ]:
+        t = str(t or "").strip()
+        if t and t not in terminos:
+            terminos.append(t)
+
+    candidatos = []
+    vistos = set()
+    for term in terminos:
+        try:
+            lote = buscar_mensajes_inbox_por_asunto(
+                asunto_contiene=term,
+                top=top_msgs,
+                since_days=since_days,
+            ) or []
+        except Exception as e:
+            print(f"[ORIGEN PDF] Error buscando asunto={term!r}: {e}")
+            lote = []
+
+        for m in lote:
+            mid = m.get("id")
+            if not mid or mid == msg_id_aprobado or mid in vistos:
+                continue
+            vistos.add(mid)
+            candidatos.append(m)
+
+    print(f"[ORIGEN PDF] candidatos encontrados={len(candidatos)}")
+
+    for m in candidatos:
+        mid = m.get("id")
+        subj = m.get("subject") or ""
+
+        # evitar reusar el mismo correo de aprobadas
+        if "aprobado" in normalize_text(subj):
+            continue
+
+        try:
+            zips = listar_adjuntos_zip(mid) or []
+        except Exception:
+            zips = []
+
+        try:
+            pdfs = listar_adjuntos_pdf(mid) or []
+        except Exception:
+            pdfs = []
+
+        if len(zips) == 0 and len(pdfs) == 1:
+            att = pdfs[0]
+            aid = att.get("id")
+            if not aid:
+                continue
+
+            aname = att.get("name") or f"{aid}.pdf"
+            safe_name = re.sub(r"[^A-Za-z0-9_. -]", "_", aname)
+            local = os.path.join(TMP_DIR, f"origen_unico_{uuid.uuid4().hex}_{safe_name}")
+
+            ok = descargar_adjunto_por_id(mid, aid, local)
+            if ok and os.path.exists(local):
+                print(f"[ORIGEN PDF] ✅ Correo origen con PDF único: asunto={subj} | pdf={aname}")
+                return local, aname, mid, aid
+
+            try:
+                if os.path.exists(local):
+                    os.remove(local)
+            except Exception:
+                pass
+
+    print("[ORIGEN PDF] No se encontró correo origen con PDF único utilizable.")
+    return None, None, None, None
+
+
+def _registrar_desde_pdf_origen_unico(
+    *,
+    msg_id: str,
+    subj: str,
+    pdf_name_aprobado: str,
+    pdf_origen_path: str,
+    pdf_origen_name: str,
+    ident_pdf_aprobado: Dict[str, str],
+    fecha_local: str,
+    hora_local: str,
+    run_id: str,
+    detalle_rows: List[Dict[str, object]],
+    resumen: List[Tuple[str, float, str, int]],
+    t0: float,
+    usar_processed_store: bool,
+    store: ProcessedStore,
+    source_msg_id: str = "",
+    source_att_id: str = "",
+) -> Tuple[bool, int, int, int]:
+    """
+    Registra usando el PDF único encontrado en el correo origen.
+    """
+    try:
+        ident_origen = parse_identificadores_pdf(extraer_texto_pdf(pdf_origen_path)) or {}
+
+        reg = _asegurar_reg_7_conceptos(_generar_registro_pdf_only(pdf_origen_path, pdf_origen_name))
+
+        numero_final = (
+            ident_pdf_aprobado.get("NUMERO_APROB")
+            or ident_pdf_aprobado.get("NUMERO")
+            or ident_origen.get("NUMERO_APROB")
+            or ident_origen.get("NUMERO")
+            or reg.get("Número de factura")
+            or ""
+        )
+        if numero_final and len(str(numero_final).strip()) >= 3:
+            reg["Número de factura"] = str(numero_final).strip()
+
+        regs_tmp = [reg]
+        regs_tmp, enriquecidas_forzadas, radicado_final, proyecto_final = _forzar_radicado_y_proyecto_en_filas(
+            filas=regs_tmp,
+            subj=subj,
+            estado="ok_pdf_origen_unico",
+        )
+        reg = regs_tmp[0]
+
+        total_nuevos = guardar_en_excel([reg])
+
+        datos_subject_local = _parse_datos_desde_subject_aprobado(subj)
+        radicado_local_force = str(reg.get("Radicado") or datos_subject_local.get("radicado_subject") or "").strip()
+        proyecto_local_force = str(reg.get("ProyectoProceso") or datos_subject_local.get("proyecto_subject") or "").strip()
+        archivos_force = {os.path.basename(pdf_origen_name), str(reg.get("Archivo") or os.path.basename(pdf_origen_name)), os.path.basename(pdf_name_aprobado)}
+        numeros_force = {str(reg.get("Número de factura") or ident_pdf_aprobado.get("NUMERO_APROB") or ident_pdf_aprobado.get("NUMERO") or "").strip()}
+        _forzar_campos_obligatorios_en_excel_local(
+            ARCHIVO_EXCEL,
+            archivos_ref=archivos_force,
+            numeros_ref=numeros_force,
+            radicado=radicado_local_force,
+            proyecto=proyecto_local_force,
+        )
+
+        historial_actualizado = False
+        if total_nuevos > 0:
+            registrar_historial_por_zip([{
+                "Fecha": fecha_local,
+                "Hora": hora_local,
+                "Archivo ZIP": "(PDF_ORIGEN_UNICO)",
+                "Nuevos XML guardados": total_nuevos,
+                "Errores encontrados": 0
+            }])
+            historial_actualizado = True
+
+        enriquecidas = int(total_nuevos or 0)
+        try:
+            sincronizar_aprobaciones_en_facturas()
+        except Exception as e:
+            print(f"[APROB] Error al sincronizar aprobaciones: {e}")
+
+        sp_ext_root = f"{BASE_SP}/extraidos/pdf_origen_unico"
+        sp_excel = f"{BASE_SP}/excel"
+
+        sp_disponible = True
+        try:
+            ensure_folder(sp_ext_root)
+            ensure_folder(sp_excel)
+        except Exception as e:
+            sp_disponible = False
+            print(f"⚠️ SharePoint no disponible en PDF origen único: {e}")
+
+        if sp_disponible:
+            try:
+                upload_small_file(pdf_origen_path, f"{sp_ext_root}/{os.path.basename(pdf_origen_name)}", mode="skip")
+            except Exception as e:
+                print(f"⚠️ No pude subir PDF origen único a SharePoint: {e}")
+
+        hubo_cambios_excel = (total_nuevos > 0) or (enriquecidas > 0)
+        insertadas = 0
+        if sp_disponible and hubo_cambios_excel:
+            try:
+                archivos_ref = {
+                    os.path.basename(pdf_origen_name),
+                    str(reg.get("Archivo") or os.path.basename(pdf_origen_name)),
+                    os.path.basename(pdf_name_aprobado),
+                }
+                insertadas = _try_workbook_append(sp_excel, archivos_ref, table_name="TblFacturas")
+                print(f"✅ Workbook API (PDF_ORIGEN_UNICO): +{insertadas} fila(s) nuevas en TblFacturas.")
+            except Exception as e:
+                print(f"⚠️ Workbook API falló (PDF_ORIGEN_UNICO): {e}")
+
+        if sp_disponible:
+            _subir_excels_a_sharepoint(sp_excel, hubo_cambios_excel, historial_actualizado)
+
+        if usar_processed_store:
+            store.mark_processed(msg_id, {
+                "status": "ok_pdf_origen_unico",
+                "pdf": pdf_name_aprobado,
+                "origen_pdf": pdf_origen_name,
+                "nuevos": int(total_nuevos),
+                "enriquecidas": int(enriquecidas),
+                "src_msg": source_msg_id,
+                "src_att": source_att_id,
+            })
+
+        try:
+            marcar_mensaje_como_leido(msg_id)
+        except Exception as e:
+            print(f"⚠️ No se pudo marcar como leído: {e}")
+
+        secs = time.perf_counter() - t0
+        resumen.append((pdf_name_aprobado, secs, "pdf origen unico", total_nuevos))
+
+        cufe_final, numero_final = _resolver_cufe_numero_final(
+            reg_pdf=reg,
+            cufe_pdf=_norm_cufe(ident_origen.get("CUFE") or ident_pdf_aprobado.get("CUFE") or ""),
+            numero_pdf=reg.get("Número de factura") or ident_origen.get("NUMERO") or ident_pdf_aprobado.get("NUMERO_APROB") or ident_pdf_aprobado.get("NUMERO") or "",
+        )
+
+        _push_detalle(
+            detalle_rows, run_id, msg_id, subj,
+            pdf_name=pdf_name_aprobado,
+            cufe=cufe_final,
+            numero=numero_final,
+            fecha_factura=ident_origen.get("FECHA") or ident_pdf_aprobado.get("FECHA") or "",
+            zip_match="(PDF_ORIGEN_UNICO)",
+            estado="ok_pdf_origen_unico",
+            duracion_s=secs,
+            nuevos=int(total_nuevos or 0),
+            enriquecidas=int(enriquecidas or 0),
+            fuente="PDF_ORIGEN_UNICO"
+        )
+
+        return True, int(total_nuevos or 0), int(enriquecidas or 0), int(insertadas or 0)
+
+    except Exception as e:
+        print(f"⚠️ Falló PDF_ORIGEN_UNICO para {pdf_name_aprobado}: {e}")
+        return False, 0, 0, 0
+
+
+
+def _construir_registro_minimo_obligatorio(
+    *,
+    subj: str,
+    pdf_name: str,
+    numero_aprob: str = "",
+    fecha_pdf: str = "",
+    ident_pdf: Optional[Dict[str, str]] = None,
+) -> Dict[str, object]:
+    """
+    Construye un registro mínimo obligatorio para facturas de solo aprobadas
+    cuando no fue posible leer CUFE/XML/PDF, pero la regla de negocio exige
+    registrar sí o sí la factura con 7 conceptos.
+    """
+    ident_pdf = ident_pdf or {}
+    datos_subj = _parse_datos_desde_subject_aprobado(subj)
+
+    numero_final = (
+        str(numero_aprob or "").strip()
+        or str(ident_pdf.get("NUMERO_APROB") or "").strip()
+        or str(ident_pdf.get("NUMERO") or "").strip()
+        or str(datos_subj.get("numero_subject") or "").strip()
+        or Path(pdf_name or "").stem
+    ).strip()
+
+    fecha_final = str(fecha_pdf or ident_pdf.get("FECHA") or "").strip()
+    fecha_final = normalizar_fecha(fecha_final) or fecha_final if fecha_final else ""
+
+    y = fecha_final[:4] if len(fecha_final) >= 4 else ""
+    mo = fecha_final[5:7] if len(fecha_final) >= 7 else ""
+    d = fecha_final[8:10] if len(fecha_final) >= 10 else ""
+
+    empresa = str(datos_subj.get("empresa_subject") or "").strip()
+
+    reg = {
+        "Archivo": os.path.basename(pdf_name or ""),
+        "Empresa emisora": empresa,
+        "CUFE": "",
+        "Ciudad emisora": "",
+        "Código ciudad": "",
+        "NIT": "",
+        "Cliente": "",
+        "Número de factura": numero_final,
+        "Año": y,
+        "Mes": mo,
+        "Día": d,
+        "Tipo de contribuyente": "",
+        "Actividad económica": "",
+        "DescripcionLineas": "REGISTRO MÍNIMO OBLIGATORIO",
+        "Radicado": str(datos_subj.get("radicado_subject") or "").strip(),
+        "ProyectoProceso": str(datos_subj.get("proyecto_subject") or "").strip(),
+        "Subtotal": 0.0,
+        "IVA 5%": 0.0,
+        "IVA 19%": 0.0,
+        "Retención de IVA": 0.0,
+        "Retención de ICA": 0.0,
+        "Retención en la fuente": 0.0,
+        "Total": 0.0,
+    }
+    return _asegurar_reg_7_conceptos(reg)
+
+
+def _registrar_minimo_obligatorio_desde_aprobadas(
+    *,
+    msg_id: str,
+    subj: str,
+    pdf_name: str,
+    pdf_tmp: str,
+    ident_pdf: Optional[Dict[str, str]],
+    fecha_pdf: str,
+    fecha_local: str,
+    hora_local: str,
+    numero_aprob: str,
+    detalle_rows: List[Dict[str, object]],
+    run_id: str,
+    t0: float,
+    usar_processed_store: bool,
+    store,
+    motivo: str = "ok_registro_minimo",
+) -> Dict[str, object]:
+    """
+    Registro mínimo obligatorio:
+    si una factura de solo aprobadas no pudo procesarse por CUFE/ZIP/PDF,
+    se registra de todos modos con Radicado, ProyectoProceso y los 7 conceptos.
+    """
+    try:
+        reg = _construir_registro_minimo_obligatorio(
+            subj=subj,
+            pdf_name=pdf_name,
+            numero_aprob=numero_aprob,
+            fecha_pdf=fecha_pdf,
+            ident_pdf=ident_pdf or {},
+        )
+
+        regs_tmp = [reg]
+        regs_tmp, _, radicado_final, proyecto_final = _forzar_radicado_y_proyecto_en_filas(
+            filas=regs_tmp,
+            subj=subj,
+            estado="ok_registro_minimo",
+        )
+        reg = regs_tmp[0]
+
+        total_nuevos = guardar_en_excel([reg])
+
+        datos_subject_local = _parse_datos_desde_subject_aprobado(subj)
+        radicado_local_force = str(reg.get("Radicado") or datos_subject_local.get("radicado_subject") or "").strip()
+        proyecto_local_force = str(reg.get("ProyectoProceso") or datos_subject_local.get("proyecto_subject") or "").strip()
+        archivos_force = {os.path.basename(pdf_name), str(reg.get("Archivo") or os.path.basename(pdf_name))}
+        numeros_force = {str(reg.get("Número de factura") or numero_aprob or "").strip()}
+
+        filas_match_force, filas_upd_force = _forzar_campos_obligatorios_en_excel_local(
+            ARCHIVO_EXCEL,
+            archivos_ref=archivos_force,
+            numeros_ref=numeros_force,
+            radicado=radicado_local_force,
+            proyecto=proyecto_local_force,
+        )
+        if filas_upd_force <= 0 and int(total_nuevos or 0) > 0:
+            filas_match_force, filas_upd_force = _forzar_campos_obligatorios_en_ultimas_filas(
+                ARCHIVO_EXCEL,
+                expected_rows=int(total_nuevos or 0),
+                radicado=radicado_local_force,
+                proyecto=proyecto_local_force,
+            )
+
+        historial_actualizado = False
+        if total_nuevos > 0:
+            registrar_historial_por_zip([{
+                "Fecha": fecha_local,
+                "Hora": hora_local,
+                "Archivo ZIP": f"(REGISTRO_MINIMO:{os.path.basename(pdf_name)})",
+                "Nuevos XML guardados": total_nuevos,
+                "Errores encontrados": 0,
+            }])
+            historial_actualizado = True
+
+        enriquecidas = int(total_nuevos or 0)
+        try:
+            sincronizar_aprobaciones_en_facturas()
+        except Exception as e:
+            print(f"[APROB] Error al sincronizar aprobaciones (registro mínimo): {e}")
+
+        sp_ext_root = f"{BASE_SP}/extraidos/pdf_aprobadas_fallback"
+        sp_excel = f"{BASE_SP}/excel"
+
+        sp_disponible = True
+        try:
+            ensure_folder(sp_ext_root)
+            ensure_folder(sp_excel)
+        except Exception as e:
+            sp_disponible = False
+            print(f"⚠️ SharePoint no disponible en registro mínimo: {e}")
+
+        if sp_disponible and pdf_tmp and os.path.exists(pdf_tmp):
+            try:
+                upload_small_file(pdf_tmp, f"{sp_ext_root}/{os.path.basename(pdf_name)}", mode="skip")
+            except Exception as e:
+                print(f"⚠️ No pude subir PDF de registro mínimo a SharePoint: {e}")
+
+        hubo_cambios_excel = (total_nuevos > 0) or (enriquecidas > 0)
+        insertadas = 0
+        if sp_disponible and hubo_cambios_excel:
+            try:
+                archivos_ref = {
+                    os.path.basename(pdf_name),
+                    str(reg.get("Archivo") or os.path.basename(pdf_name)),
+                }
+                insertadas = _subir_factura_a_web_desde_local(
+                    sp_excel_root=sp_excel,
+                    archivos_ref=archivos_ref,
+                    numeros_ref={str(reg.get("Número de factura") or numero_aprob or "").strip()},
+                    expected_rows=int(total_nuevos or 0),
+                    table_name="TblFacturas",
+                    rows_dicts=[reg],
+                )
+            except Exception as e:
+                print(f"⚠️ Workbook API falló (registro mínimo): {e}")
+
+        if sp_disponible:
+            _subir_excels_a_sharepoint(sp_excel, hubo_cambios_excel, historial_actualizado)
+
+        if usar_processed_store:
+            store.mark_processed(msg_id, {
+                "status": "ok_registro_minimo",
+                "pdf": pdf_name,
+                "nuevos": int(total_nuevos or 0),
+                "enriquecidas": int(enriquecidas or 0),
+                "motivo": motivo,
+            })
+
+        try:
+            marcar_mensaje_como_leido(msg_id)
+        except Exception as e:
+            print(f"⚠️ No se pudo marcar como leído (registro mínimo): {e}")
+
+        secs = time.perf_counter() - t0
+        _push_detalle(
+            detalle_rows, run_id, msg_id, subj,
+            pdf_name=pdf_name,
+            cufe="",
+            numero=str(reg.get("Número de factura") or numero_aprob or ""),
+            fecha_factura=fecha_pdf or "",
+            zip_match=f"(REGISTRO_MINIMO:{motivo})",
+            estado="ok_registro_minimo",
+            duracion_s=secs,
+            nuevos=int(total_nuevos or 0),
+            enriquecidas=int(enriquecidas or 0),
+            fuente="REGISTRO_MINIMO",
+            error=motivo,
+        )
+
+        return {
+            "handled": True,
+            "ok": True,
+            "nuevos": int(total_nuevos or 0),
+            "enriquecidas": int(enriquecidas or 0),
+            "insertadas": int(insertadas or 0),
+            "estado": "ok_registro_minimo",
+        }
+    except Exception as e:
+        print(f"⚠️ Falló registro mínimo obligatorio para {pdf_name}: {e}")
+        return {
+            "handled": True,
+            "ok": False,
+            "nuevos": 0,
+            "enriquecidas": 0,
+            "insertadas": 0,
+            "estado": "error_registro_minimo",
+        }
+
+
 def _try_workbook_append_rows(
     sp_excel_root: str,
     rows_dicts: List[Dict[str, object]],
@@ -2296,15 +3384,206 @@ def _try_workbook_append_rows(
     if not rows_dicts:
         return 0
 
+    filas = []
+    for row in rows_dicts:
+        if not isinstance(row, dict):
+            continue
+
+        fila = dict(row)
+
+        if "Número de factura" in fila:
+            fila["Número de factura"] = _forzar_texto_numero_factura(
+                fila.get("Número de factura", "")
+            )
+
+        filas.append(fila)
+
+    if not filas:
+        return 0
+
     sp_facturas_path = f"{sp_excel_root}/facturas.xlsx".strip("/")
     xl = ExcelWorkbookGraph(sp_facturas_path)
 
     insertadas = xl.append_rows_dedup(
         table_name=table_name,
-        rows_dicts=rows_dicts,
+        rows_dicts=filas,
         key_cols=("Archivo", "Concepto"),
         require_table=True,
     )
+    return int(insertadas or 0)
+
+
+def _obtener_filas_locales_por_archivos_y_numeros(
+    excel_path: str,
+    *,
+    archivos_ref: Optional[set[str]] = None,
+    numeros_ref: Optional[set[str]] = None,
+    last_n: int = 0,
+) -> List[Dict[str, object]]:
+    if not excel_path or not os.path.exists(excel_path):
+        return []
+
+    try:
+        from openpyxl import load_workbook
+
+        wb = load_workbook(excel_path, data_only=True)
+        ws = wb["Facturas"] if "Facturas" in wb.sheetnames else wb.active
+
+        headers = [str(ws.cell(row=1, column=c).value or "").strip() for c in range(1, ws.max_column + 1)]
+
+        archivos_ref = _expand_archivos_ref(set(archivos_ref or set()))
+        nums_norm = {_normalizar_numero_para_match_local(str(n or "").strip()) for n in (numeros_ref or set()) if str(n or "").strip()}
+        nums_norm.discard("")
+
+        rows = []
+        for r in range(2, ws.max_row + 1):
+            values = [ws.cell(row=r, column=c).value for c in range(1, ws.max_column + 1)]
+            row = {headers[i]: values[i] for i in range(len(headers)) if headers[i]}
+
+            arc_val = str(row.get("Archivo") or "").strip()
+            num_val = str(row.get("Número de factura") or "").strip()
+
+            arc_hit = False
+            num_hit = False
+
+            if archivos_ref and arc_val:
+                arc_hit = (arc_val in archivos_ref) or (os.path.basename(arc_val) in archivos_ref)
+
+            if nums_norm and num_val:
+                num_hit = _normalizar_numero_para_match_local(num_val) in nums_norm
+
+            if archivos_ref or nums_norm:
+                if not arc_hit and not num_hit:
+                    continue
+
+            rows.append(row)
+
+        if rows:
+            return rows
+
+        if last_n > 0 and ws.max_row > 1:
+            start = max(2, ws.max_row - last_n + 1)
+            out = []
+            for r in range(start, ws.max_row + 1):
+                values = [ws.cell(row=r, column=c).value for c in range(1, ws.max_column + 1)]
+                out.append({headers[i]: values[i] for i in range(len(headers)) if headers[i]})
+            return out
+
+        return []
+    except Exception as e:
+        print(f"[LOCAL->WEB] Error leyendo filas locales: {e}")
+        return []
+
+
+def _forzar_campos_obligatorios_en_ultimas_filas(
+    excel_path: str,
+    *,
+    expected_rows: int,
+    radicado: str = "",
+    proyecto: str = "",
+) -> Tuple[int, int]:
+    if not excel_path or not os.path.exists(excel_path) or expected_rows <= 0:
+        return 0, 0
+
+    radicado = str(radicado or "").strip() or "SIN_RADICADO"
+    proyecto = str(proyecto or "").strip() or "SIN_PROYECTO"
+
+    try:
+        from openpyxl import load_workbook
+
+        wb = load_workbook(excel_path)
+        ws = wb["Facturas"] if "Facturas" in wb.sheetnames else wb.active
+
+        headers = {}
+        for c in range(1, ws.max_column + 1):
+            key = str(ws.cell(row=1, column=c).value or "").strip()
+            if key:
+                headers[key] = c
+
+        col_rad = headers.get("Radicado")
+        col_pro = headers.get("ProyectoProceso")
+        if not col_rad or not col_pro:
+            return 0, 0
+
+        start = max(2, ws.max_row - expected_rows + 1)
+        filas_match = 0
+        filas_upd = 0
+        for r in range(start, ws.max_row + 1):
+            filas_match += 1
+            cell_rad = ws.cell(r, col_rad)
+            cell_pro = ws.cell(r, col_pro)
+            cambio = False
+            if not str(cell_rad.value or "").strip():
+                cell_rad.value = radicado
+                cambio = True
+            if not str(cell_pro.value or "").strip():
+                cell_pro.value = proyecto
+                cambio = True
+            if cambio:
+                filas_upd += 1
+
+        if filas_upd > 0:
+            wb.save(excel_path)
+        return filas_match, filas_upd
+    except Exception as e:
+        print(f"[LOCAL FORCE LAST] Error forzando últimas filas: {e}")
+        return 0, 0
+
+
+def _subir_factura_a_web_desde_local(
+    *,
+    sp_excel_root: str,
+    archivos_ref: Optional[set[str]] = None,
+    numeros_ref: Optional[set[str]] = None,
+    expected_rows: int = 0,
+    table_name: str = "TblFacturas",
+    rows_dicts: Optional[List[Dict[str, object]]] = None,
+) -> int:
+    insertadas = 0
+
+    rows_dicts = [dict(x or {}) for x in (rows_dicts or []) if isinstance(x, dict)]
+    if rows_dicts:
+        try:
+            insertadas = _try_workbook_append_rows(
+                sp_excel_root,
+                rows_dicts,
+                table_name=table_name,
+            )
+        except Exception as e:
+            print(f"[LOCAL->WEB] append por filas en memoria falló: {e}")
+
+        if expected_rows > 0 and insertadas >= expected_rows:
+            return int(insertadas or 0)
+
+        try:
+            if archivos_ref:
+                extra_arch = _try_workbook_append(
+                    sp_excel_root,
+                    set(archivos_ref),
+                    table_name=table_name,
+                )
+                insertadas = max(int(insertadas or 0), int(extra_arch or 0))
+        except Exception as e:
+            print(f"[LOCAL->WEB] append por archivos falló: {e}")
+
+    if expected_rows > 0 and insertadas >= expected_rows:
+        return int(insertadas or 0)
+
+    rows_local = _obtener_filas_locales_por_archivos_y_numeros(
+        ARCHIVO_EXCEL,
+        archivos_ref=set(archivos_ref or set()),
+        numeros_ref=set(numeros_ref or set()),
+        last_n=expected_rows,
+    )
+    if not rows_local:
+        return int(insertadas or 0)
+
+    try:
+        extra = _try_workbook_append_rows(sp_excel_root, rows_local, table_name=table_name)
+        insertadas = max(int(insertadas or 0), int(extra or 0))
+    except Exception as e:
+        print(f"[LOCAL->WEB] append por filas locales falló: {e}")
+
     return int(insertadas or 0)
 
 def run_desde_aprobadas(
@@ -2432,6 +3711,18 @@ def run_desde_aprobadas(
     filas_local_total = 0
     filas_web_total = 0
 
+    # Resumen inteligente por factura (PASO 3.2)
+    ok_total = 0
+    ok_registradas = 0
+    ok_no_registrables = 0
+
+    dian_total = 0
+    dian_registradas = 0
+    dian_no_registrables = 0
+
+    facturas_con_filas = 0
+    facturas_sin_registro = 0
+
     detalle_rows: List[Dict[str, object]] = []
 
     procesados = 0
@@ -2550,29 +3841,49 @@ def run_desde_aprobadas(
             ident_pdf["NUMERO_APROB"] = numero_principal
 
         if not _es_probable_factura_electronica(subj, pdf_name, ident_pdf):
-            print(f"⏭️ Se omite PDF no probable factura electrónica: {pdf_name}")
-            secs = time.perf_counter() - t0
-            resumen.append((pdf_name, secs, "omitido no factura", 0))
-
-            if usar_processed_store:
-                store.mark_processed(msg_id, {
-                    "status": "omitido_no_factura",
-                    "pdf": pdf_name,
-                    "cufe": cufe_pdf,
-                })
-
-            _push_detalle(
-                detalle_rows, run_id, msg_id, subj,
+            print(f"⚠️ PDF no probable factura electrónica: {pdf_name}. Se aplicará registro mínimo obligatorio.")
+            resultado_min = _registrar_minimo_obligatorio_desde_aprobadas(
+                msg_id=msg_id,
+                subj=subj,
                 pdf_name=pdf_name,
-                cufe=cufe_pdf,
-                numero=ident_pdf.get("NUMERO_APROB") or ident_pdf.get("NUMERO") or "",
-                fecha_factura=fecha_pdf,
-                estado="omitido_no_factura",
-                duracion_s=(time.perf_counter() - t0),
-                fuente="FILTRO"
+                pdf_tmp=pdf_tmp,
+                ident_pdf=ident_pdf,
+                fecha_pdf=fecha_pdf,
+                fecha_local=fecha_local,
+                hora_local=hora_local,
+                numero_aprob=numero_aprob,
+                detalle_rows=detalle_rows,
+                run_id=run_id,
+                t0=t0,
+                usar_processed_store=usar_processed_store,
+                store=store,
+                motivo="filtro_no_factura",
             )
 
+            secs = time.perf_counter() - t0
+            resumen.append((pdf_name, secs, "registro minimo obligatorio", int(resultado_min.get("nuevos", 0) or 0)))
+
+            cnt_ok += 1
+            ok_total += 1
+            if int(resultado_min.get("nuevos", 0) or 0) > 0:
+                ok_registradas += 1
+                facturas_con_filas += 1
+            else:
+                ok_no_registrables += 1
+                facturas_sin_registro += 1
+
             msgs_procesados += 1
+            nuevos_total += int(resultado_min.get("nuevos", 0) or 0)
+            enriq_total += int(resultado_min.get("enriquecidas", 0) or 0)
+            filas_local_total += int(resultado_min.get("nuevos", 0) or 0)
+            filas_web_total += int(resultado_min.get("insertadas", 0) or 0)
+
+            sin_match_consec = 0
+            if int(resultado_min.get("nuevos", 0) or 0) == 0:
+                sin_nuevos_consec += 1
+            else:
+                sin_nuevos_consec = 0
+
             procesados += 1
             continue
 
@@ -2601,12 +3912,50 @@ def run_desde_aprobadas(
 
             if pdf_real_path:
                 pdf_real_name = os.path.basename(pdf_real_path)
-                reg = _generar_registro_pdf_only(pdf_real_path, pdf_real_name)
+                reg = _asegurar_reg_7_conceptos(_generar_registro_pdf_only(pdf_real_path, pdf_real_name))
 
                 if numero_aprob and len(numero_aprob) >= 3:
                     reg["Número de factura"] = numero_aprob
 
+                regs_tmp = [reg]
+                regs_tmp, enriquecidas_forzadas, radicado_final, proyecto_final = _forzar_radicado_y_proyecto_en_filas(
+                    filas=regs_tmp,
+                    subj=subj,
+                    estado="ok_dian_pdf_only",
+                )
+                reg = regs_tmp[0]
+
+                print(
+                    f"[FORZADO] DIAN_PDF -> radicado={radicado_final} | "
+                    f"proyecto={proyecto_final} | enriquecidas={enriquecidas_forzadas}"
+                )
+
                 total_nuevos = guardar_en_excel([reg])
+
+                datos_subject_local = _parse_datos_desde_subject_aprobado(subj)
+                radicado_local_force = str(reg.get("Radicado") or datos_subject_local.get("radicado_subject") or "").strip()
+                proyecto_local_force = str(reg.get("ProyectoProceso") or datos_subject_local.get("proyecto_subject") or "").strip()
+                archivos_force = {os.path.basename(pdf_name), str(reg.get("Archivo") or os.path.basename(pdf_name))}
+                numeros_force = {str(reg.get("Número de factura") or numero_aprob or ident_pdf.get("NUMERO_APROB") or ident_pdf.get("NUMERO") or "").strip()}
+                filas_match_force, filas_upd_force = _forzar_campos_obligatorios_en_excel_local(
+                    ARCHIVO_EXCEL,
+                    archivos_ref=archivos_force,
+                    numeros_ref=numeros_force,
+                    radicado=radicado_local_force,
+                    proyecto=proyecto_local_force,
+                )
+                if filas_upd_force <= 0 and int(total_nuevos or 0) > 0:
+                    filas_match_force, filas_upd_force = _forzar_campos_obligatorios_en_ultimas_filas(
+                        ARCHIVO_EXCEL,
+                        expected_rows=int(total_nuevos or 0),
+                        radicado=radicado_local_force,
+                        proyecto=proyecto_local_force,
+                    )
+                if filas_upd_force > 0:
+                    print(
+                        f"[LOCAL FORCE] PDF/FALLBACK -> match={filas_match_force} | "
+                        f"actualizadas={filas_upd_force} | radicado={radicado_local_force} | proyecto={proyecto_local_force}"
+                    )
 
                 historial_actualizado = False
                 if total_nuevos > 0:
@@ -2619,14 +3968,14 @@ def run_desde_aprobadas(
                     }])
                     historial_actualizado = True
 
-                enriquecidas = 0
+                enriquecidas = int(total_nuevos or 0)
                 try:
-                    enriquecidas = sincronizar_aprobaciones_en_facturas()
+                    sincronizar_aprobaciones_en_facturas()
                 except Exception as e:
                     print(f"[APROB] Error al sincronizar aprobaciones: {e}")
 
-                print("☁️  Subiendo a SharePoint (DIAN / PDF-only)...")
-                sp_ext_root = f"{BASE_SP}/extraidos/dian_pdf_only"
+                print("☁️  Subiendo a SharePoint (DIAN / PDF)...")
+                sp_ext_root = f"{BASE_SP}/extraidos/pdf_dian_fallback"
                 sp_excel = f"{BASE_SP}/excel"
 
                 sp_disponible = True
@@ -2635,7 +3984,7 @@ def run_desde_aprobadas(
                     ensure_folder(sp_excel)
                 except Exception as e:
                     sp_disponible = False
-                    print(f"⚠️ SharePoint no disponible en rama DIAN: {e}")
+                    print(f"⚠️ SharePoint no disponible en rama DIAN PDF: {e}")
 
                 if sp_disponible:
                     try:
@@ -2655,10 +4004,13 @@ def run_desde_aprobadas(
                             str(reg.get("Archivo") or pdf_real_name),
                             os.path.basename(pdf_name),
                         }
-                        insertadas = _try_workbook_append(
-                            sp_excel,
-                            archivos_ref,
-                            table_name="TblFacturas"
+                        insertadas = _subir_factura_a_web_desde_local(
+                            sp_excel_root=sp_excel,
+                            archivos_ref=archivos_ref,
+                            numeros_ref={str(reg.get("Número de factura") or numero_aprob or ident_pdf.get("NUMERO_APROB") or ident_pdf.get("NUMERO") or "").strip()},
+                            expected_rows=int(total_nuevos or 0),
+                            table_name="TblFacturas",
+                            rows_dicts=[reg],
                         )
                         print(f"✅ Workbook API (DIAN/PDF): +{insertadas} fila(s) nuevas en TblFacturas.")
                     except Exception as e:
@@ -2688,21 +4040,51 @@ def run_desde_aprobadas(
                 secs = time.perf_counter() - t0
                 resumen.append((pdf_name, secs, "match dian pdf", total_nuevos))
 
+                cufe_final, numero_final = _resolver_cufe_numero_final(
+                    reg_pdf=reg,
+                    cufe_pdf=cufe_pdf,
+                    numero_pdf=reg.get("Número de factura") or ident_pdf.get("NUMERO_APROB") or ident_pdf.get("NUMERO") or "",
+                )
+                
+                radicado_subject = ""
+                proyecto_subject = ""
+                enriquecidas_subject = 0
+
+                try:
+                    regs_subject = [reg]
+                    enriquecidas_subject, radicado_subject, proyecto_subject = _enriquecer_regs_desde_subject_si_falta(regs_subject, subj)
+
+                    if enriquecidas_subject > 0:
+                        reg = regs_subject[0]
+                        print(
+                            f"[SUBJECT] Fallback enriquecimiento DIAN/PDF en memoria: "
+                            f"filas={enriquecidas_subject} | radicado={radicado_subject} | proyecto={proyecto_subject}"
+                        )
+                except Exception as e:
+                    print(f"[SUBJECT] Error enriqueciendo DIAN/PDF desde subject: {e}")
                 _push_detalle(
                     detalle_rows, run_id, msg_id, subj,
                     pdf_name=pdf_name,
-                    cufe=cufe_pdf,
-                    numero=reg.get("Número de factura") or "",
+                    cufe=cufe_final,
+                    numero=numero_final,
                     fecha_factura=ident_pdf.get("FECHA") or fecha_pdf,
                     zip_match="(PDF-ONLY) VALIDACIONES DIAN",
                     estado="ok_dian_pdf_only",
                     duracion_s=secs,
                     nuevos=int(total_nuevos or 0),
                     enriquecidas=int(enriquecidas or 0),
-                    fuente="DIAN_PDF"
+                    fuente=("DIAN_PDF|SUBJECT" if (radicado_subject or proyecto_subject) else "DIAN_PDF")
                 )
 
                 cnt_dian += 1
+                dian_total += 1
+                if int(total_nuevos or 0) > 0:
+                    dian_registradas += 1
+                    facturas_con_filas += 1
+                else:
+                    dian_no_registrables += 1
+                    facturas_sin_registro += 1
+
                 msgs_procesados += 1
                 nuevos_total += int(total_nuevos or 0)
                 enriq_total += int(enriquecidas or 0)
@@ -2754,12 +4136,37 @@ def run_desde_aprobadas(
                         continue
 
                     regs, errores_zip = procesar_xml_en_carpeta(ruta)
+                    regs = _asegurar_regs_registrables_7_conceptos(regs)
+
+                    if not regs:
+                        print(
+                            f"[DIAN ZIP][FALLBACK REGS] ZIP match sin regs útiles. "
+                            f"Se fuerza registro mínimo desde PDF aprobado: {pdf_name}"
+                        )
+                        reg_min = _asegurar_reg_7_conceptos(_generar_registro_pdf_only(pdf_tmp, pdf_name))
+                        numero_final_min = (
+                            numero_aprob
+                            or ident_pdf.get("NUMERO_APROB")
+                            or ident_pdf.get("NUMERO")
+                            or reg_min.get("Número de factura")
+                            or ""
+                        )
+                        if numero_final_min and len(str(numero_final_min).strip()) >= 3:
+                            reg_min["Número de factura"] = str(numero_final_min).strip()
+                        regs = [reg_min]
 
                     if regs and numero_aprob:
                         for dct in regs:
                             old = str(dct.get("Número de factura", "")).strip()
                             if old != numero_aprob and len(numero_aprob) >= 3:
                                 dct["Número de factura"] = numero_aprob
+
+                    if regs:
+                        regs, enriquecidas_forzadas_zip_tmp, radicado_final_zip_tmp, proyecto_final_zip_tmp = _forzar_radicado_y_proyecto_en_filas(
+                            filas=regs,
+                            subj=subj,
+                            estado="ok_dian_zip",
+                        )
 
                     if regs:
                         regs_para_sharepoint.extend(regs)
@@ -2789,11 +4196,82 @@ def run_desde_aprobadas(
                     registrar_historial_por_zip(historial_rows)
                     historial_actualizado = True
 
-                enriquecidas = 0
+                enriquecidas = int(total_nuevos or 0)
+                if regs_para_sharepoint:
+                    _, _enriquecidas_forzadas_zip, radicado_final_zip, proyecto_final_zip = _forzar_radicado_y_proyecto_en_filas(
+                        filas=regs_para_sharepoint,
+                        subj=subj,
+                        estado="ok_dian_zip",
+                    )
+                    print(
+                        f"[FORZADO] DIAN_ZIP -> radicado={radicado_final_zip} | "
+                        f"proyecto={proyecto_final_zip} | enriquecidas={int(total_nuevos or 0)}"
+                    )
+
+                if int(total_nuevos or 0) <= 0:
+                    print(f"[DIAN ZIP][FORZADO FINAL] Match con ZIP pero sin filas. Se fuerza registro mínimo obligatorio: {pdf_name}")
+                    resultado_min = _registrar_minimo_obligatorio_desde_aprobadas(
+                        msg_id=msg_id,
+                        subj=subj,
+                        pdf_name=pdf_name,
+                        pdf_tmp=pdf_tmp,
+                        ident_pdf=ident_pdf,
+                        fecha_pdf=fecha_pdf,
+                        fecha_local=fecha_local,
+                        hora_local=hora_local,
+                        numero_aprob=numero_aprob,
+                        detalle_rows=detalle_rows,
+                        run_id=run_id,
+                        t0=t0,
+                        usar_processed_store=usar_processed_store,
+                        store=store,
+                        motivo="match_zip_sin_filas",
+                    )
+
+                    secs = time.perf_counter() - t0
+                    resumen.append((pdf_name, secs, "registro minimo obligatorio", int(resultado_min.get("nuevos", 0) or 0)))
+
+                    cnt_dian += 1
+                    dian_total += 1
+                    if int(resultado_min.get("nuevos", 0) or 0) > 0:
+                        dian_registradas += 1
+                        facturas_con_filas += 1
+                    else:
+                        dian_no_registrables += 1
+                        facturas_sin_registro += 1
+
+                    msgs_procesados += 1
+                    nuevos_total += int(resultado_min.get("nuevos", 0) or 0)
+                    enriq_total += int(resultado_min.get("enriquecidas", 0) or 0)
+                    filas_local_total += int(resultado_min.get("nuevos", 0) or 0)
+                    filas_web_total += int(resultado_min.get("insertadas", 0) or 0)
+
+                    sin_match_consec = 0
+                    if int(resultado_min.get("nuevos", 0) or 0) == 0:
+                        sin_nuevos_consec += 1
+                    else:
+                        sin_nuevos_consec = 0
+
+                    procesados += 1
+                    continue
+
                 try:
-                    enriquecidas = sincronizar_aprobaciones_en_facturas()
+                    sincronizar_aprobaciones_en_facturas()
                 except Exception as e:
                     print(f"[APROB] Error al sincronizar aprobaciones: {e}")
+
+                enriquecidas_subject = 0
+                radicado_subject = ""
+                proyecto_subject = ""
+                try:
+                    enriquecidas_subject, radicado_subject, proyecto_subject = _enriquecer_regs_desde_subject_si_falta(regs_para_sharepoint, subj)
+                    if enriquecidas_subject > 0:
+                        print(
+                            f"[SUBJECT] Fallback enriquecimiento DIAN/ZIP en memoria: "
+                            f"filas={enriquecidas_subject} | radicado={radicado_subject} | proyecto={proyecto_subject}"
+                        )
+                except Exception as e:
+                    print(f"[SUBJECT] Error enriqueciendo DIAN/ZIP desde subject: {e}")
 
                 print("☁️  Subiendo a SharePoint (DIAN / ZIP)...")
                 if USE_DATE_SUBFOLDERS:
@@ -2846,10 +4324,14 @@ def run_desde_aprobadas(
                         if found_zip_name:
                             archivos_ref.add(os.path.basename(found_zip_name))
 
-                        insertadas = _try_workbook_append(
-                            sp_excel,
-                            archivos_ref,
-                            table_name="TblFacturas"
+                        numeros_ref_web = {str(d.get("Número de factura") or "").strip() for d in regs_para_sharepoint if str(d.get("Número de factura") or "").strip()}
+                        insertadas = _subir_factura_a_web_desde_local(
+                            sp_excel_root=sp_excel,
+                            archivos_ref=archivos_ref,
+                            numeros_ref=numeros_ref_web,
+                            expected_rows=int(total_nuevos or 0),
+                            table_name="TblFacturas",
+                            rows_dicts=regs_para_sharepoint,
                         )
                         print(f"✅ Workbook API (DIAN/ZIP): +{insertadas} fila(s) nuevas en TblFacturas.")
                     except Exception as e:
@@ -2882,21 +4364,35 @@ def run_desde_aprobadas(
                 secs = time.perf_counter() - t0
                 resumen.append((pdf_name, secs, "match dian zip", total_nuevos))
 
+                cufe_final, numero_final = _resolver_cufe_numero_final(
+                    regs=regs_para_sharepoint,
+                    cufe_pdf=cufe_pdf,
+                    numero_pdf=ident_pdf.get("NUMERO_APROB") or ident_pdf.get("NUMERO") or "",
+                )
+
                 _push_detalle(
                     detalle_rows, run_id, msg_id, subj,
                     pdf_name=pdf_name,
-                    cufe=cufe_pdf,
-                    numero=ident_pdf.get("NUMERO_APROB") or ident_pdf.get("NUMERO") or "",
+                    cufe=cufe_final,
+                    numero=numero_final,
                     fecha_factura=fecha_pdf,
                     zip_match=found_zip_name,
                     estado="ok_dian_zip",
                     duracion_s=secs,
                     nuevos=int(total_nuevos or 0),
                     enriquecidas=int(enriquecidas or 0),
-                    fuente="DIAN_ZIP"
+                    fuente=("DIAN_ZIP|SUBJECT" if (radicado_subject or proyecto_subject) else "DIAN_ZIP")
                 )
 
                 cnt_dian += 1
+                dian_total += 1
+                if int(total_nuevos or 0) > 0:
+                    dian_registradas += 1
+                    facturas_con_filas += 1
+                else:
+                    dian_no_registrables += 1
+                    facturas_sin_registro += 1
+
                 msgs_procesados += 1
                 nuevos_total += int(total_nuevos or 0)
                 enriq_total += int(enriquecidas or 0)
@@ -2940,6 +4436,14 @@ def run_desde_aprobadas(
 
             if aplico_fallback:
                 cnt_dian += 1
+                dian_total += 1
+                if int(total_nuevos or 0) > 0:
+                    dian_registradas += 1
+                    facturas_con_filas += 1
+                else:
+                    dian_no_registrables += 1
+                    facturas_sin_registro += 1
+
                 msgs_procesados += 1
                 nuevos_total += int(total_nuevos or 0)
                 enriq_total += int(enriquecidas or 0)
@@ -3167,6 +4671,65 @@ def run_desde_aprobadas(
 
         if not found_match or not found_zip_name or not found_zip_bytes:
             print(f"❌ No se encontró ZIP que coincida para PDF {pdf_name}.")
+            print("🔎 Intentando localizar correo origen con PDF único antes del fallback local...")
+
+            try:
+                pdf_origen_path, pdf_origen_name, source_msg_id, source_att_id = _buscar_correo_origen_con_pdf_unico(
+                    msg_id_aprobado=msg_id,
+                    subj_aprobado=subj,
+                    ident_pdf=ident_pdf,
+                    since_days=since_days,
+                    top_msgs=80,
+                )
+                if pdf_origen_path and pdf_origen_name:
+                    aplico_origen, nuevos_origen, enriquecidas_origen, insertadas_origen = _registrar_desde_pdf_origen_unico(
+                        msg_id=msg_id,
+                        subj=subj,
+                        pdf_name_aprobado=pdf_name,
+                        pdf_origen_path=pdf_origen_path,
+                        pdf_origen_name=pdf_origen_name,
+                        ident_pdf_aprobado=ident_pdf,
+                        fecha_local=fecha_local,
+                        hora_local=hora_local,
+                        run_id=run_id,
+                        detalle_rows=detalle_rows,
+                        resumen=resumen,
+                        t0=t0,
+                        usar_processed_store=usar_processed_store,
+                        store=store,
+                        source_msg_id=source_msg_id or "",
+                        source_att_id=source_att_id or "",
+                    )
+                    if aplico_origen:
+                        cnt_ok += 1
+                        ok_total += 1
+                        if int(nuevos_origen or 0) > 0:
+                            ok_registradas += 1
+                            facturas_con_filas += 1
+                        else:
+                            ok_no_registrables += 1
+                            facturas_sin_registro += 1
+
+                        msgs_procesados += 1
+                        nuevos_total += int(nuevos_origen or 0)
+                        enriq_total += int(enriquecidas_origen or 0)
+                        filas_local_total += int(nuevos_origen or 0)
+                        filas_web_total += int(insertadas_origen or 0)
+
+                        sin_match_consec = 0
+                        if int(nuevos_origen or 0) == 0:
+                            sin_nuevos_consec += 1
+                        else:
+                            sin_nuevos_consec = 0
+                            if cufe_pdf:
+                                cufes_existentes.add(cufe_pdf)
+                                norm_cufes_existentes.add(cufe_pdf)
+
+                        procesados += 1
+                        continue
+            except Exception as e:
+                print(f"⚠️ Falló búsqueda/registro por PDF origen único para {pdf_name}: {e}")
+
             print("🔁 Intentando último recurso con el MISMO PDF de solo aprobadas...")
 
             try:
@@ -3195,6 +4758,14 @@ def run_desde_aprobadas(
                         resumen.append((pdf_name, secs, "fallback pdf aprobadas", resultado_fallback["nuevos"]))
 
                         cnt_ok += 1
+                        ok_total += 1
+                        if int(resultado_fallback.get("nuevos", 0) or 0) > 0:
+                            ok_registradas += 1
+                            facturas_con_filas += 1
+                        else:
+                            ok_no_registrables += 1
+                            facturas_sin_registro += 1
+
                         msgs_procesados += 1
                         nuevos_total += int(resultado_fallback.get("nuevos", 0) or 0)
                         enriq_total += int(resultado_fallback.get("enriquecidas", 0) or 0)
@@ -3313,12 +4884,37 @@ def run_desde_aprobadas(
                 continue
 
             regs, errores_zip = procesar_xml_en_carpeta(ruta)
+            regs = _asegurar_regs_registrables_7_conceptos(regs)
+
+            if not regs:
+                print(
+                    f"[NORMAL ZIP][FALLBACK REGS] ZIP match sin regs útiles. "
+                    f"Se fuerza registro mínimo desde PDF aprobado: {pdf_name}"
+                )
+                reg_min = _asegurar_reg_7_conceptos(_generar_registro_pdf_only(pdf_tmp, pdf_name))
+                numero_final_min = (
+                    numero_aprob
+                    or ident_pdf.get("NUMERO_APROB")
+                    or ident_pdf.get("NUMERO")
+                    or reg_min.get("Número de factura")
+                    or ""
+                )
+                if numero_final_min and len(str(numero_final_min).strip()) >= 3:
+                    reg_min["Número de factura"] = str(numero_final_min).strip()
+                regs = [reg_min]
 
             if regs and numero_aprob:
                 for dct in regs:
                     old = str(dct.get("Número de factura", "")).strip()
                     if old != numero_aprob and len(numero_aprob) >= 3:
                         dct["Número de factura"] = numero_aprob
+
+            if regs:
+                regs, enriquecidas_forzadas_tmp, radicado_final_tmp, proyecto_final_tmp = _forzar_radicado_y_proyecto_en_filas(
+                    filas=regs,
+                    subj=subj,
+                    estado="ok",
+                )
 
             if regs:
                 regs_para_sharepoint.extend(regs)
@@ -3330,6 +4926,33 @@ def run_desde_aprobadas(
                         archivos_realmente_guardados.add(str(av).strip())
 
             nuevos = guardar_en_excel(regs) if regs else 0
+
+            if regs:
+                datos_subject_local = _parse_datos_desde_subject_aprobado(subj)
+                radicado_local_force = str((regs[0].get("Radicado") if regs else "") or datos_subject_local.get("radicado_subject") or "").strip()
+                proyecto_local_force = str((regs[0].get("ProyectoProceso") if regs else "") or datos_subject_local.get("proyecto_subject") or "").strip()
+                archivos_force = {str(d.get("Archivo") or "").strip() for d in regs if str(d.get("Archivo") or "").strip()}
+                numeros_force = {str(d.get("Número de factura") or "").strip() for d in regs if str(d.get("Número de factura") or "").strip()}
+                filas_match_force, filas_upd_force = _forzar_campos_obligatorios_en_excel_local(
+                    ARCHIVO_EXCEL,
+                    archivos_ref=archivos_force,
+                    numeros_ref=numeros_force,
+                    radicado=radicado_local_force,
+                    proyecto=proyecto_local_force,
+                )
+                if filas_upd_force <= 0 and int(nuevos or 0) > 0:
+                    filas_match_force, filas_upd_force = _forzar_campos_obligatorios_en_ultimas_filas(
+                        ARCHIVO_EXCEL,
+                        expected_rows=int(nuevos or 0),
+                        radicado=radicado_local_force,
+                        proyecto=proyecto_local_force,
+                    )
+                if filas_upd_force > 0:
+                    print(
+                        f"[LOCAL FORCE] ZIP -> match={filas_match_force} | "
+                        f"actualizadas={filas_upd_force} | radicado={radicado_local_force} | proyecto={proyecto_local_force}"
+                    )
+
             total_nuevos += nuevos
 
             if nuevos > 0 or errores_zip > 0:
@@ -3348,11 +4971,85 @@ def run_desde_aprobadas(
             registrar_historial_por_zip(historial_rows)
             historial_actualizado = True
 
-        enriquecidas = 0
+        enriquecidas = int(total_nuevos or 0)
+        if regs_para_sharepoint:
+            _, _enriquecidas_forzadas_zip, radicado_final_zip, proyecto_final_zip = _forzar_radicado_y_proyecto_en_filas(
+                filas=regs_para_sharepoint,
+                subj=subj,
+                estado="ok",
+            )
+            print(
+                f"[FORZADO] NORMAL_ZIP -> radicado={radicado_final_zip} | "
+                f"proyecto={proyecto_final_zip} | enriquecidas={int(total_nuevos or 0)}"
+            )
+
+        if int(total_nuevos or 0) <= 0:
+            print(f"[NORMAL ZIP][FORZADO FINAL] Match con ZIP pero sin filas. Se fuerza registro mínimo obligatorio: {pdf_name}")
+            resultado_min = _registrar_minimo_obligatorio_desde_aprobadas(
+                msg_id=msg_id,
+                subj=subj,
+                pdf_name=pdf_name,
+                pdf_tmp=pdf_tmp,
+                ident_pdf=ident_pdf,
+                fecha_pdf=fecha_pdf,
+                fecha_local=fecha_local,
+                hora_local=hora_local,
+                numero_aprob=numero_aprob,
+                detalle_rows=detalle_rows,
+                run_id=run_id,
+                t0=t0,
+                usar_processed_store=usar_processed_store,
+                store=store,
+                motivo="match_zip_sin_filas",
+            )
+
+            secs = time.perf_counter() - t0
+            resumen.append((pdf_name, secs, "registro minimo obligatorio", int(resultado_min.get("nuevos", 0) or 0)))
+
+            cnt_ok += 1
+            ok_total += 1
+            if int(resultado_min.get("nuevos", 0) or 0) > 0:
+                ok_registradas += 1
+                facturas_con_filas += 1
+            else:
+                ok_no_registrables += 1
+                facturas_sin_registro += 1
+
+            msgs_procesados += 1
+            nuevos_total += int(resultado_min.get("nuevos", 0) or 0)
+            enriq_total += int(resultado_min.get("enriquecidas", 0) or 0)
+            filas_local_total += int(resultado_min.get("nuevos", 0) or 0)
+            filas_web_total += int(resultado_min.get("insertadas", 0) or 0)
+
+            sin_match_consec = 0
+            if int(resultado_min.get("nuevos", 0) or 0) == 0:
+                sin_nuevos_consec += 1
+            else:
+                sin_nuevos_consec = 0
+                if cufe_pdf:
+                    cufes_existentes.add(cufe_pdf)
+                    norm_cufes_existentes.add(cufe_pdf)
+
+            procesados += 1
+            continue
+
         try:
-            enriquecidas = sincronizar_aprobaciones_en_facturas()
+            sincronizar_aprobaciones_en_facturas()
         except Exception as e:
             print(f"[APROB] Error al sincronizar aprobaciones: {e}")
+
+        enriquecidas_subject = 0
+        radicado_subject = ""
+        proyecto_subject = ""
+        try:
+            enriquecidas_subject, radicado_subject, proyecto_subject = _enriquecer_regs_desde_subject_si_falta(regs_para_sharepoint, subj)
+            if enriquecidas_subject > 0:
+                print(
+                    f"[SUBJECT] Fallback enriquecimiento NORMAL/ZIP en memoria: "
+                    f"filas={enriquecidas_subject} | radicado={radicado_subject} | proyecto={proyecto_subject}"
+                )
+        except Exception as e:
+            print(f"[SUBJECT] Error enriqueciendo NORMAL/ZIP desde subject: {e}")
 
         print("☁️  Subiendo a SharePoint (desde aprobadas)...")
         if USE_DATE_SUBFOLDERS:
@@ -3405,10 +5102,14 @@ def run_desde_aprobadas(
                 if found_zip_name:
                     archivos_ref.add(os.path.basename(found_zip_name))
 
-                insertadas = _try_workbook_append(
-                    sp_excel,
-                    archivos_ref,
-                    table_name="TblFacturas"
+                numeros_ref_web = {str(d.get("Número de factura") or "").strip() for d in regs_para_sharepoint if str(d.get("Número de factura") or "").strip()}
+                insertadas = _subir_factura_a_web_desde_local(
+                    sp_excel_root=sp_excel,
+                    archivos_ref=archivos_ref,
+                    numeros_ref=numeros_ref_web,
+                    expected_rows=int(total_nuevos or 0),
+                    table_name="TblFacturas",
+                    rows_dicts=regs_para_sharepoint,
                 )
                 print(f"✅ Workbook API (NORMAL/ZIP): +{insertadas} fila(s) nuevas en TblFacturas.")
             except Exception as e:
@@ -3440,21 +5141,39 @@ def run_desde_aprobadas(
         except Exception as e:
             print(f"⚠️ No se pudo marcar como leído: {e}")
 
+        cufe_final, numero_final = _resolver_cufe_numero_final(
+            regs=regs_para_sharepoint,
+            cufe_pdf=cufe_pdf,
+            numero_pdf=ident_pdf.get("NUMERO_APROB") or ident_pdf.get("NUMERO") or "",
+        )
+
+        fuente_detalle = fuente_match
+        if radicado_subject or proyecto_subject:
+            fuente_detalle = f"{fuente_match}|SUBJECT"
+
         _push_detalle(
             detalle_rows, run_id, msg_id, subj,
             pdf_name=pdf_name,
-            cufe=cufe_pdf,
-            numero=ident_pdf.get("NUMERO_APROB") or ident_pdf.get("NUMERO") or "",
+            cufe=cufe_final,
+            numero=numero_final,
             fecha_factura=fecha_pdf,
             zip_match=found_zip_name,
             estado="ok",
             duracion_s=(time.perf_counter() - t0),
             nuevos=int(total_nuevos or 0),
             enriquecidas=int(enriquecidas or 0),
-            fuente=fuente_match
+            fuente=fuente_detalle
         )
 
         cnt_ok += 1
+        ok_total += 1
+        if int(total_nuevos or 0) > 0:
+            ok_registradas += 1
+            facturas_con_filas += 1
+        else:
+            ok_no_registrables += 1
+            facturas_sin_registro += 1
+
         msgs_procesados += 1
         nuevos_total += int(total_nuevos or 0)
         enriq_total += int(enriquecidas or 0)
@@ -3483,6 +5202,8 @@ def run_desde_aprobadas(
 
     total_secs = time.perf_counter() - t0_total
     fin_dt = datetime.datetime.now().isoformat(timespec="seconds")
+
+    total_match = ok_total + dian_total
 
     hubo_actividad = (msgs_procesados > 0) or (cnt_err > 0) or (nuevos_total > 0) or (cnt_dian > 0)
     if (not AUDIT_WRITE_ONLY_IF_ACTIVITY) or hubo_actividad:
@@ -3514,10 +5235,41 @@ def run_desde_aprobadas(
                 "enriquecidas_total": enriq_total,
                 "filas_local_total": filas_local_total,
                 "filas_web_total": filas_web_total,
+
+                # Resumen inteligente por factura (PASO 3.2)
+                "total_match": total_match,
+                "match_total": total_match,
+
+                "ok_total": ok_total,
+                "ok_match": ok_total,
+                "ok_registradas": ok_registradas,
+                "ok_con_filas": ok_registradas,
+                "ok_no_registrables": ok_no_registrables,
+                "ok_sin_filas": ok_no_registrables,
+
+                "dian_total": dian_total,
+                "dian_match": dian_total,
+                "dian_registradas": dian_registradas,
+                "dian_con_filas": dian_registradas,
+                "dian_no_registrables": dian_no_registrables,
+                "dian_sin_filas": dian_no_registrables,
+
+                "facturas_con_filas": facturas_con_filas,
+                "facturas_sin_registro": facturas_sin_registro,
+                "facturas_sin_filas": facturas_sin_registro,
+
                 "nota": "",
             })
         except Exception as e:
             print(f"⚠️ No pude escribir audit runs CSV: {e}")
+
+    print("\n===== 📊 Resumen inteligente por factura =====")
+    print(f"Procesadas: {msgs_procesados}")
+    print(f"Match total: {total_match} | OK: {ok_total} | DIAN: {dian_total}")
+    print(f"Facturas con filas: {facturas_con_filas} | Facturas sin filas: {facturas_sin_registro}")
+    print(f"OK con filas: {ok_registradas} | OK sin filas: {ok_no_registrables}")
+    print(f"DIAN con filas: {dian_registradas} | DIAN sin filas: {dian_no_registrables}")
+    print("==============================================")
 
     print("\n===== ⏱️ Resumen de tiempos (aprobadas) =====")
     for name, secs, estado, nuevos in resumen:
