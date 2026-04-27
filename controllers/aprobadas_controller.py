@@ -2457,7 +2457,7 @@ def _try_workbook_append(
     insertadas = xl.append_rows_dedup(
         table_name=table_name,
         rows_dicts=filas,
-        key_cols=("Archivo", "Concepto"),
+        key_cols=("Radicado", "Archivo", "Concepto"),
         require_table=True,
     )
     return int(insertadas or 0)
@@ -2511,7 +2511,6 @@ def _registrar_desde_pdf_aprobado_fallback(
             reg["Número de factura"] = str(numero_final).strip()
 
         total_nuevos = guardar_en_excel([reg])
-
         datos_subject_local = _parse_datos_desde_subject_aprobado(subj)
         radicado_local_force = str(reg.get("Radicado") or datos_subject_local.get("radicado_subject") or "").strip()
         proyecto_local_force = str(reg.get("ProyectoProceso") or datos_subject_local.get("proyecto_subject") or "").strip()
@@ -3376,6 +3375,126 @@ def _registrar_minimo_obligatorio_desde_aprobadas(
         }
 
 
+
+def _agregar_filas_al_buffer_web_run(
+    buffer: List[Dict[str, object]],
+    filas: Optional[List[Dict[str, object]]],
+    *,
+    origen: str = "",
+) -> int:
+    """
+    Buffer incremental del run para reconciliar LOCAL -> WEB al final.
+
+    Importante:
+    - No sube todo el histórico.
+    - Solo guarda en memoria las filas generadas durante este run.
+    - Filtra filas sin Concepto para evitar la fila fantasma del web.
+    - No modifica la lógica local que ya funciona.
+    """
+    if buffer is None or not filas:
+        return 0
+
+    agregadas = 0
+    for row in filas:
+        if not isinstance(row, dict):
+            continue
+
+        d = dict(row)
+
+        concepto = str(d.get("Concepto") or "").strip()
+        if not concepto:
+            continue
+
+        if "Número de factura" in d:
+            d["Número de factura"] = _forzar_texto_numero_factura(d.get("Número de factura", ""))
+
+        # La llave web actual es Radicado + Archivo + Concepto.
+        # Si falta Radicado/Archivo, igual intentamos conservar la fila si tiene Concepto,
+        # porque el Workbook Graph filtrará llaves incompletas si corresponde.
+        # En la práctica el controller ya fuerza Radicado y Archivo antes de guardar.
+        buffer.append(d)
+        agregadas += 1
+
+    if agregadas:
+        print(f"[WEB BUFFER] +{agregadas} fila(s) agregadas al buffer del run. origen={origen}")
+
+    return agregadas
+
+
+def _reconciliar_web_desde_buffer_run(
+    *,
+    sp_excel_root: str,
+    rows_web_run_buffer: List[Dict[str, object]],
+    table_name: str = "TblFacturas",
+) -> int:
+    """
+    Reconciliación final incremental del run.
+
+    En vez de leer las últimas N filas del Excel local, usa el buffer real
+    de filas generadas durante esta ejecución. Esto evita perder filas cuando
+    el Excel local se reordena, deduplica o cambia físicamente de orden.
+
+    El Workbook API deduplica por Radicado + Archivo + Concepto,
+    así que esta llamada no duplica lo ya insertado; solo completa faltantes.
+    """
+    if not rows_web_run_buffer:
+        print("[WEB BUFFER] No hay filas en buffer para reconciliar.")
+        return 0
+
+    filas_validas: List[Dict[str, object]] = []
+    vistos = set()
+
+    for row in rows_web_run_buffer:
+        if not isinstance(row, dict):
+            continue
+
+        d = dict(row)
+        concepto = str(d.get("Concepto") or "").strip()
+        if not concepto:
+            continue
+
+        if "Número de factura" in d:
+            d["Número de factura"] = _forzar_texto_numero_factura(d.get("Número de factura", ""))
+
+        # Deduplicación interna del buffer para no mandar la misma fila varias veces.
+        k = (
+            str(d.get("Radicado") or "").strip(),
+            str(d.get("Archivo") or "").strip(),
+            concepto,
+        )
+        if k in vistos:
+            continue
+        vistos.add(k)
+        filas_validas.append(d)
+
+    if not filas_validas:
+        print("[WEB BUFFER] Buffer sin filas válidas con Concepto.")
+        return 0
+
+    print(
+        f"[WEB BUFFER] Reconciliación final: buffer={len(rows_web_run_buffer)} | "
+        f"validas={len(filas_validas)} | tabla={table_name}"
+    )
+
+    try:
+        ensure_folder(sp_excel_root)
+    except Exception as e:
+        print(f"[WEB BUFFER] No se pudo asegurar carpeta Excel en SharePoint: {e}")
+        return 0
+
+    try:
+        insertadas = _try_workbook_append_rows(
+            sp_excel_root,
+            filas_validas,
+            table_name=table_name,
+        )
+        print(f"[WEB BUFFER] Reconciliación final insertó/completó: {insertadas} fila(s)")
+        return int(insertadas or 0)
+    except Exception as e:
+        print(f"[WEB BUFFER] Falló reconciliación final: {e}")
+        return 0
+
+
 def _try_workbook_append_rows(
     sp_excel_root: str,
     rows_dicts: List[Dict[str, object]],
@@ -3407,7 +3526,7 @@ def _try_workbook_append_rows(
     insertadas = xl.append_rows_dedup(
         table_name=table_name,
         rows_dicts=filas,
-        key_cols=("Archivo", "Concepto"),
+        key_cols=("Radicado", "Archivo", "Concepto"),
         require_table=True,
     )
     return int(insertadas or 0)
@@ -3586,6 +3705,68 @@ def _subir_factura_a_web_desde_local(
 
     return int(insertadas or 0)
 
+
+def _obtener_ultimas_filas_locales_para_reconciliacion_web(
+    excel_path: str,
+    *,
+    total_filas_run: int,
+) -> List[Dict[str, object]]:
+    """
+    Respaldo de reconciliación:
+    lee las últimas N filas del Excel local del run actual.
+    Se usa además del buffer para cubrir ramas auxiliares que generan filas
+    dentro de helpers y no tienen acceso directo al buffer.
+    """
+    if not excel_path or not os.path.exists(excel_path):
+        return []
+
+    total_filas_run = int(total_filas_run or 0)
+    if total_filas_run <= 0:
+        return []
+
+    try:
+        from openpyxl import load_workbook
+
+        wb = load_workbook(excel_path, data_only=True)
+        ws = wb["Facturas"] if "Facturas" in wb.sheetnames else wb.active
+
+        headers = [
+            str(ws.cell(row=1, column=c).value or "").strip()
+            for c in range(1, ws.max_column + 1)
+        ]
+
+        if not headers:
+            return []
+
+        start_row = max(2, ws.max_row - total_filas_run + 1)
+        filas: List[Dict[str, object]] = []
+
+        for r in range(start_row, ws.max_row + 1):
+            row = {}
+            for idx, header in enumerate(headers, start=1):
+                if not header:
+                    continue
+                row[header] = ws.cell(row=r, column=idx).value
+
+            if not str(row.get("Concepto") or "").strip():
+                continue
+
+            if "Número de factura" in row:
+                row["Número de factura"] = _forzar_texto_numero_factura(row.get("Número de factura", ""))
+
+            filas.append(row)
+
+        print(
+            f"[WEB LOCAL BACKUP] Últimas filas locales leídas: "
+            f"esperadas={total_filas_run} | encontradas={len(filas)}"
+        )
+        return filas
+
+    except Exception as e:
+        print(f"[WEB LOCAL BACKUP] Error leyendo últimas filas locales: {e}")
+        return []
+
+
 def run_desde_aprobadas(
     max_aprobados: int = 50,
     max_zip_buscar: int = 150,
@@ -3725,6 +3906,10 @@ def run_desde_aprobadas(
 
     detalle_rows: List[Dict[str, object]] = []
 
+    # Buffer real de filas generadas en este run para reconciliar al web al final.
+    # No contiene histórico, solo lo producido en esta ejecución.
+    rows_web_run_buffer: List[Dict[str, object]] = []
+
     procesados = 0
     sin_match_consec = 0
     sin_nuevos_consec = 0
@@ -3740,16 +3925,50 @@ def run_desde_aprobadas(
 
         pdf_atts = listar_adjuntos_pdf(msg_id)
         if not pdf_atts:
-            if usar_processed_store:
-                store.mark_processed(msg_id, {"status": "sin_pdf"})
-            cnt_sin_pdf += 1
-            msgs_procesados += 1
-
-            _push_detalle(
-                detalle_rows, run_id, msg_id, subj,
-                estado="sin_pdf",
-                duracion_s=(time.perf_counter() - t0)
+            print("[APROB] Correo aprobado sin PDF detectado. Se fuerza REGISTRO MÍNIMO obligatorio.")
+            resultado_min = _registrar_minimo_obligatorio_desde_aprobadas(
+                msg_id=msg_id,
+                subj=subj,
+                pdf_name="SIN_ADJUNTO_APROBADO",
+                pdf_tmp="",
+                ident_pdf={},
+                fecha_pdf="",
+                fecha_local=fecha_local,
+                hora_local=hora_local,
+                numero_aprob=(_numero_from_subject(subj) or ""),
+                detalle_rows=detalle_rows,
+                run_id=run_id,
+                t0=t0,
+                usar_processed_store=usar_processed_store,
+                store=store,
+                motivo="sin_pdf_o_imagen_aprobada",
             )
+
+            total_nuevos_min = int(resultado_min.get("nuevos", 0) or 0)
+            insertadas_min = int(resultado_min.get("insertadas", 0) or 0)
+            enriquecidas_min = int(resultado_min.get("enriquecidas", 0) or 0)
+
+            cnt_ok += 1
+            ok_total += 1
+            if total_nuevos_min > 0:
+                ok_registradas += 1
+                facturas_con_filas += 1
+            else:
+                ok_no_registrables += 1
+                facturas_sin_registro += 1
+
+            msgs_procesados += 1
+            nuevos_total += total_nuevos_min
+            enriq_total += enriquecidas_min
+            filas_local_total += total_nuevos_min
+            filas_web_total += insertadas_min
+
+            secs = time.perf_counter() - t0
+            resumen.append(("SIN_ADJUNTO_APROBADO", secs, "registro minimo sin pdf/imagen", total_nuevos_min))
+
+            procesados += 1
+            sin_match_consec = 0
+            sin_nuevos_consec = 0 if total_nuevos_min > 0 else (sin_nuevos_consec + 1)
             continue
 
         pdf = None
@@ -3931,6 +4150,7 @@ def run_desde_aprobadas(
                 )
 
                 total_nuevos = guardar_en_excel([reg])
+                _agregar_filas_al_buffer_web_run(rows_web_run_buffer, [reg], origen="dian_pdf")
 
                 datos_subject_local = _parse_datos_desde_subject_aprobado(subj)
                 radicado_local_force = str(reg.get("Radicado") or datos_subject_local.get("radicado_subject") or "").strip()
@@ -4179,6 +4399,8 @@ def run_desde_aprobadas(
 
                     nuevos = guardar_en_excel(regs) if regs else 0
                     total_nuevos += nuevos
+                    if regs and int(nuevos or 0) > 0:
+                        _agregar_filas_al_buffer_web_run(rows_web_run_buffer, regs, origen="dian_zip")
 
                     if nuevos > 0 or errores_zip > 0:
                         historial_rows.append({
@@ -4459,38 +4681,56 @@ def run_desde_aprobadas(
                 procesados += 1
                 continue
 
-            secs = time.perf_counter() - t0
-            resumen.append((pdf_name, secs, "sin match dian", 0))
-
             motivo_dian = "sin_match_dian"
             if not cufe_pdf:
                 motivo_dian = "sin_match_dian_pdf_sin_cufe"
             elif cufe_pdf and not _cufe_is_valid(cufe_pdf):
                 motivo_dian = "sin_match_dian_cufe_debil"
 
-            if usar_processed_store:
-                store.mark_processed(msg_id, {
-                    "status": motivo_dian,
-                    "pdf": pdf_name,
-                    "cufe": cufe_pdf
-                })
-
-            cnt_sin_match += 1
-            msgs_procesados += 1
-            sin_match_consec += 1
-            sin_nuevos_consec = 0
-            procesados += 1
-
-            _push_detalle(
-                detalle_rows, run_id, msg_id, subj,
+            print(f"[DIAN][MINIMO FINAL] {motivo_dian}. Se fuerza registro mínimo obligatorio: {pdf_name}")
+            resultado_min = _registrar_minimo_obligatorio_desde_aprobadas(
+                msg_id=msg_id,
+                subj=subj,
                 pdf_name=pdf_name,
-                cufe=cufe_pdf,
-                numero=ident_pdf.get("NUMERO_APROB") or ident_pdf.get("NUMERO") or "",
-                fecha_factura=fecha_pdf,
-                estado=motivo_dian,
-                duracion_s=secs,
-                fuente="DIAN"
+                pdf_tmp=pdf_tmp,
+                ident_pdf=ident_pdf,
+                fecha_pdf=fecha_pdf,
+                fecha_local=fecha_local,
+                hora_local=hora_local,
+                numero_aprob=numero_aprob,
+                detalle_rows=detalle_rows,
+                run_id=run_id,
+                t0=t0,
+                usar_processed_store=usar_processed_store,
+                store=store,
+                motivo=motivo_dian,
             )
+
+            total_nuevos_min = int(resultado_min.get("nuevos", 0) or 0)
+            insertadas_min = int(resultado_min.get("insertadas", 0) or 0)
+            enriquecidas_min = int(resultado_min.get("enriquecidas", 0) or 0)
+
+            secs = time.perf_counter() - t0
+            resumen.append((pdf_name, secs, "registro minimo obligatorio dian", total_nuevos_min))
+
+            cnt_dian += 1
+            dian_total += 1
+            if total_nuevos_min > 0:
+                dian_registradas += 1
+                facturas_con_filas += 1
+            else:
+                dian_no_registrables += 1
+                facturas_sin_registro += 1
+
+            msgs_procesados += 1
+            nuevos_total += total_nuevos_min
+            enriq_total += enriquecidas_min
+            filas_local_total += total_nuevos_min
+            filas_web_total += insertadas_min
+
+            sin_match_consec = 0
+            sin_nuevos_consec = 0 if total_nuevos_min > 0 else (sin_nuevos_consec + 1)
+            procesados += 1
             continue
 
         found_match = False
@@ -4954,6 +5194,8 @@ def run_desde_aprobadas(
                     )
 
             total_nuevos += nuevos
+            if regs and int(nuevos or 0) > 0:
+                _agregar_filas_al_buffer_web_run(rows_web_run_buffer, regs, origen="normal_zip")
 
             if nuevos > 0 or errores_zip > 0:
                 historial_rows.append({
@@ -5199,6 +5441,44 @@ def run_desde_aprobadas(
         print(f"🧹 Limpieza temp_check: borrados {n} PDF(s).")
     except Exception:
         print("⚠️ Limpieza temp_check: no se pudo completar.")
+
+    # Reconciliación final incremental LOCAL/RUN -> WEB.
+    # 1) usa buffer real del run;
+    # 2) agrega respaldo de últimas filas locales para cubrir helpers que no tienen acceso al buffer.
+    try:
+        sp_excel_final = f"{BASE_SP}/excel"
+        filas_backup_local = _obtener_ultimas_filas_locales_para_reconciliacion_web(
+            ARCHIVO_EXCEL,
+            total_filas_run=int(nuevos_total or 0),
+        )
+
+        filas_reconciliacion = []
+        if rows_web_run_buffer:
+            filas_reconciliacion.extend(rows_web_run_buffer)
+        if filas_backup_local:
+            filas_reconciliacion.extend(filas_backup_local)
+
+        if filas_reconciliacion:
+            print(
+                f"[WEB FINAL] Reconciliando web al cierre del run: "
+                f"buffer={len(rows_web_run_buffer)} | backup_local={len(filas_backup_local)} | "
+                f"total_envio={len(filas_reconciliacion)}"
+            )
+            insertadas_final = _reconciliar_web_desde_buffer_run(
+                sp_excel_root=sp_excel_final,
+                rows_web_run_buffer=filas_reconciliacion,
+                table_name="TblFacturas",
+            )
+            if int(insertadas_final or 0) > 0:
+                filas_web_total += int(insertadas_final or 0)
+                print(
+                    f"[WEB FINAL] filas_web_total actualizado={filas_web_total} | "
+                    f"filas_local_total={filas_local_total} | nuevos_total={nuevos_total}"
+                )
+        else:
+            print("[WEB FINAL] Sin filas para reconciliar al cierre.")
+    except Exception as e:
+        print(f"[WEB FINAL] Error no crítico en reconciliación final: {e}")
 
     total_secs = time.perf_counter() - t0_total
     fin_dt = datetime.datetime.now().isoformat(timespec="seconds")

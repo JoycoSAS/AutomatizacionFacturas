@@ -327,7 +327,28 @@ def guardar_en_excel(datos: List[Dict[str, Any]]) -> int:
 
         combinado = pd.concat([antiguo, df_nuevo], ignore_index=True)
 
-        if "Archivo" in combinado.columns and "Concepto" in combinado.columns:
+        # DEDUPE CORREGIDO:
+        # Antes se usaba solo ["Archivo", "Concepto"], lo cual hacía que facturas distintas
+        # con nombres genéricos iguales se pisaran entre sí:
+        #   - SIN.img
+        #   - Representacion grafica.pdf
+        #   - JOYCO S.A.S. BIC.pdf
+        #   - Tu Factura ETB Marzo de 2026.pdf
+        #
+        # Ahora la llave mínima local es:
+        #   Radicado + Archivo + Concepto
+        #
+        # Esto permite que dos facturas distintas con el mismo nombre de archivo
+        # convivan correctamente si tienen distinto radicado.
+        dedupe_cols = []
+        for c in ["Radicado", "Archivo", "Concepto"]:
+            if c in combinado.columns:
+                dedupe_cols.append(c)
+
+        if len(dedupe_cols) == 3:
+            combinado = combinado.drop_duplicates(subset=dedupe_cols, keep="last")
+        elif "Archivo" in combinado.columns and "Concepto" in combinado.columns:
+            # Fallback conservador por compatibilidad si el Excel antiguo no trae Radicado.
             combinado = combinado.drop_duplicates(subset=["Archivo", "Concepto"], keep="last")
 
         nuevos = len(combinado) - len(antiguo)
@@ -337,6 +358,11 @@ def guardar_en_excel(datos: List[Dict[str, Any]]) -> int:
         final_df = df_nuevo
 
     final_df = _limpiar_dataframe_a_formato_largo(final_df)
+
+    # Seguridad local: no conservar filas fantasma sin Concepto.
+    # El registro mínimo válido siempre genera los 7 conceptos, así que esto no borra datos buenos.
+    if "Concepto" in final_df.columns:
+        final_df = final_df[final_df["Concepto"].astype(str).str.strip() != ""].copy()
 
     columnas_finales_presentes = [c for c in COLUMNAS_VALIDAS_FINALES if c in final_df.columns]
     final_df = final_df[columnas_finales_presentes]

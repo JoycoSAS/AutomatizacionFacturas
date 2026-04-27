@@ -138,24 +138,45 @@ class ExcelWorkbookGraph:
     # ---------------------------
     @staticmethod
     def _build_existing_keys(
-        table_values: List[List[Any]], key_cols: Tuple[str, str]
-    ) -> Set[Tuple[str, str]]:
+        table_values: List[List[Any]], key_cols: Tuple[str, ...]
+    ) -> Set[Tuple[str, ...]]:
+        """
+        Construye las llaves existentes usando una cantidad variable de columnas.
+
+        Importante:
+        - Antes esta función solo soportaba 2 columnas.
+        - Ahora soporta 3 o más, por ejemplo:
+          ("Radicado", "Archivo", "Concepto")
+        """
         if not table_values or len(table_values) < 2:
             return set()
 
         header = [str(x).strip() for x in (table_values[0] or [])]
-        try:
-            i1 = header.index(key_cols[0])
-            i2 = header.index(key_cols[1])
-        except ValueError:
-            return set()
 
-        existing: Set[Tuple[str, str]] = set()
+        idxs = []
+        for col in key_cols:
+            try:
+                idxs.append(header.index(col))
+            except ValueError:
+                print(f"[Workbook] Columna de llave no encontrada en tabla: {col}")
+                return set()
+
+        existing: Set[Tuple[str, ...]] = set()
+
         for row in table_values[1:]:
-            v1 = str(row[i1]).strip() if i1 < len(row) and row[i1] is not None else ""
-            v2 = str(row[i2]).strip() if i2 < len(row) and row[i2] is not None else ""
-            if v1 and v2:
-                existing.add((v1, v2))
+            vals = []
+            ok = True
+
+            for idx in idxs:
+                v = str(row[idx]).strip() if idx < len(row) and row[idx] is not None else ""
+                if not v:
+                    ok = False
+                    break
+                vals.append(v)
+
+            if ok:
+                existing.add(tuple(vals))
+
         return existing
 
     @staticmethod
@@ -169,20 +190,53 @@ class ExcelWorkbookGraph:
         self,
         table_name: str,
         rows_dicts: List[Dict[str, Any]],
-        key_cols: Tuple[str, str] = ("Archivo", "Concepto"),
+        key_cols: Tuple[str, ...] = ("Radicado", "Archivo", "Concepto"),
         require_table: bool = True,
         retries: int = 2,
         retry_sleep: float = 1.0,
     ) -> int:
         """
-        1) Abre sesión workbook
-        2) Verifica que exista la tabla (si require_table=True)
-        3) Lee tabla
-        4) Dedupe por key_cols
-        5) Inserta solo nuevas
+        Reglas críticas:
+        - NO insertar filas sin Concepto
+        - NO insertar filas con llave incompleta
+        - dedupe por (Radicado, Archivo, Concepto)
         """
         if not rows_dicts:
             print("[Workbook] append_rows_dedup: rows_dicts vacío")
+            return 0
+
+        sanitized: List[Dict[str, Any]] = []
+        descartadas_sin_concepto = 0
+        descartadas_sin_llave = 0
+
+        for raw in rows_dicts:
+            if not isinstance(raw, dict):
+                continue
+
+            d = dict(raw)
+
+            concepto = str(d.get("Concepto", "")).strip()
+            if not concepto:
+                descartadas_sin_concepto += 1
+                continue
+
+            for col in key_cols:
+                if col in d and d[col] is not None:
+                    d[col] = str(d[col]).strip()
+
+            k = tuple(str(d.get(col, "")).strip() for col in key_cols)
+            if not all(k):
+                descartadas_sin_llave += 1
+                continue
+
+            sanitized.append(d)
+
+        if not sanitized:
+            print(
+                "[Workbook] No hay filas válidas para insertar. "
+                f"descartadas_sin_concepto={descartadas_sin_concepto} | "
+                f"descartadas_sin_llave={descartadas_sin_llave}"
+            )
             return 0
 
         session_id = self.create_session(persist_changes=True)
@@ -203,30 +257,16 @@ class ExcelWorkbookGraph:
                 raise RuntimeError(f"[Workbook] Tabla '{table_name}' sin encabezados.")
 
             existing = self._build_existing_keys(table_values, key_cols)
-
-            # Si solo existe el encabezado, no hay filas reales
             if len(table_values) <= 1:
                 existing = set()
 
             filtered: List[Dict[str, Any]] = []
-            seen_new: Set[Tuple[str, str]] = set()
+            seen_new: Set[Tuple[str, ...]] = set()
 
-            for d in rows_dicts:
-                k = (
-                    str(d.get(key_cols[0], "")).strip(),
-                    str(d.get(key_cols[1], "")).strip(),
-                )
-
-                # Si no tiene ambas claves, no la bloqueamos por dedupe
-                if not k[0] or not k[1]:
-                    filtered.append(d)
-                    continue
-
-                # Evitar duplicados dentro del mismo lote
+            for d in sanitized:
+                k = tuple(str(d.get(col, "")).strip() for col in key_cols)
                 if k in seen_new:
                     continue
-
-                # Si no existe en la tabla actual, se inserta
                 if k not in existing:
                     filtered.append(d)
                     seen_new.add(k)
@@ -234,9 +274,12 @@ class ExcelWorkbookGraph:
             print(
                 f"[Workbook] Tabla={table_name} | "
                 f"rows_dicts={len(rows_dicts)} | "
+                f"sanitized={len(sanitized)} | "
                 f"table_rows={max(len(table_values) - 1, 0)} | "
                 f"existing_keys={len(existing)} | "
-                f"filtered={len(filtered)}"
+                f"filtered={len(filtered)} | "
+                f"desc_sin_concepto={descartadas_sin_concepto} | "
+                f"desc_sin_llave={descartadas_sin_llave}"
             )
 
             if not filtered:
