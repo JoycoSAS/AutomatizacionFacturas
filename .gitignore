@@ -2,7 +2,7 @@
 adjuntos/
 extraidos/
 temp_check/
-
+audit/
 # Archivos de salida
 *.xlsx
 *.xls

@@ -6,8 +6,6 @@ import datetime
 import time
 import shutil
 import uuid
-import json
-import atexit
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 import xml.etree.ElementTree as ET
@@ -162,37 +160,6 @@ from services.m365.mail_graph import (
     buscar_mensajes_inbox_por_asunto,
 )
 
-# ============================================================
-# PRODUCCIÓN - MARCAR LEÍDO SOLO SI .env LO PERMITE
-# ============================================================
-# En producción debe respetar FACTURAS_MARCAR_LEIDO=0 para evitar 403
-# y para no modificar el estado de los correos manualmente.
-# ============================================================
-FACTURAS_MARCAR_LEIDO_CONTROLLER = _env_bool_controller("FACTURAS_MARCAR_LEIDO", "0")
-_MARCAR_LEIDO_SKIP_LOGGED = False
-
-
-def _marcar_mensaje_como_leido_si_corresponde(msg_id: str, contexto: str = "aprobadas") -> bool:
-    """
-    Respeta FACTURAS_MARCAR_LEIDO.
-
-    Si FACTURAS_MARCAR_LEIDO=0, no llama a Graph PATCH para marcar leído.
-    Esto evita errores 403 y mantiene los correos sin modificaciones.
-    """
-    global _MARCAR_LEIDO_SKIP_LOGGED
-
-    if not FACTURAS_MARCAR_LEIDO_CONTROLLER:
-        if not _MARCAR_LEIDO_SKIP_LOGGED:
-            print("⏭️ Marcar leído DESACTIVADO por FACTURAS_MARCAR_LEIDO=0. No se modificará el estado de los correos.")
-            _MARCAR_LEIDO_SKIP_LOGGED = True
-        return False
-
-    try:
-        return bool(marcar_mensaje_como_leido(msg_id))
-    except Exception as e:
-        print(f"⚠️ No se pudo marcar como leído ({contexto}): {e}")
-        return False
-
 from utils.pdf_utils import (
     extraer_texto_pdf,
     parse_identificadores_pdf,
@@ -200,6 +167,42 @@ from utils.pdf_utils import (
     extraer_totales_basicos_pdf,
     extraer_campos_basicos_pdf
 )
+
+
+# ============================================================
+# PATCH 2026-06-09B - MARCAR LEÍDO RESPETA .env
+# ============================================================
+# FACTURAS_MARCAR_LEIDO=0/False debe impedir cualquier PATCH
+# a Graph para marcar correos como leídos. Esto evita los 403
+# en producción cuando la app no tiene permisos de escritura sobre
+# el buzón o cuando se decidió no cambiar el estado del correo.
+# ============================================================
+
+_MARCAR_LEIDO_SKIP_LOGGED = False
+
+
+def _env_bool_marcar_leido_controller_20260609(name: str = "FACTURAS_MARCAR_LEIDO", default: str = "0") -> bool:
+    value = str(os.getenv(name, default) or default).strip().lower()
+    return value in {"1", "true", "yes", "si", "sí", "on"}
+
+
+def _marcar_mensaje_como_leido_si_corresponde(msg_id: str) -> bool:
+    global _MARCAR_LEIDO_SKIP_LOGGED
+
+    if not msg_id:
+        return False
+
+    if not _env_bool_marcar_leido_controller_20260609():
+        if not _MARCAR_LEIDO_SKIP_LOGGED:
+            print("⏭️ Marcar leído DESACTIVADO por FACTURAS_MARCAR_LEIDO=0. No se enviará PATCH a Graph.")
+            _MARCAR_LEIDO_SKIP_LOGGED = True
+        return False
+
+    try:
+        return bool(marcar_mensaje_como_leido(msg_id))
+    except Exception as e:
+        print(f"⚠️ No se pudo marcar como leído: {e}")
+        return False
 
 from services.aprobaciones_service import sincronizar_aprobaciones_en_facturas
 from services.m365.excel_workbook_graph import ExcelWorkbookGraph
@@ -214,212 +217,6 @@ CONCEPTOS_BASE_FIJOS = (
     "Retención en la fuente",
     "Total",
 )
-
-
-# ============================================================
-# RESUMEN CONSOLIDADO FINAL / CACHE AIDX INCREMENTAL
-# ============================================================
-# 2026-06-04
-# - Mantiene el main liviano: el controller registra el resumen de cada flujo.
-# - Al terminar el proceso completo imprime un consolidado final por atexit.
-# - Evita que el prefetch AIDX vuelva a revisar mensajes ya indexados/revisados.
-# ============================================================
-
-_RESUMENES_CONSOLIDADOS: Dict[str, Dict[str, object]] = {}
-_RESUMEN_CONSOLIDADO_IMPRESO = False
-
-AIDX_PREFETCH_SEEN_PATH = os.path.join(DATA_DIR, "state", "attachment_index_seen_messages.json")
-
-
-def _int_safe_controller(value, default: int = 0) -> int:
-    try:
-        if value is None:
-            return default
-        return int(value)
-    except Exception:
-        return default
-
-
-def _float_safe_controller(value, default: float = 0.0) -> float:
-    try:
-        if value is None:
-            return default
-        return float(value)
-    except Exception:
-        return default
-
-
-def _registrar_resumen_consolidado(nombre: str, resumen: Optional[Dict[str, object]]) -> Dict[str, object]:
-    nombre = str(nombre or "").strip().lower() or "flujo"
-    resumen = dict(resumen or {})
-    resumen.setdefault("flujo", nombre)
-    resumen.setdefault("estado_final", "FINALIZADO")
-    _RESUMENES_CONSOLIDADOS[nombre] = resumen
-    return resumen
-
-
-def _fmt_num_controller(value) -> str:
-    try:
-        return f"{int(value)}"
-    except Exception:
-        return str(value or 0)
-
-
-def _imprimir_resumen_consolidado_final():
-    global _RESUMEN_CONSOLIDADO_IMPRESO
-
-    if _RESUMEN_CONSOLIDADO_IMPRESO or not _RESUMENES_CONSOLIDADOS:
-        return
-
-    _RESUMEN_CONSOLIDADO_IMPRESO = True
-
-    aprob = _RESUMENES_CONSOLIDADOS.get("aprobadas") or {}
-    nota = (
-        _RESUMENES_CONSOLIDADOS.get("notas_credito")
-        or _RESUMENES_CONSOLIDADOS.get("no_aprobacion")
-        or {}
-    )
-
-    total_filas_local = _int_safe_controller(aprob.get("filas_local_total")) + _int_safe_controller(nota.get("filas_local_total"))
-    total_filas_web = _int_safe_controller(aprob.get("filas_web_total")) + _int_safe_controller(nota.get("filas_web_total"))
-    total_procesados = _int_safe_controller(aprob.get("procesados")) + _int_safe_controller(nota.get("procesados"))
-    total_con_filas = _int_safe_controller(aprob.get("con_filas")) + _int_safe_controller(nota.get("con_filas"))
-    total_sin_filas = _int_safe_controller(aprob.get("sin_filas")) + _int_safe_controller(nota.get("sin_filas"))
-    total_tiempo = _float_safe_controller(aprob.get("tiempo_total_s")) + _float_safe_controller(nota.get("tiempo_total_s"))
-
-    print("\n====================================================")
-    print("📌 RESUMEN CONSOLIDADO FINAL")
-    print("====================================================")
-
-    if aprob:
-        print("\nFLUJO 1/2 - APROBADAS NORMAL")
-        print(f"Estado: {aprob.get('estado_final', 'FINALIZADO')}")
-        print(f"Mensajes leídos: {_fmt_num_controller(aprob.get('mensajes_leidos'))}")
-        print(f"Mensajes pendientes: {_fmt_num_controller(aprob.get('mensajes_pendientes'))}")
-        print(f"Procesadas: {_fmt_num_controller(aprob.get('procesados'))}")
-        print(f"Match total: {_fmt_num_controller(aprob.get('match_total'))} | OK: {_fmt_num_controller(aprob.get('ok_total'))} | DIAN: {_fmt_num_controller(aprob.get('dian_total'))}")
-        print(f"Con filas: {_fmt_num_controller(aprob.get('con_filas'))} | Sin filas: {_fmt_num_controller(aprob.get('sin_filas'))}")
-        print(f"Filas locales: {_fmt_num_controller(aprob.get('filas_local_total'))}")
-        print(f"Filas web insertadas: {_fmt_num_controller(aprob.get('filas_web_total'))}")
-        print(f"Tiempo: {_float_safe_controller(aprob.get('tiempo_total_s')):.2f} s")
-
-    if nota:
-        print("\nFLUJO 2/2 - NOTAS CRÉDITO / NO REQUIERE APROBACIÓN")
-        print(f"Estado: {nota.get('estado_final', 'FINALIZADO')}")
-        print(f"Mensajes candidatos: {_fmt_num_controller(nota.get('mensajes_leidos'))}")
-        print(f"Mensajes pendientes: {_fmt_num_controller(nota.get('mensajes_pendientes'))}")
-        print(f"Procesados: {_fmt_num_controller(nota.get('procesados'))}")
-        print(f"Con filas: {_fmt_num_controller(nota.get('con_filas'))} | Sin registro: {_fmt_num_controller(nota.get('sin_filas'))}")
-        print(f"Filas locales: {_fmt_num_controller(nota.get('filas_local_total'))}")
-        print(f"Filas web insertadas: {_fmt_num_controller(nota.get('filas_web_total'))}")
-        print(f"Tiempo: {_float_safe_controller(nota.get('tiempo_total_s')):.2f} s")
-
-    print("\nTOTAL GENERAL")
-    print(f"Procesados: {total_procesados}")
-    print(f"Con filas: {total_con_filas} | Sin filas/registro: {total_sin_filas}")
-    print(f"Filas locales nuevas/actualizadas reportadas: {total_filas_local}")
-    print(f"Filas web insertadas reportadas: {total_filas_web}")
-    print(f"Tiempo total reportado: {total_tiempo:.2f} s")
-    print("Estado general: FINALIZADO")
-    print("====================================================\n")
-
-
-atexit.register(_imprimir_resumen_consolidado_final)
-
-
-def _leer_json_seguro_controller(path: str, default):
-    try:
-        if not path or not os.path.exists(path):
-            return default
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return default
-
-
-def _guardar_json_seguro_controller(path: str, data) -> None:
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = f"{path}.tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
-    except Exception as e:
-        print(f"[AIDX CACHE] No pude guardar cache de mensajes revisados: {e}")
-
-
-def _collect_msg_ids_from_any_controller(obj) -> set[str]:
-    ids: set[str] = set()
-
-    def walk(x):
-        if isinstance(x, dict):
-            mid = x.get("msg_id") or x.get("message_id") or x.get("id_mensaje")
-            if mid:
-                ids.add(str(mid))
-            for v in x.values():
-                walk(v)
-        elif isinstance(x, list):
-            for item in x:
-                walk(item)
-
-    walk(obj)
-    return ids
-
-
-def _aidx_msg_ids_ya_indexados_controller() -> set[str]:
-    data = _leer_json_seguro_controller(ATTACHMENT_INDEX_PATH, {})
-    return _collect_msg_ids_from_any_controller(data)
-
-
-def _leer_aidx_seen_controller() -> Dict[str, Dict[str, object]]:
-    data = _leer_json_seguro_controller(AIDX_PREFETCH_SEEN_PATH, {})
-    if not isinstance(data, dict):
-        return {}
-    return {str(k): (v if isinstance(v, dict) else {}) for k, v in data.items() if k}
-
-
-def _guardar_aidx_seen_controller(seen: Dict[str, Dict[str, object]], ttl_days: int = 365) -> None:
-    if not isinstance(seen, dict):
-        return
-
-    limite = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=max(1, int(ttl_days or 365)))
-    limpio: Dict[str, Dict[str, object]] = {}
-
-    for mid, info in seen.items():
-        if not mid:
-            continue
-        info = info if isinstance(info, dict) else {}
-        ts = str(info.get("seen_at") or "").strip()
-        if ts:
-            try:
-                dt = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=datetime.timezone.utc)
-                if dt < limite:
-                    continue
-            except Exception:
-                pass
-        limpio[str(mid)] = info
-
-    _guardar_json_seguro_controller(AIDX_PREFETCH_SEEN_PATH, limpio)
-
-
-def _aidx_seen_marcar_controller(
-    seen: Dict[str, Dict[str, object]],
-    msg_id: str,
-    *,
-    subject: str = "",
-    received_dt: str = "",
-    zip_count: int = 0,
-) -> None:
-    if not msg_id:
-        return
-    seen[str(msg_id)] = {
-        "seen_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "receivedDateTime": received_dt or "",
-        "subject": (subject or "")[:300],
-        "zip_count": int(zip_count or 0),
-    }
 
 
 def _float_seguro(valor) -> float:
@@ -893,6 +690,203 @@ def _clasificar_auditoria_detalle(
     return "OTRO", 0, ""
 
 
+
+
+# ============================================================
+# PATCH 2026-06-09 - CLASIFICACIÓN NO REQUIERE APROBACIÓN
+# ============================================================
+# Regla de negocio:
+# - Los correos que lleguen a "solo aprobadas" con asunto tipo
+#   "(No necesita aprobación)" también se registran.
+# - Nunca se registran cuentas de cobro ni solicitudes de anticipo,
+#   aunque Outlook las mueva por error a la carpeta.
+# - La regla de Outlook ayuda a mover correos, pero esta validación
+#   en Python es la protección real antes de procesar.
+# ============================================================
+
+NO_REQUIERE_APROBACION_MARKERS = (
+    "no necesita aprobacion",
+    "no necesita aprobación",
+    "no requiere aprobacion",
+    "no requiere aprobación",
+)
+
+EXCLUIR_NO_FACTURA_MARKERS = (
+    "cuenta de cobro",
+    "cuentas de cobro",
+    "solicitud anticipo",
+    "solicitud de anticipo",
+)
+
+TIPO_PROCESO_APROBADA_NORMAL = "APROBADA_NORMAL"
+TIPO_PROCESO_NO_REQUIERE_APROBACION = "NO_REQUIERE_APROBACION"
+TIPO_PROCESO_EXCLUIDO_NO_FACTURA = "EXCLUIDO_NO_FACTURA"
+
+
+def _norm_regla_no_aprobacion_20260609(value: str) -> str:
+    """Normaliza texto para reglas de asunto sin depender de tildes."""
+    return normalize_text(value or "")
+
+
+def _subject_contiene_no_requiere_aprobacion_20260609(subj: str) -> bool:
+    s = _norm_regla_no_aprobacion_20260609(subj)
+    return any(_norm_regla_no_aprobacion_20260609(x) in s for x in NO_REQUIERE_APROBACION_MARKERS)
+
+
+def _subject_es_excluido_no_factura_20260609(subj: str) -> Tuple[bool, str]:
+    s = _norm_regla_no_aprobacion_20260609(subj)
+
+    if "cuenta de cobro" in s or "cuentas de cobro" in s:
+        return True, "CUENTA_DE_COBRO"
+
+    # No se excluye cualquier anticipo a ciegas; se excluye la solicitud de anticipo.
+    if "anticipo" in s and "solicitud" in s:
+        return True, "SOLICITUD_ANTICIPO"
+
+    for marker in EXCLUIR_NO_FACTURA_MARKERS:
+        if _norm_regla_no_aprobacion_20260609(marker) in s:
+            return True, marker.upper().replace(" ", "_")
+
+    return False, ""
+
+
+def _clasificar_subject_proceso_aprobadas_20260609(subj: str) -> Dict[str, str]:
+    """
+    Clasifica el correo que ya está dentro de la carpeta de aprobadas.
+
+    Retorna:
+      - APROBADA_NORMAL
+      - NO_REQUIERE_APROBACION
+      - EXCLUIDO_NO_FACTURA
+    """
+    excluido, motivo = _subject_es_excluido_no_factura_20260609(subj)
+    if excluido:
+        return {
+            "tipo_proceso": TIPO_PROCESO_EXCLUIDO_NO_FACTURA,
+            "motivo": motivo or "EXCLUIDO_NO_FACTURA",
+        }
+
+    if _subject_contiene_no_requiere_aprobacion_20260609(subj):
+        return {
+            "tipo_proceso": TIPO_PROCESO_NO_REQUIERE_APROBACION,
+            "motivo": "NO_NECESITA_APROBACION",
+        }
+
+    return {
+        "tipo_proceso": TIPO_PROCESO_APROBADA_NORMAL,
+        "motivo": "",
+    }
+
+
+def _limpiar_marcador_no_requiere_aprobacion_subject_20260609(value: str) -> str:
+    """Quita el sufijo visual '(No necesita aprobación)' del asunto/proyecto."""
+    s = str(value or "").strip()
+    if not s:
+        return ""
+
+    patrones = [
+        r"\(\s*no\s+necesita\s+aprobaci[oó]n\s*\)",
+        r"\(\s*no\s+requiere\s+aprobaci[oó]n\s*\)",
+        r"no\s+necesita\s+aprobaci[oó]n",
+        r"no\s+requiere\s+aprobaci[oó]n",
+    ]
+    out = s
+    for pat in patrones:
+        out = re.sub(pat, "", out, flags=re.IGNORECASE)
+    out = re.sub(r"\s+", " ", out).strip(" -()")
+    return out.strip()
+
+
+def _ajustar_parse_subject_no_requiere_aprobacion_20260609(out: Dict[str, str], subj: str) -> Dict[str, str]:
+    """
+    Ajusta Radicado/Empresa/Proyecto cuando el asunto es de no requiere aprobación.
+
+    Ejemplo:
+      Factura - A515152090 - Radicado 192918 - SERVIENTREGA SA - FAC - Pto. Salgar (No necesita aprobación)
+
+    Resultado esperado:
+      empresa_subject = SERVIENTREGA SA
+      proyecto_subject = Pto. Salgar
+      tipo_proceso_subject = NO_REQUIERE_APROBACION
+    """
+    out = dict(out or {})
+
+    if not _subject_contiene_no_requiere_aprobacion_20260609(subj):
+        return out
+
+    out["tipo_proceso_subject"] = TIPO_PROCESO_NO_REQUIERE_APROBACION
+
+    s_limpio = _limpiar_marcador_no_requiere_aprobacion_subject_20260609(subj)
+    s_limpio = s_limpio.replace("–", "-").replace("—", "-")
+    s_limpio = re.sub(r"\s+", " ", s_limpio).strip()
+
+    # Reforzar radicado.
+    m_rad = re.search(r"Radicado\s+(\d{4,20})", s_limpio, flags=re.IGNORECASE)
+    if m_rad:
+        out["radicado_subject"] = m_rad.group(1).strip()
+
+    # Reforzar número entre tipo de documento y Radicado.
+    m_num = re.search(
+        r"(?:Nota\s+Cr[eé]dito|Nota\s+Credito|Nota\s+D[eé]bito|Nota\s+Debito|Factura|P[oó]liza|Poliza)"
+        r"\s*-\s*(.*?)\s*-\s*Radicado\s+\d+",
+        s_limpio,
+        flags=re.IGNORECASE,
+    )
+    if m_num:
+        numero_raw = (m_num.group(1) or "").strip()
+        numero_raw = numero_raw.replace("–", "-").replace("—", "-")
+        numero_raw = re.sub(r"\s*-\s*", "-", numero_raw)
+        numero_raw = re.sub(r"\s+", " ", numero_raw).strip()
+        if numero_raw:
+            out["numero_subject"] = numero_raw
+
+    # Reforzar empresa/proyecto después del Radicado.
+    m_post = re.search(r"Radicado\s+\d+\s*-\s*(.*?)\s*$", s_limpio, flags=re.IGNORECASE)
+    if m_post:
+        cola = (m_post.group(1) or "").strip()
+        partes = [
+            _limpiar_marcador_no_requiere_aprobacion_subject_20260609(p.strip())
+            for p in cola.split(" - ")
+            if _limpiar_marcador_no_requiere_aprobacion_subject_20260609(p.strip())
+        ]
+
+        if len(partes) >= 1:
+            out["empresa_subject"] = partes[0]
+
+        if len(partes) >= 2:
+            tipo_intermedio = _norm_regla_no_aprobacion_20260609(partes[1])
+            if partes[-1].strip().upper() == "NA" and len(partes) >= 3:
+                proyecto = partes[-2]
+            elif tipo_intermedio in {"fac", "fact", "factura", "nc", "nota credito", "nd", "nota debito"} and len(partes) >= 3:
+                proyecto = partes[-1]
+            else:
+                # Para no requiere aprobación suele ser más confiable el último segmento útil.
+                proyecto = partes[-1]
+
+            try:
+                proyecto = _limpiar_proyecto_subject_controller_20260513(proyecto)
+            except Exception:
+                pass
+            out["proyecto_subject"] = proyecto
+
+    for k in ("numero_subject", "empresa_subject", "proyecto_subject"):
+        if out.get(k):
+            out[k] = _limpiar_marcador_no_requiere_aprobacion_subject_20260609(out.get(k) or "")
+
+    return out
+
+
+def _fuente_con_tipo_proceso_20260609(fuente: str, subj: str) -> str:
+    info = _clasificar_subject_proceso_aprobadas_20260609(subj)
+    tipo = info.get("tipo_proceso") or TIPO_PROCESO_APROBADA_NORMAL
+    if tipo == TIPO_PROCESO_APROBADA_NORMAL:
+        return fuente or ""
+    base = str(fuente or "").strip()
+    if base:
+        if tipo not in base:
+            return f"{base}|{tipo}"
+        return base
+    return tipo
 def _push_detalle(
     detalle_rows: list,
     run_id: str,
@@ -928,6 +922,14 @@ def _push_detalle(
 
     if filas_generadas is None:
         filas_generadas = int(nuevos or 0)
+
+    try:
+        fuente = _fuente_con_tipo_proceso_20260609(fuente, subj)
+        info_tipo = _clasificar_subject_proceso_aprobadas_20260609(subj)
+        if info_tipo.get("tipo_proceso") == TIPO_PROCESO_NO_REQUIERE_APROBACION and not motivo_no_registro:
+            motivo_no_registro = "NO_NECESITA_APROBACION" if int(filas_generadas or 0) <= 0 else motivo_no_registro
+    except Exception:
+        pass
 
     detalle_rows.append({
         "run_id": run_id,
@@ -2210,22 +2212,11 @@ def _build_zip_index(
 
     print(f"📦 Prefetch ZIPs: {len(candidatos)} mensajes candidatos (ventana {since_days} día(s))")
 
-    # Cache incremental del prefetch:
-    # Si un mensaje ya fue revisado o ya tiene ZIPs en AttachmentIndexStore,
-    # no volvemos a listar/descargar sus adjuntos en cada corrida.
-    aidx_seen = _leer_aidx_seen_controller()
-    aidx_msg_ids = _aidx_msg_ids_ya_indexados_controller()
-    aidx_skip_revisados = 0
-
     vistos_zip_ids = set()
 
     for i_msg, imsg in enumerate(candidatos, start=1):
         mid = imsg.get("id")
         if not mid:
-            continue
-
-        if str(mid) in aidx_msg_ids or str(mid) in aidx_seen:
-            aidx_skip_revisados += 1
             continue
 
         try:
@@ -2243,14 +2234,6 @@ def _build_zip_index(
             )
         except Exception:
             pass
-
-        _aidx_seen_marcar_controller(
-            aidx_seen,
-            str(mid),
-            subject=imsg.get("subject") or "",
-            received_dt=imsg.get("receivedDateTime", "") or "",
-            zip_count=len(zips),
-        )
 
         if not zips:
             continue
@@ -2347,15 +2330,9 @@ def _build_zip_index(
 
             if len(idx_cufe) >= 2500 and len(idx_num_match) >= 2500:
                 print("🛑 Índice suficiente; deteniendo prefetch temprano.")
-                if aidx_skip_revisados:
-                    print(f"⚡ [AIDX CACHE] Mensajes omitidos por cache/index histórico: {aidx_skip_revisados}")
-                _guardar_aidx_seen_controller(aidx_seen, ttl_days=ATTACHMENT_INDEX_TTL_DAYS)
                 print(f"✅ Índice parcial: {len(idx_cufe)} por CUFE, {len(idx_num)} por NUMERO, {len(idx_num_match)} por MATCH")
                 return idx_cufe, idx_num, idx_num_match
 
-    if aidx_skip_revisados:
-        print(f"⚡ [AIDX CACHE] Mensajes omitidos por cache/index histórico: {aidx_skip_revisados}")
-    _guardar_aidx_seen_controller(aidx_seen, ttl_days=ATTACHMENT_INDEX_TTL_DAYS)
     print(f"✅ Índice listo: {len(idx_cufe)} por CUFE, {len(idx_num)} por NUMERO, {len(idx_num_match)} por MATCH")
     return idx_cufe, idx_num, idx_num_match
 
@@ -3740,7 +3717,7 @@ def _registrar_desde_pdf_aprobado_fallback(
             })
 
         try:
-            _marcar_mensaje_como_leido_si_corresponde(msg_id, contexto="aprobadas")
+            _marcar_mensaje_como_leido_si_corresponde(msg_id)
         except Exception as e:
             print(f"⚠️ No se pudo marcar como leído: {e}")
 
@@ -3992,7 +3969,7 @@ def _procesar_pdf_aprobadas_como_ultimo_recurso(
         })
 
     try:
-        _marcar_mensaje_como_leido_si_corresponde(msg_id, contexto="aprobadas")
+        _marcar_mensaje_como_leido_si_corresponde(msg_id)
     except Exception as e:
         print(f"⚠️ No se pudo marcar como leído: {e}")
 
@@ -4235,7 +4212,7 @@ def _registrar_desde_pdf_origen_unico(
             })
 
         try:
-            _marcar_mensaje_como_leido_si_corresponde(msg_id, contexto="aprobadas")
+            _marcar_mensaje_como_leido_si_corresponde(msg_id)
         except Exception as e:
             print(f"⚠️ No se pudo marcar como leído: {e}")
 
@@ -4460,7 +4437,7 @@ def _registrar_minimo_obligatorio_desde_aprobadas(
             })
 
         try:
-            _marcar_mensaje_como_leido_si_corresponde(msg_id, contexto="aprobadas")
+            _marcar_mensaje_como_leido_si_corresponde(msg_id)
         except Exception as e:
             print(f"⚠️ No se pudo marcar como leído (registro mínimo): {e}")
 
@@ -4736,26 +4713,11 @@ def run_desde_aprobadas(
     folder_id = get_folder_id_by_name("Inbox", APROB_FOLDER_NAME) or find_folder_id_anywhere(APROB_FOLDER_NAME)
     if not folder_id:
         print(f"[APROB] No se encontró la carpeta: {APROB_FOLDER_NAME!r}")
-        total_secs = time.perf_counter() - t0_total
-        resumen_final = _registrar_resumen_consolidado("aprobadas", {
-            "estado_final": "SIN_CARPETA",
-            "mensajes_leidos": 0,
-            "mensajes_pendientes": 0,
-            "procesados": 0,
-            "match_total": 0,
-            "ok_total": 0,
-            "dian_total": 0,
-            "con_filas": 0,
-            "sin_filas": 0,
-            "filas_local_total": 0,
-            "filas_web_total": 0,
-            "tiempo_total_s": round(total_secs, 3),
-        })
         try:
             lock.release()
         except Exception:
             pass
-        return resumen_final
+        return
 
     modo_lectura = "solo NO leídos" if (unread_only is True or unread_only is None) else "todos"
     print(f"📬 Leyendo carpeta de aprobadas ({modo_lectura}): {APROB_FOLDER_NAME}")
@@ -4772,25 +4734,11 @@ def run_desde_aprobadas(
         print("ℹ️ No hay mensajes para procesar en la carpeta de aprobadas.")
         total_secs = time.perf_counter() - t0_total
         print(f"⏱️ Tiempo total real: {total_secs:.2f} s")
-        resumen_final = _registrar_resumen_consolidado("aprobadas", {
-            "estado_final": "SIN_MENSAJES",
-            "mensajes_leidos": 0,
-            "mensajes_pendientes": 0,
-            "procesados": 0,
-            "match_total": 0,
-            "ok_total": 0,
-            "dian_total": 0,
-            "con_filas": 0,
-            "sin_filas": 0,
-            "filas_local_total": 0,
-            "filas_web_total": 0,
-            "tiempo_total_s": round(total_secs, 3),
-        })
         try:
             lock.release()
         except Exception:
             pass
-        return resumen_final
+        return
 
     msgs_pendientes = []
     for m in msgs:
@@ -4816,25 +4764,11 @@ def run_desde_aprobadas(
 
         total_secs = time.perf_counter() - t0_total
         print(f"⏱️ Tiempo total real: {total_secs:.2f} s")
-        resumen_final = _registrar_resumen_consolidado("aprobadas", {
-            "estado_final": "SIN_PENDIENTES_PROCESSED_STORE",
-            "mensajes_leidos": msgs_leidos,
-            "mensajes_pendientes": 0,
-            "procesados": 0,
-            "match_total": 0,
-            "ok_total": 0,
-            "dian_total": 0,
-            "con_filas": 0,
-            "sin_filas": 0,
-            "filas_local_total": 0,
-            "filas_web_total": 0,
-            "tiempo_total_s": round(total_secs, 3),
-        })
         try:
             lock.release()
         except Exception:
             pass
-        return resumen_final
+        return
 
     msgs = msgs_pendientes
 
@@ -4912,6 +4846,49 @@ def run_desde_aprobadas(
         t0 = time.perf_counter()
         msg_id = msg["id"]
         subj = msg.get("subject") or ""
+
+        tipo_info_msg = _clasificar_subject_proceso_aprobadas_20260609(subj)
+        tipo_proceso_msg = tipo_info_msg.get("tipo_proceso") or TIPO_PROCESO_APROBADA_NORMAL
+        motivo_tipo_msg = tipo_info_msg.get("motivo") or ""
+
+        if tipo_proceso_msg == TIPO_PROCESO_EXCLUIDO_NO_FACTURA:
+            print(
+                f"⛔ [NO REQUIERE APROBACIÓN] Correo excluido por regla de seguridad: "
+                f"motivo={motivo_tipo_msg} | asunto={subj[:180]}"
+            )
+
+            if usar_processed_store:
+                store.mark_processed(msg_id, {
+                    "status": "omitido_no_factura",
+                    "motivo": motivo_tipo_msg or "EXCLUIDO_NO_FACTURA",
+                    "fuente": TIPO_PROCESO_EXCLUIDO_NO_FACTURA,
+                    "subject": subj,
+                })
+
+            _push_detalle(
+                detalle_rows, run_id, msg_id, subj,
+                pdf_name="",
+                estado="omitido_no_factura",
+                duracion_s=(time.perf_counter() - t0),
+                nuevos=0,
+                enriquecidas=0,
+                fuente=TIPO_PROCESO_EXCLUIDO_NO_FACTURA,
+                error=motivo_tipo_msg or "EXCLUIDO_NO_FACTURA",
+                tipo_resultado="OMITIDO_NO_FACTURA",
+                filas_generadas=0,
+                motivo_no_registro=motivo_tipo_msg or "EXCLUIDO_NO_FACTURA",
+            )
+
+            msgs_procesados += 1
+            cnt_sin_match += 1
+            facturas_sin_registro += 1
+            procesados += 1
+            sin_match_consec = 0
+            sin_nuevos_consec = 0
+            continue
+
+        if tipo_proceso_msg == TIPO_PROCESO_NO_REQUIERE_APROBACION:
+            print(f"🟢 [NO REQUIERE APROBACIÓN] Correo registrable detectado: {subj[:180]}")
 
         if usar_processed_store and store.is_processed(msg_id):
             print(f"⏭️  Mensaje ya procesado (store). Se omite. id={msg_id}")
@@ -5467,7 +5444,7 @@ def run_desde_aprobadas(
                     })
 
                 try:
-                    _marcar_mensaje_como_leido_si_corresponde(msg_id, contexto="aprobadas")
+                    _marcar_mensaje_como_leido_si_corresponde(msg_id)
                 except Exception as e:
                     print(f"⚠️ No se pudo marcar como leído: {e}")
 
@@ -5791,7 +5768,7 @@ def run_desde_aprobadas(
                     })
 
                 try:
-                    _marcar_mensaje_como_leido_si_corresponde(msg_id, contexto="aprobadas")
+                    _marcar_mensaje_como_leido_si_corresponde(msg_id)
                 except Exception as e:
                     print(f"⚠️ No se pudo marcar como leído: {e}")
 
@@ -6672,7 +6649,7 @@ def run_desde_aprobadas(
             })
 
         try:
-            _marcar_mensaje_como_leido_si_corresponde(msg_id, contexto="aprobadas")
+            _marcar_mensaje_como_leido_si_corresponde(msg_id)
         except Exception as e:
             print(f"⚠️ No se pudo marcar como leído: {e}")
 
@@ -6798,23 +6775,6 @@ def run_desde_aprobadas(
         except Exception as e:
             print(f"⚠️ No pude escribir audit runs CSV: {e}")
 
-    resumen_final = _registrar_resumen_consolidado("aprobadas", {
-        "estado_final": "FINALIZADO",
-        "mensajes_leidos": msgs_leidos,
-        "mensajes_pendientes": msgs_pendientes_count,
-        "procesados": msgs_procesados,
-        "match_total": total_match,
-        "ok_total": ok_total,
-        "dian_total": dian_total,
-        "con_filas": facturas_con_filas,
-        "sin_filas": facturas_sin_registro,
-        "filas_local_total": filas_local_total,
-        "filas_web_total": filas_web_total,
-        "nuevos_total": nuevos_total,
-        "enriquecidas_total": enriq_total,
-        "tiempo_total_s": round(total_secs, 3),
-    })
-
     print("\n===== 📊 Resumen inteligente por factura =====")
     print(f"Procesadas: {msgs_procesados}")
     print(f"Match total: {total_match} | OK: {ok_total} | DIAN: {dian_total}")
@@ -6833,8 +6793,6 @@ def run_desde_aprobadas(
         lock.release()
     except Exception:
         pass
-
-    return resumen_final
 
 # =====================================================================
 # PATCH 2026-05-13 - Refuerzo lote parciales / no pisar pdf_utils
@@ -7369,6 +7327,11 @@ def _parse_datos_desde_subject_aprobado(subj: str) -> Dict[str, str]:
     if ext.get("tipo_documento_subject"):
         out["tipo_documento_subject"] = ext.get("tipo_documento_subject", "")
 
+    try:
+        out = _ajustar_parse_subject_no_requiere_aprobacion_20260609(out, subj)
+    except Exception as e:
+        print(f"[NO REQUIERE APROBACIÓN] No se pudo ajustar subject: {e}")
+
     return out
 
 
@@ -7758,7 +7721,7 @@ def run_notas_credito_inbox_prueba(
     Flujo temporal/controlado para validar documentos que no requieren aprobación.
 
     Reglas de seguridad:
-    - Busca SOLO en Bandeja de entrada por asunto "nota crédito"/"nota credito".
+    - Busca SOLO en Bandeja de entrada por asunto base "nota".
     - Procesa máximo max_correos.
     - NO marca como leído por defecto.
     - NO usa ProcessedStore por defecto para no afectar pruebas.
@@ -7788,19 +7751,17 @@ def run_notas_credito_inbox_prueba(
     print("==================================================\n")
 
     candidatos: List[Dict[str, object]] = []
-    # Una sola pasada: buscamos "nota" y filtramos localmente normalizando tildes.
-    # Antes se escaneaba Inbox dos veces: "nota credito" y "nota crédito".
-    termino_busqueda = "nota"
+    termino = "nota"
     try:
         lote = buscar_mensajes_inbox_por_asunto(
-            asunto_contiene=termino_busqueda,
-            top=max(50, int(max_correos or 5) * 10),
+            asunto_contiene=termino,
+            top=max(20, int(max_correos or 5) * 5),
             since_days=since_days,
         ) or []
         candidatos.extend(lote)
-        print(f"[NO APROBACIÓN] Búsqueda única {termino_busqueda!r}: {len(lote)} mensaje(s)")
+        print(f"[NO APROBACIÓN] Búsqueda única {termino!r}: {len(lote)} mensaje(s)")
     except Exception as e:
-        print(f"[NO APROBACIÓN] Error buscando {termino_busqueda!r}: {e}")
+        print(f"[NO APROBACIÓN] Error buscando {termino!r}: {e}")
 
     candidatos = _dedup_msgs_por_id_20260526(candidatos)
     candidatos = [m for m in candidatos if _subject_es_nota_credito_prueba_20260526(m.get("subject") or "")]
@@ -7814,23 +7775,11 @@ def run_notas_credito_inbox_prueba(
 
     if not msgs:
         print("ℹ️ No hay correos de prueba por procesar.")
-        total_secs = time.perf_counter() - t0_total
-        resumen_final = _registrar_resumen_consolidado("notas_credito", {
-            "estado_final": "SIN_PENDIENTES",
-            "mensajes_leidos": msgs_leidos,
-            "mensajes_pendientes": msgs_pendientes_count,
-            "procesados": 0,
-            "con_filas": 0,
-            "sin_filas": 0,
-            "filas_local_total": 0,
-            "filas_web_total": 0,
-            "tiempo_total_s": round(total_secs, 3),
-        })
         try:
             lock.release()
         except Exception:
             pass
-        return resumen_final
+        return
 
     fecha_local = datetime.datetime.now().strftime("%Y-%m-%d")
     hora_local = datetime.datetime.now().strftime("%H:%M:%S")
@@ -7951,7 +7900,7 @@ def run_notas_credito_inbox_prueba(
 
         if marcar_leido:
             try:
-                _marcar_mensaje_como_leido_si_corresponde(msg_id, contexto="aprobadas")
+                _marcar_mensaje_como_leido_si_corresponde(msg_id)
             except Exception as e:
                 print(f"[NO APROBACIÓN] ⚠️ No se pudo marcar como leído: {e}")
         else:
@@ -8018,20 +7967,6 @@ def run_notas_credito_inbox_prueba(
         except Exception as e:
             print(f"⚠️ No pude escribir audit runs CSV: {e}")
 
-    resumen_final = _registrar_resumen_consolidado("notas_credito", {
-        "estado_final": "FINALIZADO",
-        "mensajes_leidos": msgs_leidos,
-        "mensajes_pendientes": msgs_pendientes_count,
-        "procesados": msgs_procesados,
-        "con_filas": facturas_con_filas,
-        "sin_filas": facturas_sin_registro,
-        "filas_local_total": filas_local_total,
-        "filas_web_total": filas_web_total,
-        "nuevos_total": nuevos_total,
-        "enriquecidas_total": enriq_total,
-        "tiempo_total_s": round(total_secs, 3),
-    })
-
     print("\n===== 📊 Resumen inteligente NOTA CRÉDITO INBOX =====")
     print(f"Mensajes leídos candidatos: {msgs_leidos}")
     print(f"Mensajes pendientes: {msgs_pendientes_count}")
@@ -8053,9 +7988,7 @@ def run_notas_credito_inbox_prueba(
     except Exception:
         pass
 
-    return resumen_final
 
 
 
-
-print("🔥 CONTROLLER VERSION ACTIVA: 2026-06-05-RESUMEN-AIDX-NOTA-UNICA-MARCAR-LEIDO-ENV")
+print("🔥 CONTROLLER VERSION ACTIVA: 2026-06-09B-NO-REQUIERE-APROBACION-GUARDRAIL-MARCAR-ENV-NOTA-UNICA")
