@@ -132,6 +132,57 @@ APROB_SEARCH_SINCE_DAYS = _env_int(
     _env_int("FACTURAS_SINCE_DAYS", 6),
 )
 
+# ============================================================
+# Modo histórico / reproceso controlado
+# ============================================================
+# Estas variables NO cambian el comportamiento de producción normal.
+#
+# Uso esperado para corrida histórica:
+#   FACTURAS_MODO=HISTORICO
+#   FACTURAS_ORDEN_HISTORICO=ASC
+#   FACTURAS_PROCESAR_ANTIGUOS_PRIMERO=1
+#   FACTURAS_HISTORICO_DESDE=2026-04-01
+#   FACTURAS_HISTORICO_HASTA=2026-06-09
+#   FACTURAS_DISABLE_AUTOSTOP=1
+#   FACTURAS_HISTORICO_DRY_RUN=1
+#
+# FACTURAS_HISTORICO_DRY_RUN:
+#   True  = prueba segura del orden, sin escribir Excel ni procesar adjuntos.
+#   False = corrida real. Usar solo cuando ya validemos el orden.
+# ============================================================
+
+FACTURAS_MODO = _env_str("FACTURAS_MODO", "PRODUCCION").upper()
+if FACTURAS_MODO not in {"HISTORICO", "DIARIO", "PRODUCCION", "PRODUCCIÓN"}:
+    print(f"⚠️ config.py: FACTURAS_MODO inválido={FACTURAS_MODO!r}. Uso PRODUCCION.")
+    FACTURAS_MODO = "PRODUCCION"
+
+FACTURAS_ORDEN_HISTORICO = _env_str("FACTURAS_ORDEN_HISTORICO", "").upper()
+if FACTURAS_ORDEN_HISTORICO not in {"", "ASC", "DESC"}:
+    print(
+        "⚠️ config.py: FACTURAS_ORDEN_HISTORICO inválido="
+        f"{FACTURAS_ORDEN_HISTORICO!r}. Uso vacío."
+    )
+    FACTURAS_ORDEN_HISTORICO = ""
+
+FACTURAS_PROCESAR_ANTIGUOS_PRIMERO = _env_bool(
+    "FACTURAS_PROCESAR_ANTIGUOS_PRIMERO",
+    FACTURAS_ORDEN_HISTORICO == "ASC",
+)
+
+FACTURAS_HISTORICO_DESDE = _env_str("FACTURAS_HISTORICO_DESDE", "")
+FACTURAS_HISTORICO_HASTA = _env_str("FACTURAS_HISTORICO_HASTA", "")
+
+FACTURAS_DISABLE_AUTOSTOP = _env_bool("FACTURAS_DISABLE_AUTOSTOP", False)
+FACTURAS_HISTORICO_DRY_RUN = _env_bool("FACTURAS_HISTORICO_DRY_RUN", False)
+
+FACTURAS_HISTORICO_ASC_ACTIVO = (
+    FACTURAS_MODO == "HISTORICO"
+    and (
+        FACTURAS_ORDEN_HISTORICO == "ASC"
+        or FACTURAS_PROCESAR_ANTIGUOS_PRIMERO
+    )
+)
+
 
 # ============================================================
 # Match
@@ -171,9 +222,16 @@ APROB_CAT_ERROR = _env_str("APROB_CAT_ERROR", "AprobMatchError")
 #   AUTO_STOP_SIN_MATCH_CONSEC=5
 # ============================================================
 
-AUTO_STOP_MIN_PROCESADOS = _env_int("AUTO_STOP_MIN_PROCESADOS", 3)
-AUTO_STOP_SIN_NUEVOS_CONSEC = _env_int("AUTO_STOP_SIN_NUEVOS_CONSEC", 3)
-AUTO_STOP_SIN_MATCH_CONSEC = _env_int("AUTO_STOP_SIN_MATCH_CONSEC", 5)
+if FACTURAS_DISABLE_AUTOSTOP:
+    # En histórico no conviene cortar por repetidos/sin match,
+    # porque se busca recorrer una ventana grande y cronológica.
+    AUTO_STOP_MIN_PROCESADOS = 999999999
+    AUTO_STOP_SIN_NUEVOS_CONSEC = 999999999
+    AUTO_STOP_SIN_MATCH_CONSEC = 999999999
+else:
+    AUTO_STOP_MIN_PROCESADOS = _env_int("AUTO_STOP_MIN_PROCESADOS", 3)
+    AUTO_STOP_SIN_NUEVOS_CONSEC = _env_int("AUTO_STOP_SIN_NUEVOS_CONSEC", 3)
+    AUTO_STOP_SIN_MATCH_CONSEC = _env_int("AUTO_STOP_SIN_MATCH_CONSEC", 5)
 
 
 # ============================================================
@@ -325,7 +383,10 @@ LOCK_FILE_APROBADAS = os.path.join(STATE_DIR, "aprobadas.lock")
 #
 # No poner demasiado bajo si una ejecución puede durar más que ese tiempo,
 # porque una segunda ejecución podría creer que el lock ya venció.
-LOCK_TTL_SECONDS = _env_int("LOCK_TTL_SECONDS", 3600)
+LOCK_TTL_SECONDS = _env_int(
+    "LOCK_TTL_SECONDS",
+    14400 if FACTURAS_MODO == "HISTORICO" else 3600,
+)
 
 
 # ============================================================
@@ -361,4 +422,4 @@ for _folder in [
 # Sello de versión
 # ============================================================
 
-print("🔥 CONFIG VERSION ACTIVA: 2026-06-04-ENV-PRODUCCION-AUTOSTOP-AIDX")
+print("🔥 CONFIG VERSION ACTIVA: 2026-06-09-HISTORICO-ASC-DRYRUN-AUTOSTOP")

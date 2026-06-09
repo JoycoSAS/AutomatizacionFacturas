@@ -887,6 +887,279 @@ def _fuente_con_tipo_proceso_20260609(fuente: str, subj: str) -> str:
             return f"{base}|{tipo}"
         return base
     return tipo
+
+
+# ============================================================
+# PATCH 2026-06-09C - MODO HISTÓRICO ASC / DRY-RUN SEGURO
+# ============================================================
+# Objetivo:
+# - En modo HISTORICO permitir ordenar mensajes de más antiguo a más reciente.
+# - Permitir filtro explícito por fechas recibidas.
+# - Permitir validar el orden con FACTURAS_HISTORICO_DRY_RUN=1 sin descargar
+#   adjuntos, sin procesar PDF/XML, sin escribir Excel y sin marcar correos.
+#
+# Variables .env soportadas:
+#   FACTURAS_MODO=HISTORICO
+#   FACTURAS_ORDEN_HISTORICO=ASC|DESC
+#   FACTURAS_PROCESAR_ANTIGUOS_PRIMERO=1
+#   FACTURAS_HISTORICO_DESDE=YYYY-MM-DD
+#   FACTURAS_HISTORICO_HASTA=YYYY-MM-DD
+#   FACTURAS_DISABLE_AUTOSTOP=1
+#   FACTURAS_HISTORICO_DRY_RUN=1
+#   FACTURAS_MAX_PROCESAR_HISTORICO=10
+#
+# Nota importante:
+# - FACTURAS_MAX_MENSAJES controla cuántos correos se LEEN desde Graph.
+# - FACTURAS_MAX_PROCESAR_HISTORICO controla cuántos correos ya ordenados
+#   se PROCESAN realmente en una prueba histórica controlada.
+# ============================================================
+
+_HISTORICO_DRY_RUN_SKIP_GRAPH_PATCH_LOGGED = False
+
+
+def _env_str_controller_20260609c(name: str, default: str = "") -> str:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    value = str(value).strip()
+    return value if value else default
+
+
+def _env_bool_controller_20260609c(name: str, default: str = "0") -> bool:
+    value = str(os.getenv(name, default) or default).strip().lower()
+    return value in {"1", "true", "yes", "y", "si", "sí", "on"}
+
+
+def _facturas_modo_controller_20260609c() -> str:
+    return _env_str_controller_20260609c("FACTURAS_MODO", "PRODUCCION").upper()
+
+
+def _historico_activo_controller_20260609c() -> bool:
+    return _facturas_modo_controller_20260609c() == "HISTORICO"
+
+
+def _orden_historico_controller_20260609c() -> str:
+    orden = _env_str_controller_20260609c("FACTURAS_ORDEN_HISTORICO", "").upper()
+    if orden not in {"ASC", "DESC", ""}:
+        print(f"⚠️ FACTURAS_ORDEN_HISTORICO inválido={orden!r}. Se ignora.")
+        return ""
+    return orden
+
+
+def _procesar_antiguos_primero_controller_20260609c() -> bool:
+    return _env_bool_controller_20260609c("FACTURAS_PROCESAR_ANTIGUOS_PRIMERO", "0")
+
+
+def _historico_dry_run_controller_20260609c() -> bool:
+    return _env_bool_controller_20260609c("FACTURAS_HISTORICO_DRY_RUN", "0")
+
+
+def _max_procesar_historico_controller_20260609e() -> int:
+    """
+    Límite seguro para pruebas reales históricas.
+
+    Diferencia clave:
+    - FACTURAS_MAX_MENSAJES: cuántos correos se leen desde Graph.
+    - FACTURAS_MAX_PROCESAR_HISTORICO: cuántos correos ya filtrados y
+      ordenados se procesan realmente.
+
+    Con esto se puede leer 1000/5000 correos, ordenar desde abril ASC,
+    y procesar solo los primeros 10 antiguos en una prueba controlada.
+    """
+    raw = _env_str_controller_20260609c("FACTURAS_MAX_PROCESAR_HISTORICO", "0")
+    if not raw:
+        return 0
+
+    try:
+        value = int(str(raw).strip())
+    except Exception:
+        print(f"⚠️ FACTURAS_MAX_PROCESAR_HISTORICO inválido={raw!r}. Se ignora.")
+        return 0
+
+    if value <= 0:
+        return 0
+
+    return value
+
+
+def _disable_autostop_controller_20260609c() -> bool:
+    if _env_bool_controller_20260609c("FACTURAS_DISABLE_AUTOSTOP", "0"):
+        return True
+    # En histórico ASC se desactiva por seguridad para no cortar el recorrido
+    # al encontrar varios repetidos o sin nuevos.
+    if _historico_activo_controller_20260609c():
+        if _orden_historico_controller_20260609c() == "ASC" or _procesar_antiguos_primero_controller_20260609c():
+            return True
+    return False
+
+
+def _parse_date_env_controller_20260609c(name: str) -> Optional[datetime.date]:
+    raw = _env_str_controller_20260609c(name, "")
+    if not raw:
+        return None
+
+    raw = raw.strip()
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d"):
+        try:
+            return datetime.datetime.strptime(raw, fmt).date()
+        except Exception:
+            pass
+
+    print(f"⚠️ {name} inválida={raw!r}. Formato esperado YYYY-MM-DD. Se ignora.")
+    return None
+
+
+def _parse_received_dt_controller_20260609c(msg: Dict[str, object]) -> Optional[datetime.datetime]:
+    raw = (
+        msg.get("receivedDateTime")
+        or msg.get("received_datetime")
+        or msg.get("received")
+        or ""
+    )
+    raw = str(raw or "").strip()
+    if not raw:
+        return None
+
+    try:
+        dt = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt.astimezone(datetime.timezone.utc)
+    except Exception:
+        return None
+
+
+def _fecha_received_date_controller_20260609c(msg: Dict[str, object]) -> Optional[datetime.date]:
+    dt = _parse_received_dt_controller_20260609c(msg)
+    if not dt:
+        return None
+    return dt.date()
+
+
+def _aplicar_filtro_orden_historico_controller_20260609c(
+    msgs: List[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    """
+    Aplica filtro de fechas y orden histórico solo cuando corresponde.
+
+    No descarga adjuntos, no escribe archivos y no marca mensajes.
+    """
+    msgs = list(msgs or [])
+
+    modo = _facturas_modo_controller_20260609c()
+    orden = _orden_historico_controller_20260609c()
+    antiguos_primero = _procesar_antiguos_primero_controller_20260609c()
+    desde = _parse_date_env_controller_20260609c("FACTURAS_HISTORICO_DESDE")
+    hasta = _parse_date_env_controller_20260609c("FACTURAS_HISTORICO_HASTA")
+
+    aplicar = (
+        modo == "HISTORICO"
+        or bool(orden)
+        or antiguos_primero
+        or desde is not None
+        or hasta is not None
+    )
+
+    if not aplicar:
+        return msgs
+
+    total_inicial = len(msgs)
+    filtrados: List[Dict[str, object]] = []
+
+    for msg in msgs:
+        f = _fecha_received_date_controller_20260609c(msg)
+
+        # Si hay filtro explícito por fechas y el mensaje no tiene fecha,
+        # se deja por fuera para no procesar algo ambiguo en histórico.
+        if (desde or hasta) and not f:
+            continue
+
+        if desde and f and f < desde:
+            continue
+
+        if hasta and f and f > hasta:
+            continue
+
+        filtrados.append(msg)
+
+    if orden == "DESC":
+        reverse = True
+        etiqueta_orden = "DESC"
+    else:
+        # Si FACTURAS_PROCESAR_ANTIGUOS_PRIMERO=1 o HISTORICO sin orden,
+        # el comportamiento seguro es ASC.
+        reverse = False
+        etiqueta_orden = "ASC" if (orden == "ASC" or antiguos_primero or modo == "HISTORICO") else "SIN_ORDEN"
+
+    if etiqueta_orden in {"ASC", "DESC"}:
+        filtrados.sort(
+            key=lambda m: (
+                _parse_received_dt_controller_20260609c(m) or datetime.datetime.max.replace(tzinfo=datetime.timezone.utc),
+                str(m.get("id") or ""),
+            ),
+            reverse=reverse,
+        )
+
+    print("\n===== 🧭 MODO HISTÓRICO / ORDEN DE MENSAJES =====")
+    print(f"FACTURAS_MODO={modo}")
+    print(f"FACTURAS_ORDEN_HISTORICO={orden or '(vacío)'}")
+    print(f"FACTURAS_PROCESAR_ANTIGUOS_PRIMERO={antiguos_primero}")
+    print(f"FACTURAS_HISTORICO_DESDE={desde or '(sin filtro)'}")
+    print(f"FACTURAS_HISTORICO_HASTA={hasta or '(sin filtro)'}")
+    print(f"Mensajes antes de filtro histórico: {total_inicial}")
+    print(f"Mensajes después de filtro histórico: {len(filtrados)}")
+    print(f"Orden aplicado: {etiqueta_orden}")
+
+    if filtrados:
+        first_dt = _parse_received_dt_controller_20260609c(filtrados[0])
+        last_dt = _parse_received_dt_controller_20260609c(filtrados[-1])
+        print(f"Primer mensaje ordenado: {first_dt.isoformat() if first_dt else 'SIN_FECHA'} | {(filtrados[0].get('subject') or '')[:120]}")
+        print(f"Último mensaje ordenado: {last_dt.isoformat() if last_dt else 'SIN_FECHA'} | {(filtrados[-1].get('subject') or '')[:120]}")
+    print("=================================================\n")
+
+    return filtrados
+
+
+def _imprimir_historico_dry_run_controller_20260609c(
+    msgs: List[Dict[str, object]],
+    *,
+    since_days: int,
+    max_aprobados: int,
+    max_zip_buscar: int,
+    unread_only,
+    usar_processed_store: bool,
+) -> None:
+    """
+    Muestra el orden final de correos que se procesarían, sin procesarlos.
+    """
+    print("\n===== 🧪 HISTÓRICO DRY-RUN =====")
+    print("No se descargan adjuntos.")
+    print("No se procesan PDF/XML/ZIP.")
+    print("No se escribe facturas.xlsx.")
+    print("No se actualiza Excel Web.")
+    print("No se marca ningún correo como leído.")
+    print("No se modifica ProcessedStore.")
+    print("-------------------------------------------------")
+    print(f"since_days={since_days}")
+    print(f"max_aprobados={max_aprobados}")
+    print(f"max_zip_buscar={max_zip_buscar}")
+    max_proc_hist = _max_procesar_historico_controller_20260609e()
+    print(f"max_procesar_historico={max_proc_hist if max_proc_hist > 0 else '(sin límite de proceso real)'}")
+    print(f"unread_only={unread_only}")
+    print(f"usar_processed_store={usar_processed_store} (ignorado en dry-run)")
+    print(f"mensajes_en_orden={len(msgs or [])}")
+    print("-------------------------------------------------")
+
+    for i, msg in enumerate((msgs or []), start=1):
+        dt = _parse_received_dt_controller_20260609c(msg)
+        dt_txt = dt.isoformat() if dt else "SIN_FECHA"
+        subj = str(msg.get("subject") or "").replace("\n", " ").strip()
+        clasif = _clasificar_subject_proceso_aprobadas_20260609(subj)
+        tipo = clasif.get("tipo_proceso") or ""
+        motivo = clasif.get("motivo") or ""
+        print(f"{i:04d}. {dt_txt} | {tipo} | {motivo} | {subj[:180]}")
+
+    print("===== FIN HISTÓRICO DRY-RUN =====\n")
 def _push_detalle(
     detalle_rows: list,
     run_id: str,
@@ -4683,7 +4956,37 @@ def run_desde_aprobadas(
     since_days: Optional[int] = None,
     unread_only: Optional[bool] = None,
     usar_processed_store: bool = True,
+    orden_historico: Optional[str] = None,
+    procesar_antiguos_primero: Optional[bool] = None,
+    historico_desde: Optional[str] = None,
+    historico_hasta: Optional[str] = None,
+    disable_autostop: Optional[bool] = None,
+    historico_dry_run: Optional[bool] = None,
+    max_procesar_historico: Optional[int] = None,
 ):
+    # PATCH 2026-06-09D:
+    # El main nuevo detecta por firma si el controller soporta histórico/dry-run.
+    # Estos parámetros se aceptan explícitamente para que el main pueda pasar
+    # la configuración sin detenerse por seguridad. También se reflejan en
+    # os.environ para reutilizar los helpers históricos existentes de este archivo.
+    if orden_historico is not None:
+        os.environ["FACTURAS_ORDEN_HISTORICO"] = str(orden_historico or "")
+    if procesar_antiguos_primero is not None:
+        os.environ["FACTURAS_PROCESAR_ANTIGUOS_PRIMERO"] = "1" if bool(procesar_antiguos_primero) else "0"
+    if historico_desde is not None:
+        os.environ["FACTURAS_HISTORICO_DESDE"] = str(historico_desde or "")
+    if historico_hasta is not None:
+        os.environ["FACTURAS_HISTORICO_HASTA"] = str(historico_hasta or "")
+    if disable_autostop is not None:
+        os.environ["FACTURAS_DISABLE_AUTOSTOP"] = "1" if bool(disable_autostop) else "0"
+    if historico_dry_run is not None:
+        os.environ["FACTURAS_HISTORICO_DRY_RUN"] = "1" if bool(historico_dry_run) else "0"
+    if max_procesar_historico is not None:
+        try:
+            os.environ["FACTURAS_MAX_PROCESAR_HISTORICO"] = str(int(max_procesar_historico or 0))
+        except Exception:
+            os.environ["FACTURAS_MAX_PROCESAR_HISTORICO"] = "0"
+
     if since_days is None:
         since_days = APROB_SEARCH_SINCE_DAYS
 
@@ -4702,13 +5005,24 @@ def run_desde_aprobadas(
 
     store = ProcessedStore(PROCESSED_MESSAGES_PATH, ttl_days=PROCESSED_MESSAGES_TTL_DAYS)
 
+    historico_dry_run = _historico_dry_run_controller_20260609c()
+    autostop_deshabilitado = _disable_autostop_controller_20260609c()
+
+    if historico_dry_run:
+        print("🧪 FACTURAS_HISTORICO_DRY_RUN=1 activo: esta corrida solo validará orden. No habrá escrituras.")
+    if autostop_deshabilitado:
+        print("🧭 Auto-stop deshabilitado para esta corrida histórica/controlada.")
+
     aidx = AttachmentIndexStore(ATTACHMENT_INDEX_PATH, ttl_days=ATTACHMENT_INDEX_TTL_DAYS)
-    try:
-        purged = aidx.purge()
-        if purged:
-            print(f"🧹 [AIDX] Purge index: removidas {purged} entradas viejas.")
-    except Exception:
-        pass
+    if not historico_dry_run:
+        try:
+            purged = aidx.purge()
+            if purged:
+                print(f"🧹 [AIDX] Purge index: removidas {purged} entradas viejas.")
+        except Exception:
+            pass
+    else:
+        print("🧪 Dry-run: se omite purge de AIDX para no modificar estado local.")
 
     folder_id = get_folder_id_by_name("Inbox", APROB_FOLDER_NAME) or find_folder_id_anywhere(APROB_FOLDER_NAME)
     if not folder_id:
@@ -4740,16 +5054,30 @@ def run_desde_aprobadas(
             pass
         return
 
+    msgs = _aplicar_filtro_orden_historico_controller_20260609c(msgs)
+
+    if not msgs:
+        print("ℹ️ No quedaron mensajes después del filtro histórico por fecha/orden.")
+        total_secs = time.perf_counter() - t0_total
+        print(f"⏱️ Tiempo total real: {total_secs:.2f} s")
+        try:
+            lock.release()
+        except Exception:
+            pass
+        return
+
     msgs_pendientes = []
     for m in msgs:
         mid = m.get("id")
         if not mid:
             continue
 
-        if usar_processed_store:
+        if usar_processed_store and not historico_dry_run:
             if not store.is_processed(mid):
                 msgs_pendientes.append(m)
         else:
+            # En dry-run NO se consulta/respeta ProcessedStore para poder validar
+            # el orden real de todos los mensajes candidatos.
             msgs_pendientes.append(m)
 
     msgs_pendientes_count = len(msgs_pendientes)
@@ -4771,6 +5099,64 @@ def run_desde_aprobadas(
         return
 
     msgs = msgs_pendientes
+
+    if historico_dry_run:
+        _imprimir_historico_dry_run_controller_20260609c(
+            msgs,
+            since_days=since_days,
+            max_aprobados=max_aprobados,
+            max_zip_buscar=max_zip_buscar,
+            unread_only=unread_only,
+            usar_processed_store=usar_processed_store,
+        )
+        try:
+            n = borrar_pdfs_en_arbol(TMP_DIR)
+            print(f"🧹 Limpieza temp_check: borrados {n} PDF(s).")
+        except Exception:
+            pass
+
+        total_secs = time.perf_counter() - t0_total
+        print(f"⏱️ Tiempo total real: {total_secs:.2f} s")
+        try:
+            lock.release()
+        except Exception:
+            pass
+        return
+
+    # ============================================================
+    # PATCH 2026-06-09E - LÍMITE REAL HISTÓRICO CONTROLADO
+    # ============================================================
+    # En histórico real NO se debe usar FACTURAS_MAX_MENSAJES=10 para probar,
+    # porque Graph entrega primero los correos más recientes y el orden ASC se
+    # aplicaría sobre un lote ya recortado.
+    #
+    # Flujo correcto:
+    #   1) Leer muchos correos con FACTURAS_MAX_MENSAJES=1000/5000.
+    #   2) Filtrar por fechas.
+    #   3) Ordenar ASC antiguo -> reciente.
+    #   4) Procesar solo N con FACTURAS_MAX_PROCESAR_HISTORICO=10.
+    # ============================================================
+    max_proc_hist = _max_procesar_historico_controller_20260609e()
+    if (
+        max_proc_hist > 0
+        and _historico_activo_controller_20260609c()
+        and not historico_dry_run
+    ):
+        total_ordenado = len(msgs or [])
+        if total_ordenado > max_proc_hist:
+            msgs = msgs[:max_proc_hist]
+
+        print("\n===== 🧪 LÍMITE REAL HISTÓRICO CONTROLADO =====")
+        print(f"FACTURAS_MAX_MENSAJES/leídos Graph={max_aprobados}")
+        print(f"Mensajes históricos ordenados disponibles={total_ordenado}")
+        print(f"FACTURAS_MAX_PROCESAR_HISTORICO={max_proc_hist}")
+        print(f"Mensajes que se procesarán realmente={len(msgs or [])}")
+        if msgs:
+            first_dt = _parse_received_dt_controller_20260609c(msgs[0])
+            last_dt = _parse_received_dt_controller_20260609c(msgs[-1])
+            print(f"Primer procesable: {first_dt.isoformat() if first_dt else 'SIN_FECHA'} | {(msgs[0].get('subject') or '')[:120]}")
+            print(f"Último procesable: {last_dt.isoformat() if last_dt else 'SIN_FECHA'} | {(msgs[-1].get('subject') or '')[:120]}")
+        print("=================================================\n")
 
     # ============================================================
     # MUESTRA POR PROVEEDOR DESACTIVADA
@@ -6702,7 +7088,11 @@ def run_desde_aprobadas(
                 norm_cufes_existentes.add(cufe_pdf)
 
         procesados += 1
-        if (procesados >= AUTO_STOP_MIN_PROCESADOS) and (sin_nuevos_consec >= AUTO_STOP_SIN_NUEVOS_CONSEC):
+        if (
+            not autostop_deshabilitado
+            and (procesados >= AUTO_STOP_MIN_PROCESADOS)
+            and (sin_nuevos_consec >= AUTO_STOP_SIN_NUEVOS_CONSEC)
+        ):
             print("🛑 Deteniendo flujo: varios PDFs con match pero sin nuevos registros.")
             break
 
@@ -7991,4 +8381,4 @@ def run_notas_credito_inbox_prueba(
 
 
 
-print("🔥 CONTROLLER VERSION ACTIVA: 2026-06-09B-NO-REQUIERE-APROBACION-GUARDRAIL-MARCAR-ENV-NOTA-UNICA")
+print("🔥 CONTROLLER VERSION ACTIVA: 2026-06-09E-HISTORICO-ASC-MAX-PROCESAR-NO-REQUIERE-APROBACION")
