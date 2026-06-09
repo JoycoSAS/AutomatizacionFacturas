@@ -1,9 +1,76 @@
 import os
-from pathlib import Path
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+
+# ============================================================
+# HELPERS DE CONFIGURACIÓN
+# ============================================================
+
+def _env_str(name: str, default: str = "") -> str:
+    value = os.getenv(name)
+    if value is None:
+        return default
+
+    value = str(value).strip()
+    return value if value else default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+
+    if raw is None or str(raw).strip() == "":
+        return int(default)
+
+    try:
+        return int(str(raw).strip())
+    except Exception:
+        print(f"⚠️ config.py: variable {name} inválida={raw!r}. Uso default={default}.")
+        return int(default)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+
+    if raw is None or str(raw).strip() == "":
+        return bool(default)
+
+    value = str(raw).strip().lower()
+
+    if value in {"1", "true", "yes", "y", "si", "sí", "on"}:
+        return True
+
+    if value in {"0", "false", "no", "n", "off"}:
+        return False
+
+    print(f"⚠️ config.py: variable {name} inválida={raw!r}. Uso default={default}.")
+    return bool(default)
+
+
+def _path_from_base_or_absolute(path_value: str) -> str:
+    """
+    Permite usar rutas relativas o absolutas desde .env.
+
+    Ejemplos válidos:
+    - data/facturas.xlsx
+    - data/prod/facturas.xlsx
+    - C:/ruta/local/facturas.xlsx
+    - /opt/joyco/facturas_procesador/data/prod/facturas.xlsx
+    """
+    if os.path.isabs(path_value):
+        return path_value
+
+    return os.path.join(BASE_DIR, path_value)
+
 
 # ============================================================
 # Paths base
 # ============================================================
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 
@@ -13,32 +80,109 @@ CARPETA_EXTRAIDOS = os.path.join(DATA_DIR, "extraidos")
 TEMP_CHECK_DIR = os.path.join(DATA_DIR, "temp_check")
 TMP_DIR = TEMP_CHECK_DIR
 
-ARCHIVO_EXCEL = os.path.join(DATA_DIR, "facturas.xlsx")
-HISTORIAL_EXCEL = os.path.join(DATA_DIR, "historial_ejecuciones.xlsx")
+
+# ============================================================
+# Excel local runtime
+# ============================================================
+# Este Excel local es el archivo de trabajo interno del automatizador.
+#
+# El Excel oficial visible para usuarios debe ser el Excel Web actualizado
+# por Workbook API.
+#
+# Por ahora queda:
+#   data/facturas.xlsx
+#
+# Más adelante en VPS se podrá usar, por ejemplo:
+#   ARCHIVO_EXCEL_LOCAL=data/prod/facturas.xlsx
+#   HISTORIAL_EXCEL_LOCAL=data/prod/historial_ejecuciones.xlsx
+# ============================================================
+
+ARCHIVO_EXCEL = _path_from_base_or_absolute(
+    _env_str("ARCHIVO_EXCEL_LOCAL", os.path.join("data", "facturas.xlsx"))
+)
+
+HISTORIAL_EXCEL = _path_from_base_or_absolute(
+    _env_str("HISTORIAL_EXCEL_LOCAL", os.path.join("data", "historial_ejecuciones.xlsx"))
+)
+
 
 # ============================================================
 # Correo / carpeta aprobadas
 # ============================================================
-STORE_NAME = "radicacion@joyco.com.co"
+# STORE_NAME:
+#   Buzón que consulta el sistema.
+#
+# APROB_FOLDER_NAME:
+#   Carpeta donde llegan las facturas aprobadas.
+#
+# APROB_SEARCH_SINCE_DAYS:
+#   Ventana de días para búsqueda en aprobadas.
+#   Por defecto se sincroniza con FACTURAS_SINCE_DAYS.
+#
+# Producción actual:
+#   FACTURAS_SINCE_DAYS=6
+# ============================================================
 
-APROB_FOLDER_NAME = "solo aprobadas"
-APROB_SEARCH_SINCE_DAYS = 90
+STORE_NAME = _env_str("MAILBOX_UPN", "radicacion@joyco.com.co")
+
+APROB_FOLDER_NAME = _env_str("APROB_FOLDER_NAME", "solo aprobadas")
+
+APROB_SEARCH_SINCE_DAYS = _env_int(
+    "APROB_SEARCH_SINCE_DAYS",
+    _env_int("FACTURAS_SINCE_DAYS", 6),
+)
+
+
+# ============================================================
+# Match
+# ============================================================
+# MATCH_PRIORIDAD:
+#   Orden de búsqueda para relacionar PDF aprobado con XML/ZIP.
+#
+# No tocar por rendimiento sin revisar la lógica del controller.
+# ============================================================
 
 MATCH_PRIORIDAD = ["CUFE", "NUMERO_FECHA"]
 
-APROB_CAT_OK = "AprobMatchOK"
-APROB_CAT_ERROR = "AprobMatchError"
+APROB_CAT_OK = _env_str("APROB_CAT_OK", "AprobMatchOK")
+APROB_CAT_ERROR = _env_str("APROB_CAT_ERROR", "AprobMatchError")
 
-AUTO_STOP_MIN_PROCESADOS = 9
-AUTO_STOP_SIN_MATCH_CONSEC = 9
-AUTO_STOP_SIN_NUEVOS_CONSEC = 9
+
+# ============================================================
+# Auto stop / corte temprano
+# ============================================================
+# Estas variables ayudan a que producción no se quede recorriendo
+# demasiados correos cuando ya encuentra registros repetidos.
+#
+# AUTO_STOP_MIN_PROCESADOS:
+#   Mínimo de facturas procesadas antes de permitir el corte.
+#
+# AUTO_STOP_SIN_NUEVOS_CONSEC:
+#   Facturas seguidas con match pero sin filas nuevas.
+#   Normalmente significa que ya estaban registradas.
+#
+# AUTO_STOP_SIN_MATCH_CONSEC:
+#   Facturas seguidas sin match antes de cortar.
+#   Se deja un poco más alto para no cortar por casos difíciles.
+#
+# Recomendado producción:
+#   AUTO_STOP_MIN_PROCESADOS=3
+#   AUTO_STOP_SIN_NUEVOS_CONSEC=3
+#   AUTO_STOP_SIN_MATCH_CONSEC=5
+# ============================================================
+
+AUTO_STOP_MIN_PROCESADOS = _env_int("AUTO_STOP_MIN_PROCESADOS", 3)
+AUTO_STOP_SIN_NUEVOS_CONSEC = _env_int("AUTO_STOP_SIN_NUEVOS_CONSEC", 3)
+AUTO_STOP_SIN_MATCH_CONSEC = _env_int("AUTO_STOP_SIN_MATCH_CONSEC", 5)
+
 
 # ============================================================
 # FLUJO ESPECIAL DIAN
 # ============================================================
-APROB_DIAN_KEYWORD = "DIAN"
 
-# Más amplio y tolerante
+APROB_DIAN_KEYWORD = _env_str("APROB_DIAN_KEYWORD", "DIAN")
+
+# Más amplio y tolerante.
 INBOX_DIAN_SUBJECT_CANDIDATES = [
     "DIAN",
     "VALIDACION DIAN",
@@ -58,59 +202,163 @@ INBOX_DIAN_SUBJECT_CANDIDATES = [
     "VALIDACIONES JOYCO SAS",
 ]
 
-# True = si hay preview, también valida ahí; si no hay, cae a asunto
-REQUIRE_DIAN_IN_BODY_PREVIEW = True
+# True:
+#   Si hay bodyPreview, también valida ahí.
+#   Si no hay, cae al asunto.
+REQUIRE_DIAN_IN_BODY_PREVIEW = _env_bool("REQUIRE_DIAN_IN_BODY_PREVIEW", True)
+
 
 # ============================================================
 # RADICADOS
 # ============================================================
-RADICADOS_SP_RELATIVE_PATH = (
-    "Control de correspondencia Oficina Principal/"
-    "Control correspondencia Oficina Principal.xlsx"
+
+RADICADOS_SP_RELATIVE_PATH = _env_str(
+    "RADICADOS_SP_RELATIVE_PATH",
+    (
+        "Control de correspondencia Oficina Principal/"
+        "Control correspondencia Oficina Principal.xlsx"
+    ),
 )
 
-RADICADOS_SHEET_NAME = "Recibida"
+RADICADOS_SHEET_NAME = _env_str("RADICADOS_SHEET_NAME", "Recibida")
 
-RAD_COL_ASUNTO = "Asunto"
-RAD_COL_RADICADO = "Consecutivo de entrada"
-RAD_COL_PROY = "Proyecto o Proceso"
+RAD_COL_ASUNTO = _env_str("RAD_COL_ASUNTO", "Asunto")
+RAD_COL_RADICADO = _env_str("RAD_COL_RADICADO", "Consecutivo de entrada")
+RAD_COL_PROY = _env_str("RAD_COL_PROY", "Proyecto o Proceso")
 
-FACT_COL_NUMERO = "Número de factura"
-FACT_COL_RAD = "Radicado"
-FACT_COL_PROY = "ProyectoProceso"
+FACT_COL_NUMERO = _env_str("FACT_COL_NUMERO", "Número de factura")
+FACT_COL_RAD = _env_str("FACT_COL_RAD", "Radicado")
+FACT_COL_PROY = _env_str("FACT_COL_PROY", "ProyectoProceso")
+
 
 # ============================================================
 # RADICADOS local
 # ============================================================
+
 RADICADOS_LOCAL_DIR = os.path.join(TEMP_CHECK_DIR, "radicados")
-RADICADOS_LOCAL_FILENAME = "Control correspondencia Oficina Principal.xlsx"
+
+RADICADOS_LOCAL_FILENAME = _env_str(
+    "RADICADOS_LOCAL_FILENAME",
+    "Control correspondencia Oficina Principal.xlsx",
+)
+
 RADICADOS_LOCAL_PATH = os.path.join(RADICADOS_LOCAL_DIR, RADICADOS_LOCAL_FILENAME)
+
 
 # ============================================================
 # STATE
 # ============================================================
+
 STATE_DIR = os.path.join(DATA_DIR, "state")
-PROCESSED_MESSAGES_PATH = os.path.join(STATE_DIR, "processed_messages.json")
-PROCESSED_MESSAGES_TTL_DAYS = 20000
+
+PROCESSED_MESSAGES_PATH = os.path.join(
+    STATE_DIR,
+    _env_str("PROCESSED_MESSAGES_FILENAME", "processed_messages.json"),
+)
+
+# TTL del ProcessedStore.
+#
+# Producción recomendado:
+#   365 días.
+#
+# Esto evita que processed_messages.json crezca sin control durante años.
+PROCESSED_MESSAGES_TTL_DAYS = _env_int("PROCESSED_MESSAGES_TTL_DAYS", 365)
+
 
 # ============================================================
-# AttachmentIndexStore
+# AttachmentIndexStore / AIDX
 # ============================================================
-ATTACHMENT_INDEX_PATH = os.path.join(STATE_DIR, "attachment_index_store.json")
-ATTACHMENT_INDEX_TTL_DAYS = 965
+
+ATTACHMENT_INDEX_PATH = os.path.join(
+    STATE_DIR,
+    _env_str("ATTACHMENT_INDEX_FILENAME", "attachment_index_store.json"),
+)
+
+# TTL del índice de adjuntos/ZIP/XML.
+#
+# Producción recomendado:
+#   365 días.
+#
+# Si se necesita más histórico:
+#   730 días.
+#
+# No dejar infinito si el sistema va a correr por años.
+ATTACHMENT_INDEX_TTL_DAYS = _env_int("ATTACHMENT_INDEX_TTL_DAYS", 365)
+
 
 # ============================================================
 # Auditoría CSV
 # ============================================================
+
 AUDIT_DIR = os.path.join(DATA_DIR, "audit")
-AUDIT_RUNS_PREFIX = "audit_runs"
-AUDIT_DETALLE_PREFIX = "audit_detalle"
-AUDIT_WRITE_ONLY_IF_ACTIVITY = True
+
+AUDIT_RUNS_PREFIX = _env_str("AUDIT_RUNS_PREFIX", "audit_runs")
+AUDIT_DETALLE_PREFIX = _env_str("AUDIT_DETALLE_PREFIX", "audit_detalle")
+
+# True:
+#   Solo escribe audit si hubo actividad.
+#
+# False:
+#   Escribe audit aunque no haya actividad.
+#   Puede servir más adelante para evidencia de cada corrida.
+AUDIT_WRITE_ONLY_IF_ACTIVITY = _env_bool("AUDIT_WRITE_ONLY_IF_ACTIVITY", True)
+
 
 # ============================================================
 # Lock
 # ============================================================
+
 LOCK_FILE_APROBADAS = os.path.join(STATE_DIR, "aprobadas.lock")
 
-# 4 horas
-LOCK_TTL_SECONDS = 240 * 60
+# TTL del lock.
+#
+# Sirve para evitar que dos ejecuciones corran al mismo tiempo.
+#
+# Si una ejecución se queda pegada o el proceso muere, este TTL permite
+# considerar vencido el lock después de cierto tiempo.
+#
+# Producción:
+#   3600 = 1 hora.
+#
+# Reproceso histórico largo:
+#   14400 = 4 horas.
+#
+# No poner demasiado bajo si una ejecución puede durar más que ese tiempo,
+# porque una segunda ejecución podría creer que el lock ya venció.
+LOCK_TTL_SECONDS = _env_int("LOCK_TTL_SECONDS", 3600)
+
+
+# ============================================================
+# Compatibilidad opcional con variable antigua
+# ============================================================
+# Esta variable existía en algunas pruebas antiguas.
+# Se deja disponible por si algún módulo viejo la consulta.
+# El control oficial actual debe ser AUTO_STOP_*.
+# ============================================================
+
+STOP_AFTER_ALREADY_PROCESSED = _env_int("STOP_AFTER_ALREADY_PROCESSED", 3)
+
+
+# ============================================================
+# Crear carpetas base si no existen
+# ============================================================
+
+for _folder in [
+    DATA_DIR,
+    CARPETA_ADJUNTOS,
+    CARPETA_EXTRAIDOS,
+    TEMP_CHECK_DIR,
+    STATE_DIR,
+    AUDIT_DIR,
+]:
+    try:
+        os.makedirs(_folder, exist_ok=True)
+    except Exception:
+        pass
+
+
+# ============================================================
+# Sello de versión
+# ============================================================
+
+print("🔥 CONFIG VERSION ACTIVA: 2026-06-04-ENV-PRODUCCION-AUTOSTOP-AIDX")

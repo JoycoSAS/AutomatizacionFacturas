@@ -1,6 +1,8 @@
 # services/m365/excel_workbook_graph.py
 import time
+import math
 import requests
+from decimal import Decimal, InvalidOperation
 from typing import List, Dict, Set, Tuple, Optional, Any
 
 from .sp_graph import get_item_by_path, DRIVE_ID, SSL_VERIFY, TIMEOUT, GRAPH
@@ -20,11 +22,109 @@ def _h(session_id: Optional[str] = None) -> Dict[str, str]:
     return h
 
 
+# Columnas que Excel Web NO debe interpretar como número.
+# Si Excel las interpreta como número, las convierte a notación científica
+# o pierde precisión.
+TEXT_COLUMNS_FORCE = {
+    "Radicado",
+    "ProyectoProceso",
+    "Archivo",
+    "Empresa emisora",
+    "CUFE",
+    "Ciudad emisora",
+    "Código ciudad",
+    "NIT",
+    "Cliente",
+    "Número de factura",
+    "Año",
+    "Mes",
+    "Día",
+    "Nombre contrato",
+    "Unidad económica",
+    "DESCRIPCIÓN",
+    "Concepto",
+    "Estado_calidad",
+}
+
+
+def _plain_number_text(value: Any) -> str:
+    """
+    Convierte valores numéricos a texto plano evitando notación científica.
+    Se usa solo para columnas que deben guardarse como texto.
+    """
+    if value is None:
+        return ""
+
+    if isinstance(value, bool):
+        return "true" if value else "false"
+
+    if isinstance(value, int):
+        return str(value)
+
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return ""
+        if value.is_integer():
+            return str(int(value))
+        return format(value, "f").rstrip("0").rstrip(".")
+
+    s = str(value).strip()
+    if not s:
+        return ""
+
+    if s.startswith("'"):
+        return s
+
+    s_num = s.replace(",", ".")
+    if "e+" in s_num.lower() or "e-" in s_num.lower():
+        try:
+            d = Decimal(s_num)
+            if d == d.to_integral_value():
+                return format(d.quantize(Decimal(1)), "f")
+            return format(d, "f").rstrip("0").rstrip(".")
+        except (InvalidOperation, ValueError):
+            return s
+
+    return s
+
+
+def _excel_text(value: Any) -> str:
+    """
+    Fuerza texto en Excel. El apóstrofo inicial evita que Excel Online
+    convierta CUFE/NIT/Número de factura a notación científica.
+    """
+    s = _plain_number_text(value).strip()
+    if not s:
+        return ""
+
+    if s.startswith("'"):
+        return s
+
+    return "'" + s
+
+
+def _normalizar_valor_para_excel_web(col: str, value: Any) -> Any:
+    """
+    Normaliza cada valor antes de enviarlo al Workbook API.
+    """
+    col = str(col or "").strip()
+
+    if col in TEXT_COLUMNS_FORCE:
+        return _excel_text(value)
+
+    if value is None:
+        return ""
+
+    return value
+
+
+
 class ExcelWorkbookGraph:
     """
     Escribe en un Excel en SharePoint usando Graph Workbook API (sin reemplazar el archivo).
     ✅ Permite que el Excel esté abierto en Excel Online (evita 423 locked del /content).
     ✅ Soporta drive_id opcional (por defecto usa SP_DRIVE_ID -> DRIVE_ID).
+    ✅ Fuerza texto en columnas críticas para evitar notación científica y pérdida de precisión.
 
     IMPORTANTÍSIMO:
     - Para /tables/{table}/... debe existir una TABLA real en el Excel (ej: TblFacturas).
@@ -137,17 +237,19 @@ class ExcelWorkbookGraph:
     # Dedupe helpers
     # ---------------------------
     @staticmethod
-    def _build_existing_keys(
-        table_values: List[List[Any]], key_cols: Tuple[str, ...]
-    ) -> Set[Tuple[str, ...]]:
+    def _clean_key_value(value: Any) -> str:
         """
-        Construye las llaves existentes usando una cantidad variable de columnas.
+        Normaliza valores de llave tanto si vienen con apóstrofo como si vienen normales.
+        """
+        s = _plain_number_text(value).strip()
+        if s.startswith("'"):
+            s = s[1:].strip()
+        return s
 
-        Importante:
-        - Antes esta función solo soportaba 2 columnas.
-        - Ahora soporta 3 o más, por ejemplo:
-          ("Radicado", "Archivo", "Concepto")
-        """
+    @classmethod
+    def _build_existing_keys(
+        cls, table_values: List[List[Any]], key_cols: Tuple[str, ...]
+    ) -> Set[Tuple[str, ...]]:
         if not table_values or len(table_values) < 2:
             return set()
 
@@ -158,30 +260,37 @@ class ExcelWorkbookGraph:
             try:
                 idxs.append(header.index(col))
             except ValueError:
-                print(f"[Workbook] Columna de llave no encontrada en tabla: {col}")
                 return set()
 
         existing: Set[Tuple[str, ...]] = set()
-
         for row in table_values[1:]:
             vals = []
             ok = True
-
             for idx in idxs:
-                v = str(row[idx]).strip() if idx < len(row) and row[idx] is not None else ""
+                v = cls._clean_key_value(row[idx]) if idx < len(row) and row[idx] is not None else ""
                 if not v:
                     ok = False
                     break
                 vals.append(v)
-
             if ok:
                 existing.add(tuple(vals))
-
         return existing
 
     @staticmethod
     def _align_rows_to_table(header: List[str], rows_dicts: List[Dict[str, Any]]) -> List[List[Any]]:
-        return [[d.get(col, "") for col in header] for d in rows_dicts]
+        """
+        Alinea dicts al orden real de columnas de la tabla.
+        Aquí se fuerza texto para columnas críticas antes de enviar al Workbook API.
+        """
+        rows: List[List[Any]] = []
+
+        for d in rows_dicts:
+            row = []
+            for col in header:
+                row.append(_normalizar_valor_para_excel_web(col, d.get(col, "")))
+            rows.append(row)
+
+        return rows
 
     # ---------------------------
     # Public API
@@ -196,47 +305,14 @@ class ExcelWorkbookGraph:
         retry_sleep: float = 1.0,
     ) -> int:
         """
-        Reglas críticas:
-        - NO insertar filas sin Concepto
-        - NO insertar filas con llave incompleta
-        - dedupe por (Radicado, Archivo, Concepto)
+        1) Abre sesión workbook
+        2) Verifica que exista la tabla (si require_table=True)
+        3) Lee tabla
+        4) Dedupe por key_cols
+        5) Inserta solo nuevas
         """
         if not rows_dicts:
             print("[Workbook] append_rows_dedup: rows_dicts vacío")
-            return 0
-
-        sanitized: List[Dict[str, Any]] = []
-        descartadas_sin_concepto = 0
-        descartadas_sin_llave = 0
-
-        for raw in rows_dicts:
-            if not isinstance(raw, dict):
-                continue
-
-            d = dict(raw)
-
-            concepto = str(d.get("Concepto", "")).strip()
-            if not concepto:
-                descartadas_sin_concepto += 1
-                continue
-
-            for col in key_cols:
-                if col in d and d[col] is not None:
-                    d[col] = str(d[col]).strip()
-
-            k = tuple(str(d.get(col, "")).strip() for col in key_cols)
-            if not all(k):
-                descartadas_sin_llave += 1
-                continue
-
-            sanitized.append(d)
-
-        if not sanitized:
-            print(
-                "[Workbook] No hay filas válidas para insertar. "
-                f"descartadas_sin_concepto={descartadas_sin_concepto} | "
-                f"descartadas_sin_llave={descartadas_sin_llave}"
-            )
             return 0
 
         session_id = self.create_session(persist_changes=True)
@@ -257,16 +333,51 @@ class ExcelWorkbookGraph:
                 raise RuntimeError(f"[Workbook] Tabla '{table_name}' sin encabezados.")
 
             existing = self._build_existing_keys(table_values, key_cols)
+
+            # Si solo existe el encabezado, no hay filas reales
             if len(table_values) <= 1:
                 existing = set()
+
+            # Sanitizar antes de insertar:
+            # - NO dejar pasar filas sin Concepto.
+            # - NO dejar pasar filas con llave incompleta.
+            # Esto evita la fila adicional/fantasma en Excel Web.
+            sanitized: List[Dict[str, Any]] = []
+            descartadas_sin_concepto = 0
+            descartadas_sin_llave = 0
+
+            for raw in rows_dicts:
+                if not isinstance(raw, dict):
+                    continue
+
+                d = dict(raw)
+
+                concepto = self._clean_key_value(d.get("Concepto", ""))
+                if not concepto:
+                    descartadas_sin_concepto += 1
+                    continue
+                d["Concepto"] = concepto
+
+                for col in key_cols:
+                    if col in d and d[col] is not None:
+                        d[col] = self._clean_key_value(d[col])
+
+                k = tuple(self._clean_key_value(d.get(col, "")) for col in key_cols)
+                if not all(k):
+                    descartadas_sin_llave += 1
+                    continue
+
+                sanitized.append(d)
 
             filtered: List[Dict[str, Any]] = []
             seen_new: Set[Tuple[str, ...]] = set()
 
             for d in sanitized:
-                k = tuple(str(d.get(col, "")).strip() for col in key_cols)
+                k = tuple(self._clean_key_value(d.get(col, "")) for col in key_cols)
+
                 if k in seen_new:
                     continue
+
                 if k not in existing:
                     filtered.append(d)
                     seen_new.add(k)

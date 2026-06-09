@@ -1,6 +1,8 @@
 import os
 import base64
 import time
+import unicodedata
+import re
 import requests
 from urllib.parse import quote
 from dotenv import load_dotenv
@@ -14,7 +16,35 @@ load_dotenv()
 
 GRAPH = "https://graph.microsoft.com/v1.0"
 
-MAILBOX = (
+def _sanitize_mailbox_value(value: str | None) -> str:
+    """
+    Limpia el buzón leído desde .env.
+
+    Evita errores como:
+    MAILBOX_UPN=[radicacion@joyco.com.co](mailto:radicacion@joyco.com.co)
+
+    y lo deja como:
+    radicacion@joyco.com.co
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+
+    # Caso Markdown: [correo@dominio](mailto:correo@dominio)
+    m = re.search(r"mailto:([^\)\s]+)", raw, flags=re.IGNORECASE)
+    if m:
+        raw = m.group(1).strip()
+    else:
+        # Primer correo válido dentro del texto.
+        m = re.search(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", raw, flags=re.IGNORECASE)
+        if m:
+            raw = m.group(0).strip()
+
+    raw = raw.strip().strip("[]()<>.,;'").strip()
+    return raw
+
+
+MAILBOX = _sanitize_mailbox_value(
     os.getenv("GRAPH_USER")
     or os.getenv("GRAPH_MAILBOX")
     or os.getenv("MAILBOX_UPN")
@@ -165,6 +195,55 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return default
 
 
+
+# Logs verbosos opcionales. En producción deben quedar apagados por defecto.
+GRAPH_VERBOSE_ATTACHMENTS = _env_bool("GRAPH_VERBOSE_ATTACHMENTS", False)
+GRAPH_DEBUG_ZIP = _env_bool("GRAPH_DEBUG_ZIP", False)
+
+
+def _normalizar_texto_busqueda(valor: str | None) -> str:
+    """
+    Normaliza texto para búsquedas internas flexibles:
+    - minúsculas
+    - sin tildes
+    - solo letras y números
+
+    Ejemplos:
+    'Nota Crédito', 'nota credito', 'NotaCredito', 'NOTA-CREDITO'
+    quedan como 'notacredito'.
+    """
+    txt = str(valor or "").strip().lower()
+    if not txt:
+        return ""
+
+    txt = unicodedata.normalize("NFKD", txt)
+    txt = "".join(ch for ch in txt if not unicodedata.combining(ch))
+    txt = "".join(ch for ch in txt if ch.isalnum())
+    return txt
+
+
+def _coincide_asunto_flexible(subject: str | None, needle: str | None) -> bool:
+    needle_raw = str(needle or "").strip().lower()
+    subject_raw = str(subject or "").strip().lower()
+
+    if not needle_raw:
+        return True
+
+    # Coincidencia normal directa.
+    if needle_raw in subject_raw:
+        return True
+
+    # Coincidencia normalizada:
+    # permite Nota Crédito / NotaCredito / Nota-Credito / nota credito.
+    needle_norm = _normalizar_texto_busqueda(needle_raw)
+    subject_norm = _normalizar_texto_busqueda(subject_raw)
+
+    if needle_norm and needle_norm in subject_norm:
+        return True
+
+    return False
+
+
 def _build_messages_url(
     base_url: str,
     page_size: int,
@@ -201,9 +280,19 @@ def _listar_mensajes_paginado(
     max_messages: int = 200,
     since_days: int | None = None,
     unread_only: bool | None = None,
+    respect_env_max: bool = True,
 ) -> list:
-    max_env = _env_int("MAX_MESSAGES", 200) or 200
-    target = min(max(1, int(max_messages or 200)), max_env)
+    requested = max(1, int(max_messages or 200))
+
+    # Compatibilidad histórica:
+    # - Por defecto se respeta MAX_MESSAGES para no disparar barridos gigantes.
+    # - Para búsquedas controladas por asunto se puede desactivar este límite
+    #   y usar un scan_limit propio, sin afectar los demás flujos.
+    if respect_env_max:
+        max_env = _env_int("MAX_MESSAGES", 200) or 200
+        target = min(requested, max_env)
+    else:
+        target = requested
 
     page_size = min(GRAPH_PAGE_SIZE, target)
     next_url = _build_messages_url(
@@ -258,13 +347,18 @@ def _listar_mensajes(max_messages: int = 200, since_days: int | None = None) -> 
     )
 
 
-def _listar_mensajes_inbox(max_messages: int = 200, since_days: int | None = None) -> list:
+def _listar_mensajes_inbox(
+    max_messages: int = 200,
+    since_days: int | None = None,
+    respect_env_max: bool = True,
+) -> list:
     base = f"{GRAPH}/{_user_segment()}/mailFolders/inbox/messages"
     return _listar_mensajes_paginado(
         base_url=base,
         max_messages=max_messages,
         since_days=since_days,
         unread_only=None,
+        respect_env_max=respect_env_max,
     )
 
 
@@ -273,18 +367,44 @@ def buscar_mensajes_inbox_por_asunto(
     top: int = 50,
     since_days: int | None = 7,
     solo_con_adjuntos: bool = True,
+    scan_limit: int | None = None,
 ):
+    """
+    Busca mensajes en Bandeja de entrada filtrando SOLO por asunto,
+    pero de forma más flexible y con barrido más amplio.
+
+    Motivo:
+    La prueba temporal de notas crédito no debe buscar por cuerpo ni adjuntos,
+    porque el criterio acordado es que el asunto diga nota crédito. Sin embargo,
+    Outlook y los correos reales pueden traer variantes:
+    - Nota Crédito
+    - Nota Credito
+    - NotaCredito
+    - NOTA-CREDITO
+    - nota_credito
+
+    Además, antes se leían solo los primeros 200 mensajes del Inbox por el cap
+    global MAX_MESSAGES. Si había muchos correos recientes, no alcanzaba a llegar
+    a marzo/abril aunque since_days lo permitiera. Por eso esta búsqueda usa
+    GRAPH_INBOX_SUBJECT_SCAN_LIMIT y desactiva el cap global solo en este caso.
+    """
     top = int(top or 50)
     if top < 1:
         return []
 
-    # Traemos más de lo pedido para permitir filtrar por asunto después
-    # y no quedarnos cortos por resultados no coincidentes.
-    lote_busqueda = max(top * 4, 200)
+    if scan_limit is None:
+        scan_limit = _env_int("GRAPH_INBOX_SUBJECT_SCAN_LIMIT", None)
+
+    if not scan_limit:
+        # Para la prueba desde enero/abril necesitamos más de 200 en muchos buzones.
+        scan_limit = max(top * 80, 1000)
+
+    scan_limit = max(top, int(scan_limit))
 
     msgs = _listar_mensajes_inbox(
-        max_messages=lote_busqueda,
-        since_days=since_days
+        max_messages=scan_limit,
+        since_days=since_days,
+        respect_env_max=False,
     )
 
     if not (asunto_contiene or "").strip():
@@ -292,19 +412,60 @@ def buscar_mensajes_inbox_por_asunto(
             msgs = [m for m in msgs if m.get("hasAttachments")]
         return msgs[:top]
 
-    asunto_contiene = asunto_contiene.strip().lower()
-
     out = []
+    vistos = set()
+
     for msg in msgs:
-        subj = (msg.get("subject") or "").lower()
-        if asunto_contiene in subj:
-            if solo_con_adjuntos and not msg.get("hasAttachments"):
-                continue
-            out.append(msg)
-            if len(out) >= top:
-                break
+        if solo_con_adjuntos and not msg.get("hasAttachments"):
+            continue
+
+        subj = msg.get("subject") or ""
+        if not _coincide_asunto_flexible(subj, asunto_contiene):
+            continue
+
+        mid = msg.get("id")
+        if mid and mid in vistos:
+            continue
+        if mid:
+            vistos.add(mid)
+
+        out.append(msg)
+
+        if len(out) >= top:
+            break
+
+    try:
+        print(
+            f"[Graph Inbox Subject] asunto='{asunto_contiene}' | "
+            f"scan_limit={scan_limit} | escaneados={len(msgs)} | "
+            f"coincidencias={len(out)} | since_days={since_days}"
+        )
+    except Exception:
+        pass
 
     return out
+
+
+def buscar_mensajes_inbox_nota_credito(
+    top: int = 5,
+    since_days: int | None = 120,
+    solo_con_adjuntos: bool = True,
+    scan_limit: int | None = None,
+):
+    """
+    Atajo específico para la prueba temporal de notas crédito.
+    Sigue filtrando SOLO por asunto, pero acepta variantes escritas.
+    """
+    candidatos = buscar_mensajes_inbox_por_asunto(
+        asunto_contiene="nota credito",
+        top=top,
+        since_days=since_days,
+        solo_con_adjuntos=solo_con_adjuntos,
+        scan_limit=scan_limit,
+    )
+
+    # Con la normalización, "nota credito" ya cubre "nota crédito" y "NotaCredito".
+    return candidatos
 
 
 def _listar_adjuntos(msg_id: str) -> list:
@@ -320,7 +481,8 @@ def _listar_adjuntos(msg_id: str) -> list:
             print(f"[Graph] Corte preventivo: demasiadas páginas de adjuntos para msg_id={msg_id}")
             break
 
-        print(f"[Graph] Listando adjuntos msg_id={msg_id} página={page_count}")
+        if GRAPH_VERBOSE_ATTACHMENTS:
+            print(f"[Graph] Listando adjuntos msg_id={msg_id} página={page_count}")
 
         data = _get_json_with_retries(
             next_url,
@@ -484,14 +646,15 @@ def listar_adjuntos_zip(msg_id: str) -> list:
         print(f"[DEBUG ZIP] Error listando adjuntos ZIP para msg_id={msg_id}: {e}")
         return []
 
-    try:
-        print(
-            f"[DEBUG ZIP] msg_id={msg_id} | "
-            f"zips encontrados={len(zips)} | "
-            f"nombres={[z.get('name') for z in zips]}"
-        )
-    except Exception:
-        pass
+    if GRAPH_DEBUG_ZIP or GRAPH_VERBOSE_ATTACHMENTS:
+        try:
+            print(
+                f"[DEBUG ZIP] msg_id={msg_id} | "
+                f"zips encontrados={len(zips)} | "
+                f"nombres={[z.get('name') for z in zips]}"
+            )
+        except Exception:
+            pass
 
     return zips
 
@@ -586,3 +749,5 @@ def marcar_mensaje_como_leido(msg_id: str) -> bool:
         return False
     finally:
         _close_response(response)
+
+print("🔥 MAIL_GRAPH PATCH 2026-06-05 ACTIVO: SAFE-LOGS-MAILBOX-SANITIZED-NOTA-UNICA")

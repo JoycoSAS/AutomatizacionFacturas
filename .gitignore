@@ -33,4 +33,8 @@ data/state/
 data/state/*.json
 processed_messages.json
 audit_detalle_2026-02-24.csv
-audit_runs_2026-02-24.csv
+audit_runs_2026-02-24.csv.env.*
+.env_*
+.env_BACKUP*
+*_BACKUP*
+!.env.example
