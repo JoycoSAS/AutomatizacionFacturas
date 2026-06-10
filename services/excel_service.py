@@ -14,7 +14,7 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 from config import ARCHIVO_EXCEL, HISTORIAL_EXCEL
 from utils.safe_io import safe_save_pandas
 
-print("🔥 EXCEL_SERVICE VERSION ACTIVA: 2026-05-21-G5-UPsert-RAD-ARCH-SIN-DUPLICAR-CUFE-NUMERO")
+print("🔥 EXCEL_SERVICE VERSION ACTIVA: 2026-06-10-H1-NAN-VACIO-CALIDAD-MINIMA")
 
 
 CONCEPTOS_BASE_FIJOS = [
@@ -54,6 +54,13 @@ COLUMNAS_EXTRA_PERMITIDAS = [
 # Estado_calidad debe quedar de última para formato condicional en Excel Web.
 COLUMNA_ESTADO_CALIDAD = "Estado_calidad"
 
+# Valores que NO deben aparecer escritos en Excel.
+# En pandas/openpyxl pueden llegar como float NaN, pd.NA, None o como texto "nan".
+# La regla oficial desde 2026-06-10 es: estos valores se guardan como celda vacía.
+VALORES_TEXTO_VACIOS_EXCEL = {
+    "", "NAN", "NONE", "NULL", "N/A", "NA", "SIN_DATO", "SIN DATO", "<NA>", "NAT"
+}
+
 COLUMNAS_VALIDAS_FINALES = COLUMNAS_EXTRA_PERMITIDAS + COLUMNAS_BASE_LARGO + [COLUMNA_ESTADO_CALIDAD]
 CONCEPTO_ORDEN = {nombre: idx for idx, nombre in enumerate(CONCEPTOS_BASE_FIJOS, start=1)}
 
@@ -79,25 +86,68 @@ CAMPOS_CALIDAD_COMPLETA_EXCEL = [
     "DESCRIPCIÓN",
 ]
 
+# Campos que definen si una factura tiene una base real de información.
+# Si varios de estos faltan, la factura no debe quedar PARCIAL: debe quedar MINIMA.
+CAMPOS_CALIDAD_BASE_REAL_EXCEL = [
+    "Empresa emisora",
+    "NIT",
+    "Cliente",
+    "Número de factura",
+    "Año",
+    "Mes",
+    "Día",
+    "DESCRIPCIÓN",
+]
 
-def _valor_presente_calidad_excel(valor: Any) -> bool:
+# Campos técnicos/operativos que por sí solos NO son suficientes para considerar
+# una factura como PARCIAL: pueden existir incluso en un registro mínimo.
+CAMPOS_CALIDAD_OPERATIVOS_EXCEL = [
+    "Radicado",
+    "ProyectoProceso",
+    "Archivo",
+    "CUFE",
+]
+
+
+def _es_valor_vacio_excel(valor: Any) -> bool:
+    """
+    Detecta vacíos reales y vacíos escritos como texto.
+
+    Evita que valores como "nan" queden visibles en Excel o cuenten como dato
+    presente para Estado_calidad.
+    """
     if valor is None:
-        return False
+        return True
 
     try:
-        if isinstance(valor, float) and pd.isna(valor):
-            return False
+        if pd.isna(valor):
+            return True
     except Exception:
         pass
 
-    s = str(valor).strip()
-    if not s:
-        return False
+    try:
+        s = str(valor).strip()
+    except Exception:
+        return True
 
-    if s.upper() in {"NAN", "NONE", "NULL", "N/A", "NA", "SIN_DATO", "SIN DATO"}:
-        return False
+    if s.upper() in VALORES_TEXTO_VACIOS_EXCEL:
+        return True
 
-    return True
+    return False
+
+
+def _sanitizar_valor_excel(valor: Any) -> Any:
+    """
+    Normaliza valores antes de escribirlos al Excel.
+    Los vacíos técnicos quedan como celda vacía.
+    """
+    if _es_valor_vacio_excel(valor):
+        return ""
+    return valor
+
+
+def _valor_presente_calidad_excel(valor: Any) -> bool:
+    return not _es_valor_vacio_excel(valor)
 
 
 ANCHO_COLUMNAS = {
@@ -164,9 +214,7 @@ def _read_facturas_df() -> pd.DataFrame:
 
 
 def _to_str(v: Any) -> str:
-    if v is None:
-        return ""
-    if isinstance(v, float) and pd.isna(v):
+    if _es_valor_vacio_excel(v):
         return ""
     return str(v).strip()
 
@@ -208,7 +256,7 @@ def _money_float(v: Any) -> float:
 
 
 def _forzar_texto_excel(valor: Any) -> str:
-    if valor is None:
+    if _es_valor_vacio_excel(valor):
         return ""
 
     if isinstance(valor, str):
@@ -216,7 +264,7 @@ def _forzar_texto_excel(valor: Any) -> str:
     else:
         s = str(valor).strip()
 
-    if not s:
+    if _es_valor_vacio_excel(s):
         return ""
 
     s_upper = s.upper().replace(",", ".")
@@ -237,7 +285,7 @@ def _forzar_texto_excel(valor: Any) -> str:
 
 
 def _limpiar_descripcion(s: Any) -> str:
-    if s is None or (isinstance(s, float) and pd.isna(s)):
+    if _es_valor_vacio_excel(s):
         return ""
 
     txt = str(s)
@@ -260,11 +308,7 @@ def _descripcion_por_concepto(d: Dict[str, Any], concepto: str) -> str:
 
 
 def _normalizar_valor_excel(v: Any) -> Any:
-    if v is None:
-        return ""
-    if isinstance(v, float) and pd.isna(v):
-        return ""
-    return v
+    return _sanitizar_valor_excel(v)
 
 
 def _limpiar_dataframe_a_formato_largo(df: pd.DataFrame) -> pd.DataFrame:
@@ -278,6 +322,10 @@ def _limpiar_dataframe_a_formato_largo(df: pd.DataFrame) -> pd.DataFrame:
             work[col] = ""
 
     work = work[[c for c in COLUMNAS_VALIDAS_FINALES if c in work.columns]].copy()
+
+    # Sanitización global: ningún "nan" textual o NaN técnico debe llegar al Excel.
+    for col in work.columns:
+        work[col] = work[col].apply(_sanitizar_valor_excel)
 
     for col in COLUMNAS_TEXTO:
         if col in work.columns:
@@ -293,8 +341,12 @@ def _limpiar_dataframe_a_formato_largo(df: pd.DataFrame) -> pd.DataFrame:
         work["VALOR"] = work["VALOR"].apply(_normalizar_valor_excel)
 
     if COLUMNA_ESTADO_CALIDAD in work.columns:
-        work[COLUMNA_ESTADO_CALIDAD] = work[COLUMNA_ESTADO_CALIDAD].astype(str).str.strip().str.upper()
-        work.loc[work[COLUMNA_ESTADO_CALIDAD].isin(["", "NAN", "NONE"]), COLUMNA_ESTADO_CALIDAD] = ""
+        work[COLUMNA_ESTADO_CALIDAD] = work[COLUMNA_ESTADO_CALIDAD].apply(_forzar_texto_excel).str.strip().str.upper()
+        work.loc[work[COLUMNA_ESTADO_CALIDAD].isin(VALORES_TEXTO_VACIOS_EXCEL), COLUMNA_ESTADO_CALIDAD] = ""
+
+    # Segunda pasada defensiva para evitar que pandas convierta algo a "nan" textual.
+    for col in work.columns:
+        work[col] = work[col].apply(_sanitizar_valor_excel)
 
     return work
 
@@ -432,6 +484,7 @@ def _calidad_visual_por_grupo(filas: list[dict]) -> str:
     - MINIMA:
         * Registro mínimo obligatorio.
         * O factura casi vacía.
+        * O faltan varios datos base reales aunque exista Radicado/Archivo/CUFE.
 
     IMPORTANTE:
     - Actividad económica NO cuenta.
@@ -504,16 +557,56 @@ def _calidad_visual_por_grupo(filas: list[dict]) -> str:
         return "COMPLETA"
 
     # Si tiene muy pocos datos útiles, se considera mínima.
+    # Importante 2026-06-10:
+    # Radicado/Proyecto/Archivo/CUFE pueden existir por el correo o por fallback,
+    # pero no significan que la factura esté realmente identificada. Para evitar
+    # falsos PARCIAL, se evalúa una base real: emisor, NIT, cliente, número,
+    # fecha y descripción.
     campos_presentes = sum(
         1
         for campo in CAMPOS_CALIDAD_COMPLETA_EXCEL
         if _valor_presente_calidad_excel(base.get(campo))
     )
 
+    campos_base_real_presentes = sum(
+        1
+        for campo in CAMPOS_CALIDAD_BASE_REAL_EXCEL
+        if _valor_presente_calidad_excel(base.get(campo))
+    )
+
+    faltantes_base_real = [
+        campo
+        for campo in CAMPOS_CALIDAD_BASE_REAL_EXCEL
+        if not _valor_presente_calidad_excel(base.get(campo))
+    ]
+
     if total_encontrado and total > 0:
         campos_presentes += 1
 
-    if campos_presentes <= 4:
+    # Caso casi vacío: antes podía quedar PARCIAL si tenía Radicado/Archivo/CUFE.
+    if campos_presentes <= 6:
+        return "MINIMA"
+
+    # Si no existe una base real mínima de identificación, debe ser MINIMA.
+    if campos_base_real_presentes <= 4:
+        return "MINIMA"
+
+    # Si faltan campos de identidad fuertes al mismo tiempo, también es MINIMA.
+    identidad_fuerte_faltante = (
+        not _valor_presente_calidad_excel(base.get("Empresa emisora"))
+        and not _valor_presente_calidad_excel(base.get("NIT"))
+    )
+    descripcion_faltante = not _valor_presente_calidad_excel(base.get("DESCRIPCIÓN"))
+    fecha_incompleta = any(
+        not _valor_presente_calidad_excel(base.get(c))
+        for c in ["Año", "Mes", "Día"]
+    )
+
+    if identidad_fuerte_faltante and (descripcion_faltante or fecha_incompleta):
+        return "MINIMA"
+
+    # Si faltan muchos datos de la base real, no se considera parcial útil.
+    if len(faltantes_base_real) >= 4:
         return "MINIMA"
 
     return "PARCIAL"
@@ -770,9 +863,7 @@ def obtener_cufes_existentes() -> Set[str]:
 
     cufes: Set[str] = set()
     for v in df["CUFE"]:
-        if pd.isna(v):
-            continue
-        s = str(v).strip()
+        s = _to_str(v)
         if s:
             cufes.add(s)
 
@@ -1616,5 +1707,7 @@ def obtener_filas_por_archivos(archivos: Set[str]) -> List[Dict[str, Any]]:
 
     df2 = df2.drop(columns=["__archivo_norm__", "__archivo_stem__"], errors="ignore")
     df2 = df2.fillna("")
+    for col in df2.columns:
+        df2[col] = df2[col].apply(_sanitizar_valor_excel)
     return df2.to_dict(orient="records")
             
