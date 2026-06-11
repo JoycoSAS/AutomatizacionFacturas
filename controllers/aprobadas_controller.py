@@ -1225,6 +1225,376 @@ def _push_detalle(
         "error": (error or "")[:500],
     })
 
+# ============================================================
+# PATCH 2026-06-11 - Auditoría completa y tiempos por etapa
+# ============================================================
+# Objetivo:
+# - No escribir audit_runs/audit_detalle cuando una corrida no trae nada nuevo.
+# - Enriquecer audit_detalle con calidad básica por factura.
+# - Enriquecer audit_runs con resumen de calidad y tiempos por etapa.
+# - Medir explícitamente el tiempo de construcción/uso inicial de AIDX.
+# ============================================================
+
+_AUDIT_20260611_VERSION = "2026-06-11-AUDIT-TIEMPOS-CALIDAD-NO-VACIOS"
+
+
+def _audit_str_20260611(value) -> str:
+    if value is None:
+        return ""
+    s = str(value).strip()
+    if s.upper() in {"NAN", "NONE", "NULL", "N/A", "NA", "<NA>", "NAT"}:
+        return ""
+    return s
+
+
+def _audit_norm_alnum_20260611(value: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", _audit_str_20260611(value).upper())
+
+
+def _audit_norm_cufe_20260611(value: str) -> str:
+    return re.sub(r"[^0-9a-f]", "", _audit_str_20260611(value).lower())
+
+
+def _audit_float_20260611(value) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        try:
+            return float(value)
+        except Exception:
+            return 0.0
+    s = _audit_str_20260611(value)
+    if not s:
+        return 0.0
+    s = s.replace("$", "").replace("COP", "").replace(" ", "")
+    if "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif "," in s:
+        s = s.replace(".", "").replace(",", ".")
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
+
+
+def _audit_cargar_filas_excel_20260611() -> List[Dict[str, object]]:
+    """Carga facturas.xlsx en formato lista de dict para diagnóstico de auditoría."""
+    try:
+        from openpyxl import load_workbook
+        if not os.path.exists(ARCHIVO_EXCEL):
+            return []
+        wb = load_workbook(ARCHIVO_EXCEL, data_only=True, read_only=True)
+        ws = wb["Facturas"] if "Facturas" in wb.sheetnames else wb.active
+        headers = [
+            _audit_str_20260611(ws.cell(row=1, column=c).value)
+            for c in range(1, ws.max_column + 1)
+        ]
+        rows: List[Dict[str, object]] = []
+        for r in range(2, ws.max_row + 1):
+            item = {}
+            for i, h in enumerate(headers, start=1):
+                if h:
+                    item[h] = ws.cell(row=r, column=i).value
+            if item:
+                rows.append(item)
+        try:
+            wb.close()
+        except Exception:
+            pass
+        return rows
+    except Exception as e:
+        print(f"[AUDIT 20260611] No pude cargar Excel para calidad: {e}")
+        return []
+
+
+def _audit_match_filas_excel_20260611(
+    detalle: Dict[str, object],
+    filas_excel: List[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    if not detalle or not filas_excel:
+        return []
+
+    cufe = _audit_norm_cufe_20260611(detalle.get("cufe"))
+    numero = _audit_norm_alnum_20260611(detalle.get("numero"))
+    pdf = os.path.basename(_audit_str_20260611(detalle.get("pdf_elegido"))).lower()
+    pdf_stem = Path(pdf).stem.lower() if pdf else ""
+
+    if cufe and len(cufe) >= 30:
+        m = [r for r in filas_excel if _audit_norm_cufe_20260611(r.get("CUFE")) == cufe]
+        if m:
+            return m
+
+    if numero:
+        m = [r for r in filas_excel if _audit_norm_alnum_20260611(r.get("Número de factura")) == numero]
+        if m:
+            return m
+
+    if pdf:
+        m = []
+        for r in filas_excel:
+            arc = os.path.basename(_audit_str_20260611(r.get("Archivo"))).lower()
+            arc_stem = Path(arc).stem.lower() if arc else ""
+            if not arc:
+                continue
+            if arc == pdf or arc_stem == pdf_stem:
+                m.append(r)
+        if m:
+            return m
+
+    return []
+
+
+def _audit_valor_total_desde_filas_20260611(filas: List[Dict[str, object]]) -> float:
+    total = 0.0
+    for f in filas or []:
+        concepto = _audit_str_20260611(f.get("Concepto")).lower()
+        if concepto == "total":
+            for col in ("VALOR", "Valor", "valor", "Total"):
+                if col in f:
+                    total = max(total, abs(_audit_float_20260611(f.get(col))))
+        elif "Total" in f:
+            total = max(total, abs(_audit_float_20260611(f.get("Total"))))
+    return float(total or 0.0)
+
+
+def _audit_calidad_desde_filas_20260611(
+    filas: List[Dict[str, object]],
+    detalle: Dict[str, object],
+) -> Dict[str, object]:
+    if not filas:
+        return {
+            "calidad_datos": "SIN_FILAS",
+            "score_calidad": 0,
+            "campos_faltantes": "sin_filas_excel_local",
+            "alertas_calidad": "SIN_FILAS",
+            "total_detectado_calidad": 0,
+        }
+
+    estado_detalle = _audit_str_20260611(detalle.get("estado")).lower()
+    tipo_resultado = _audit_str_20260611(detalle.get("tipo_resultado")).upper()
+
+    def any_val(col: str) -> str:
+        for f in filas:
+            v = _audit_str_20260611(f.get(col))
+            if v:
+                return v
+        return ""
+
+    descripcion = any_val("DescripcionLineas")
+    total = _audit_valor_total_desde_filas_20260611(filas)
+
+    checks = {
+        "numero": any_val("Número de factura"),
+        "empresa": any_val("Empresa emisora"),
+        "nit": any_val("NIT"),
+        "cliente": any_val("Cliente"),
+        "fecha": any_val("Año") and any_val("Mes") and any_val("Día"),
+        "descripcion": descripcion,
+        "radicado": any_val("Radicado"),
+        "proyecto": any_val("ProyectoProceso"),
+    }
+
+    faltantes = [k for k, v in checks.items() if not _audit_str_20260611(v)]
+    alertas = []
+
+    if total <= 0:
+        alertas.append("TOTAL_CERO_O_VACIO")
+    if not any_val("CUFE"):
+        alertas.append("SIN_CUFE")
+    if not any_val("NIT"):
+        alertas.append("SIN_NIT")
+    if not any_val("Cliente"):
+        alertas.append("SIN_CLIENTE")
+
+    desc_norm = normalize_text(descripcion or "")
+    es_minimo = (
+        "registro minimo" in desc_norm
+        or "registro mínimo" in descripcion.lower()
+        or "ok_registro_minimo" in estado_detalle
+        or "REGISTRO_MINIMO" in tipo_resultado
+    )
+
+    if es_minimo:
+        calidad = "MINIMA"
+        score = 25
+    elif total <= 0 or len(faltantes) >= 3:
+        calidad = "PARCIAL"
+        score = 60
+    else:
+        calidad = "COMPLETA"
+        score = 100
+
+    return {
+        "calidad_datos": calidad,
+        "score_calidad": score,
+        "campos_faltantes": ";".join(faltantes),
+        "alertas_calidad": ";".join(alertas),
+        "total_detectado_calidad": round(float(total or 0.0), 2),
+    }
+
+
+def _audit_enriquecer_detalle_con_calidad_20260611(
+    detalle_rows: List[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    if not detalle_rows:
+        return []
+
+    filas_excel = _audit_cargar_filas_excel_20260611()
+    enriquecidas: List[Dict[str, object]] = []
+
+    for row in detalle_rows:
+        d = dict(row or {})
+        try:
+            filas_generadas = int(d.get("filas_generadas") or d.get("nuevos") or 0)
+        except Exception:
+            filas_generadas = 0
+
+        if filas_generadas > 0:
+            filas_match = _audit_match_filas_excel_20260611(d, filas_excel)
+            calidad = _audit_calidad_desde_filas_20260611(filas_match, d)
+        else:
+            calidad = {
+                "calidad_datos": "SIN_FILAS",
+                "score_calidad": 0,
+                "campos_faltantes": "sin_filas_generadas",
+                "alertas_calidad": "SIN_FILAS",
+                "total_detectado_calidad": 0,
+            }
+
+        for k, v in calidad.items():
+            if not _audit_str_20260611(d.get(k)):
+                d[k] = v
+
+        dur = _audit_float_20260611(d.get("duracion_s"))
+        d.setdefault("tiempo_factura_s", round(dur, 3))
+        d.setdefault("tiempo_match_y_registro_s", round(dur, 3))
+        enriquecidas.append(d)
+
+    return enriquecidas
+
+
+def _audit_detalle_con_actividad_20260611(
+    detalle_rows: List[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    """Solo audita facturas con filas nuevas o errores reales."""
+    out: List[Dict[str, object]] = []
+    for row in detalle_rows or []:
+        d = dict(row or {})
+        try:
+            filas = int(d.get("filas_generadas") or d.get("nuevos") or 0)
+        except Exception:
+            filas = 0
+        estado = _audit_str_20260611(d.get("estado")).lower()
+        tipo = _audit_str_20260611(d.get("tipo_resultado")).upper()
+        error = _audit_str_20260611(d.get("error"))
+
+        if filas > 0:
+            out.append(d)
+            continue
+        # Política aprobada: si no hay filas nuevas, NO registrar detalle
+        # salvo errores reales. Mensajes sin match/sin datos/no registrables
+        # no deben llenar los audits diarios.
+        if "error" in estado or tipo == "ERROR":
+            out.append(d)
+            continue
+    return out
+
+
+def _audit_resumen_calidad_20260611(
+    detalle_rows: List[Dict[str, object]],
+) -> Dict[str, object]:
+    rows = []
+    for row in detalle_rows or []:
+        try:
+            filas = int(row.get("filas_generadas") or row.get("nuevos") or 0)
+        except Exception:
+            filas = 0
+        if filas > 0:
+            rows.append(row)
+
+    total = len(rows)
+    if total <= 0:
+        return {
+            "calidad_promedio_pct": 0,
+            "facturas_calidad_total": 0,
+            "facturas_calidad_completa": 0,
+            "facturas_calidad_parcial": 0,
+            "facturas_calidad_minima": 0,
+            "facturas_calidad_sin_filas": 0,
+            "facturas_total_cero_o_vacio": 0,
+            "facturas_sin_cufe": 0,
+            "facturas_sin_nit": 0,
+            "facturas_sin_cliente": 0,
+        }
+
+    completa = parcial = minima = sin_filas = 0
+    total_cero = sin_cufe = sin_nit = sin_cliente = 0
+    scores = []
+
+    for row in rows:
+        calidad = _audit_str_20260611(row.get("calidad_datos")).upper()
+        if calidad == "COMPLETA":
+            completa += 1
+        elif calidad == "MINIMA":
+            minima += 1
+        elif calidad == "SIN_FILAS":
+            sin_filas += 1
+        else:
+            parcial += 1
+
+        score = _audit_float_20260611(row.get("score_calidad"))
+        scores.append(score)
+
+        alertas = _audit_str_20260611(row.get("alertas_calidad")).upper()
+        if "TOTAL_CERO" in alertas:
+            total_cero += 1
+        if "SIN_CUFE" in alertas:
+            sin_cufe += 1
+        if "SIN_NIT" in alertas:
+            sin_nit += 1
+        if "SIN_CLIENTE" in alertas:
+            sin_cliente += 1
+
+    promedio = round(sum(scores) / len(scores), 2) if scores else 0
+    return {
+        "calidad_promedio_pct": promedio,
+        "facturas_calidad_total": total,
+        "facturas_calidad_completa": completa,
+        "facturas_calidad_parcial": parcial,
+        "facturas_calidad_minima": minima,
+        "facturas_calidad_sin_filas": sin_filas,
+        "facturas_total_cero_o_vacio": total_cero,
+        "facturas_sin_cufe": sin_cufe,
+        "facturas_sin_nit": sin_nit,
+        "facturas_sin_cliente": sin_cliente,
+    }
+
+
+def _audit_debe_escribir_run_20260611(
+    *,
+    nuevos_total: int = 0,
+    filas_local_total: int = 0,
+    filas_web_total: int = 0,
+    errores: int = 0,
+    detalle_rows: Optional[List[Dict[str, object]]] = None,
+) -> bool:
+    """Política aprobada: si no hay nada nuevo, no se registra corrida normal."""
+    if int(nuevos_total or 0) > 0:
+        return True
+    if int(filas_local_total or 0) > 0 or int(filas_web_total or 0) > 0:
+        return True
+    if int(errores or 0) > 0:
+        return True
+    if detalle_rows:
+        return True
+    # Política aprobada: una corrida sin nuevos no registra audit_runs,
+    # aunque la variable histórica AUDIT_WRITE_ONLY_IF_ACTIVITY esté apagada.
+    return False
+
+
 def _resolver_cufe_numero_final(
     *,
     regs: Optional[List[Dict[str, object]]] = None,
@@ -5180,11 +5550,16 @@ def run_desde_aprobadas(
     #             pass
     #         return
 
+    t0_aidx_20260611 = time.perf_counter()
     idx_cufe, idx_num, idx_num_match = _build_zip_index(
         since_days=since_days,
         max_zip_buscar=max_zip_buscar,
         aidx=aidx
     )
+    tiempo_aidx_s_20260611 = time.perf_counter() - t0_aidx_20260611
+    print(f"⏱️ [AIDX] Tiempo construcción/actualización índice: {tiempo_aidx_s_20260611:.2f} s")
+
+    t0_procesamiento_facturas_20260611 = time.perf_counter()
 
     cufes_existentes = obtener_cufes_existentes()
     norm_cufes_existentes = {_norm_cufe(x) for x in cufes_existentes}
@@ -7096,30 +7471,64 @@ def run_desde_aprobadas(
             print("🛑 Deteniendo flujo: varios PDFs con match pero sin nuevos registros.")
             break
 
+    tiempo_procesamiento_facturas_s_20260611 = 0.0
+    try:
+        tiempo_procesamiento_facturas_s_20260611 = max(
+            0.0,
+            time.perf_counter() - t0_procesamiento_facturas_20260611,
+        )
+    except Exception:
+        tiempo_procesamiento_facturas_s_20260611 = 0.0
+
+    t0_limpieza_20260611 = time.perf_counter()
     try:
         n = borrar_pdfs_en_arbol(TMP_DIR)
         print(f"🧹 Limpieza temp_check: borrados {n} PDF(s).")
     except Exception:
         print("⚠️ Limpieza temp_check: no se pudo completar.")
+    tiempo_limpieza_s_20260611 = time.perf_counter() - t0_limpieza_20260611
 
     total_secs = time.perf_counter() - t0_total
     fin_dt = datetime.datetime.now().isoformat(timespec="seconds")
 
     total_match = ok_total + dian_total
 
-    hubo_actividad = (msgs_procesados > 0) or (cnt_err > 0) or (nuevos_total > 0) or (cnt_dian > 0)
-    if (not AUDIT_WRITE_ONLY_IF_ACTIVITY) or hubo_actividad:
+    t0_audit_20260611 = time.perf_counter()
+    detalle_rows = _audit_enriquecer_detalle_con_calidad_20260611(detalle_rows)
+    detalle_rows_audit = _audit_detalle_con_actividad_20260611(detalle_rows)
+    resumen_calidad_20260611 = _audit_resumen_calidad_20260611(detalle_rows_audit)
+
+    hubo_actividad = _audit_debe_escribir_run_20260611(
+        nuevos_total=nuevos_total,
+        filas_local_total=filas_local_total,
+        filas_web_total=filas_web_total,
+        errores=cnt_err,
+        detalle_rows=detalle_rows_audit,
+    )
+
+    if hubo_actividad:
         try:
-            append_detalle_rows(AUDIT_DIR, AUDIT_DETALLE_PREFIX, detalle_rows)
+            append_detalle_rows(AUDIT_DIR, AUDIT_DETALLE_PREFIX, detalle_rows_audit)
         except Exception as e:
             print(f"⚠️ No pude escribir audit detalle CSV: {e}")
 
+        tiempo_audit_pre_run_20260611 = time.perf_counter() - t0_audit_20260611
         try:
             append_run_summary(AUDIT_DIR, AUDIT_RUNS_PREFIX, {
                 "run_id": run_id,
                 "inicio": inicio_dt,
                 "fin": fin_dt,
                 "duracion_s": round(total_secs, 3),
+                "tiempo_total_s": round(total_secs, 3),
+                "tiempo_aidx_s": round(float(locals().get("tiempo_aidx_s_20260611", 0.0) or 0.0), 3),
+                "tiempo_procesamiento_facturas_s": round(float(tiempo_procesamiento_facturas_s_20260611 or 0.0), 3),
+                "tiempo_limpieza_s": round(float(tiempo_limpieza_s_20260611 or 0.0), 3),
+                "tiempo_audit_s": round(float(tiempo_audit_pre_run_20260611 or 0.0), 3),
+                "tiempo_promedio_factura_s": round((sum(float(x[1] or 0.0) for x in resumen) / len(resumen)), 3) if resumen else 0,
+                "aidx_cufe_count": len(idx_cufe or {}),
+                "aidx_num_count": len(idx_num or {}),
+                "aidx_match_count": len(idx_num_match or {}),
+                "audit_detalle_rows": len(detalle_rows_audit),
                 "carpeta": APROB_FOLDER_NAME,
                 "since_days": since_days,
                 "max_aprobados": max_aprobados,
@@ -7138,7 +7547,7 @@ def run_desde_aprobadas(
                 "filas_local_total": filas_local_total,
                 "filas_web_total": filas_web_total,
 
-                # Resumen inteligente por factura (PASO 3.2)
+                # Resumen inteligente por factura
                 "total_match": total_match,
                 "match_total": total_match,
 
@@ -7160,10 +7569,14 @@ def run_desde_aprobadas(
                 "facturas_sin_registro": facturas_sin_registro,
                 "facturas_sin_filas": facturas_sin_registro,
 
+                **resumen_calidad_20260611,
+
                 "nota": "",
             })
         except Exception as e:
             print(f"⚠️ No pude escribir audit runs CSV: {e}")
+    else:
+        print("ℹ️ Auditoría: corrida sin filas nuevas ni errores reales; no se registra audit_runs/audit_detalle.")
 
     print("\n===== 📊 Resumen inteligente por factura =====")
     print(f"Procesadas: {msgs_procesados}")
@@ -8296,28 +8709,55 @@ def run_notas_credito_inbox_prueba(
         else:
             print("[NO APROBACIÓN] No se marca como leído por modo prueba.")
 
+    tiempo_procesamiento_facturas_s_20260611 = max(0.0, time.perf_counter() - t0_total)
+
+    t0_limpieza_20260611 = time.perf_counter()
     try:
         n = borrar_pdfs_en_arbol(TMP_DIR)
         print(f"🧹 Limpieza temp_check: borrados {n} PDF(s).")
     except Exception:
         pass
+    tiempo_limpieza_s_20260611 = time.perf_counter() - t0_limpieza_20260611
 
     total_secs = time.perf_counter() - t0_total
     fin_dt = datetime.datetime.now().isoformat(timespec="seconds")
 
-    hubo_actividad = (msgs_procesados > 0) or (nuevos_total > 0) or (cnt_err > 0)
-    if (not AUDIT_WRITE_ONLY_IF_ACTIVITY) or hubo_actividad:
+    t0_audit_20260611 = time.perf_counter()
+    detalle_rows = _audit_enriquecer_detalle_con_calidad_20260611(detalle_rows)
+    detalle_rows_audit = _audit_detalle_con_actividad_20260611(detalle_rows)
+    resumen_calidad_20260611 = _audit_resumen_calidad_20260611(detalle_rows_audit)
+
+    hubo_actividad = _audit_debe_escribir_run_20260611(
+        nuevos_total=nuevos_total,
+        filas_local_total=filas_local_total,
+        filas_web_total=filas_web_total,
+        errores=cnt_err,
+        detalle_rows=detalle_rows_audit,
+    )
+
+    if hubo_actividad:
         try:
-            append_detalle_rows(AUDIT_DIR, AUDIT_DETALLE_PREFIX, detalle_rows)
+            append_detalle_rows(AUDIT_DIR, AUDIT_DETALLE_PREFIX, detalle_rows_audit)
         except Exception as e:
             print(f"⚠️ No pude escribir audit detalle CSV: {e}")
 
+        tiempo_audit_pre_run_20260611 = time.perf_counter() - t0_audit_20260611
         try:
             append_run_summary(AUDIT_DIR, AUDIT_RUNS_PREFIX, {
                 "run_id": run_id,
                 "inicio": inicio_dt,
                 "fin": fin_dt,
                 "duracion_s": round(total_secs, 3),
+                "tiempo_total_s": round(total_secs, 3),
+                "tiempo_aidx_s": 0,
+                "tiempo_procesamiento_facturas_s": round(float(tiempo_procesamiento_facturas_s_20260611 or 0.0), 3),
+                "tiempo_limpieza_s": round(float(tiempo_limpieza_s_20260611 or 0.0), 3),
+                "tiempo_audit_s": round(float(tiempo_audit_pre_run_20260611 or 0.0), 3),
+                "tiempo_promedio_factura_s": round((sum(float(x[1] or 0.0) for x in resumen) / len(resumen)), 3) if resumen else 0,
+                "aidx_cufe_count": 0,
+                "aidx_num_count": 0,
+                "aidx_match_count": 0,
+                "audit_detalle_rows": len(detalle_rows_audit),
                 "carpeta": "INBOX_NOTA_CREDITO_PRUEBA",
                 "since_days": since_days,
                 "max_aprobados": max_correos,
@@ -8352,10 +8792,13 @@ def run_notas_credito_inbox_prueba(
                 "facturas_con_filas": facturas_con_filas,
                 "facturas_sin_registro": facturas_sin_registro,
                 "facturas_sin_filas": facturas_sin_registro,
+                **resumen_calidad_20260611,
                 "nota": "PRUEBA TEMPORAL INBOX asunto contiene nota credito; no marca leido por defecto",
             })
         except Exception as e:
             print(f"⚠️ No pude escribir audit runs CSV: {e}")
+    else:
+        print("ℹ️ Auditoría notas crédito: corrida sin filas nuevas ni errores reales; no se registra audit_runs/audit_detalle.")
 
     print("\n===== 📊 Resumen inteligente NOTA CRÉDITO INBOX =====")
     print(f"Mensajes leídos candidatos: {msgs_leidos}")
@@ -8381,4 +8824,4 @@ def run_notas_credito_inbox_prueba(
 
 
 
-print("🔥 CONTROLLER VERSION ACTIVA: 2026-06-09E-HISTORICO-ASC-MAX-PROCESAR-NO-REQUIERE-APROBACION")
+print("🔥 CONTROLLER VERSION ACTIVA: 2026-06-11-AUDIT-TIEMPOS-CALIDAD-NO-VACIOS")
