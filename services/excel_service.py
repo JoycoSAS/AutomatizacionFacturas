@@ -1,6 +1,7 @@
 # services/excel_service.py
 import os
 import re
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Set, Tuple
 
@@ -14,7 +15,7 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 from config import ARCHIVO_EXCEL, HISTORIAL_EXCEL
 from utils.safe_io import safe_save_pandas
 
-print("🔥 EXCEL_SERVICE VERSION ACTIVA: 2026-06-10-H1-NAN-VACIO-CALIDAD-MINIMA")
+print("🔥 EXCEL_SERVICE VERSION ACTIVA: 2026-06-10-H3-NAN-CALIDAD-ANTIDUP-RADICADO-MINIMA")
 
 
 CONCEPTOS_BASE_FIJOS = [
@@ -1391,6 +1392,207 @@ def _upsert_keys_row_excel_20260521(row: Dict[str, Any]) -> List[Tuple[str, str]
 
     return keys
 
+
+# ============================================================
+# PATCH 2026-06-10-H3 - Anti-duplicado estricto de registros mínimos por Radicado
+# ============================================================
+# Problema detectado en primera corrida de producción normal:
+# - Ya existía una factura COMPLETA por XML.
+# - Producción volvió a tomar el PDF de la misma aprobación/radicado.
+# - El PDF cayó a REGISTRO MÍNIMO y se insertó como si fuera otra factura,
+#   porque su llave era Radicado+Archivo+Número y no coincidía con Radicado+CUFE.
+#
+# Regla H2:
+# - Bloqueaba MINIMA / REGISTRO MÍNIMO si encontraba una fila mejor compatible
+#   para el mismo Radicado + Concepto usando número/empresa/archivo.
+#
+# Ajuste H3:
+# - Si una fila nueva es MINIMA / REGISTRO MÍNIMO y ya existe una fila mejor
+#   para el mismo Radicado + Concepto, NO se inserta, aunque el PDF tenga otro
+#   nombre, otra empresa mal extraída o un número incompleto.
+# - Si el Radicado no existe con una fila mejor, el mínimo se conserva para no
+#   perder casos legítimos sin XML o documentos no electrónicos.
+# ============================================================
+
+EMPRESA_TOKENS_IGNORAR_EXCEL = {
+    "S", "A", "SAS", "SA", "S A S", "LTDA", "LIMITADA", "CIA", "COMPANIA", "COMPAÑIA",
+    "COLOMBIA", "SUCURSAL", "NIT", "DE", "DEL", "LA", "EL", "Y", "EN",
+}
+
+
+def _normalizar_ascii_excel_20260610(v: Any) -> str:
+    s = _to_str(v).upper()
+    if not s:
+        return ""
+    try:
+        s = unicodedata.normalize("NFKD", s)
+        s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    except Exception:
+        pass
+    s = re.sub(r"[^A-Z0-9]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _normalizar_empresa_para_match_excel_20260610(v: Any) -> str:
+    s = _normalizar_ascii_excel_20260610(v)
+    if not s:
+        return ""
+    tokens = [t for t in s.split() if t and t not in EMPRESA_TOKENS_IGNORAR_EXCEL]
+    return " ".join(tokens)
+
+
+def _empresas_compatibles_excel_20260610(a: Any, b: Any) -> bool:
+    """
+    True si las empresas parecen la misma.
+    Si una de las dos viene vacía, no bloquea el match porque muchos registros
+    mínimos no tienen NIT/empresa completa.
+    """
+    ea = _normalizar_empresa_para_match_excel_20260610(a)
+    eb = _normalizar_empresa_para_match_excel_20260610(b)
+
+    if not ea or not eb:
+        return True
+
+    if ea == eb:
+        return True
+
+    if len(ea) >= 4 and len(eb) >= 4 and (ea in eb or eb in ea):
+        return True
+
+    ta = {t for t in ea.split() if len(t) >= 3}
+    tb = {t for t in eb.split() if len(t) >= 3}
+
+    if not ta or not tb:
+        return False
+
+    inter = ta & tb
+    return len(inter) >= max(1, min(len(ta), len(tb)) // 2)
+
+
+def _numeros_factura_compatibles_excel_20260610(a: Any, b: Any) -> bool:
+    na = _normalizar_numero_key_excel_20260512(a)
+    nb = _normalizar_numero_key_excel_20260512(b)
+
+    if not na or not nb:
+        return False
+
+    if na == nb:
+        return True
+
+    # Casos reales: PDF extrae "K2" y XML trae "K2B6164633".
+    # Se acepta prefijo/subcadena cuando hay mismo radicado y empresa compatible.
+    if len(na) >= 2 and nb.startswith(na):
+        return True
+    if len(nb) >= 2 and na.startswith(nb):
+        return True
+
+    if len(na) >= 4 and len(nb) >= 4 and (na in nb or nb in na):
+        return True
+
+    return False
+
+
+def _stems_archivo_compatibles_excel_20260610(a: Any, b: Any) -> bool:
+    aa = Path(_normalizar_texto_key_excel_20260512(a)).stem.upper()
+    bb = Path(_normalizar_texto_key_excel_20260512(b)).stem.upper()
+
+    aa = re.sub(r"[^A-Z0-9]+", "", aa)
+    bb = re.sub(r"[^A-Z0-9]+", "", bb)
+
+    if not aa or not bb:
+        return False
+
+    if aa == bb:
+        return True
+
+    if len(aa) >= 8 and len(bb) >= 8 and (aa in bb or bb in aa):
+        return True
+
+    return False
+
+
+def _row_es_minima_o_registro_minimo_excel_20260610(row: Dict[str, Any]) -> bool:
+    if not isinstance(row, dict):
+        return False
+
+    estado = _to_str(row.get(COLUMNA_ESTADO_CALIDAD)).upper()
+    descripcion = _to_str(row.get("DESCRIPCIÓN")).upper()
+    fuente_archivo = _to_str(row.get("Archivo")).upper()
+
+    if estado == "MINIMA":
+        return True
+
+    if "REGISTRO MINIMO" in descripcion or "REGISTRO MÍNIMO" in descripcion:
+        return True
+
+    # Algunos mínimos llegan sin descripción, pero con muchos campos base vacíos.
+    base_real_presentes = sum(
+        1
+        for c in CAMPOS_CALIDAD_BASE_REAL_EXCEL
+        if _valor_presente_calidad_excel(row.get(c))
+    )
+    if base_real_presentes <= 4 and not _valor_presente_calidad_excel(row.get("CUFE")):
+        return True
+
+    return False
+
+
+def _row_es_mejor_que_minima_excel_20260610(row: Dict[str, Any]) -> bool:
+    if not isinstance(row, dict):
+        return False
+
+    if _row_es_minima_o_registro_minimo_excel_20260610(row):
+        return False
+
+    estado = _to_str(row.get(COLUMNA_ESTADO_CALIDAD)).upper()
+    if estado in {"COMPLETA", "PARCIAL"}:
+        return True
+
+    if _valor_presente_calidad_excel(row.get("CUFE")) and _valor_presente_calidad_excel(row.get("NIT")):
+        return True
+
+    if _score_fila_para_merge_excel_20260521(row) >= 100:
+        return True
+
+    return False
+
+
+def _radicado_concepto_key_excel_20260610(row: Dict[str, Any]) -> Tuple[str, str] | None:
+    radicado = _normalizar_radicado_key_excel_20260512(row.get("Radicado"))
+    concepto = _normalizar_concepto_key_excel_20260512(row.get("Concepto"))
+    if not radicado or not concepto:
+        return None
+    return (radicado, concepto)
+
+
+def _row_minima_compatible_con_mejor_excel_20260610(minima: Dict[str, Any], mejor: Dict[str, Any]) -> bool:
+    """
+    Decide si una fila MINIMA parece duplicado de una fila mejor ya existente.
+    Se exige mismo Radicado+Concepto por índice externo y compatibilidad adicional.
+    """
+    if not _empresas_compatibles_excel_20260610(minima.get("Empresa emisora"), mejor.get("Empresa emisora")):
+        return False
+
+    if _numeros_factura_compatibles_excel_20260610(minima.get("Número de factura"), mejor.get("Número de factura")):
+        return True
+
+    if _stems_archivo_compatibles_excel_20260610(minima.get("Archivo"), mejor.get("Archivo")):
+        return True
+
+    # Si el mínimo no trae número confiable, pero la empresa coincide y el mejor tiene CUFE/NIT,
+    # se considera duplicado solo cuando el mínimo es claramente registro mínimo obligatorio.
+    desc = _to_str(minima.get("DESCRIPCIÓN")).upper()
+    if (
+        ("REGISTRO MINIMO" in desc or "REGISTRO MÍNIMO" in desc)
+        and _valor_presente_calidad_excel(mejor.get("CUFE"))
+        and _valor_presente_calidad_excel(mejor.get("NIT"))
+        and _empresas_compatibles_excel_20260610(minima.get("Empresa emisora"), mejor.get("Empresa emisora"))
+    ):
+        return True
+
+    return False
+
 def _row_signature_excel_20260512(row: Dict[str, Any]) -> str:
     parts = []
 
@@ -1432,15 +1634,48 @@ def _consolidar_filas_por_upsert_excel_20260512(
     filas_ordenadas: List[Dict[str, Any]] = []
     index_por_key: Dict[Tuple[str, str], int] = {}
     firma_por_idx: Dict[int, str] = {}
+    mejores_por_radicado_concepto: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
 
     nuevas = 0
     actualizadas = 0
+    minimas_bloqueadas = 0
 
     def registrar_keys(idx: int, row: Dict[str, Any]) -> None:
         """Registra todas las llaves seguras de una fila hacia el índice físico."""
         for k in _upsert_keys_row_excel_20260521(row):
             if k not in index_por_key:
                 index_por_key[k] = idx
+
+    def registrar_mejor(row: Dict[str, Any]) -> None:
+        """Indexa filas mejores que MINIMA por Radicado+Concepto para bloquear mínimos duplicados."""
+        if not _row_es_mejor_que_minima_excel_20260610(row):
+            return
+        k = _radicado_concepto_key_excel_20260610(row)
+        if not k:
+            return
+        bucket = mejores_por_radicado_concepto.setdefault(k, [])
+        bucket.append(row)
+
+    def es_minima_duplicada_de_mejor(row: Dict[str, Any]) -> bool:
+        """
+        Evita insertar PDF/registro mínimo cuando ya hay una fila mejor
+        para el mismo Radicado + Concepto.
+
+        H3 endurece la regla:
+        - No exige compatibilidad por empresa, número o archivo.
+        - Motivo: en registros mínimos esos campos pueden venir mal extraídos
+          o vacíos, como ocurrió con PDF mínimo frente a XML completo.
+        - Solo bloquea cuando ya existe una fila mejor indexada para el mismo
+          Radicado + Concepto. Si no existe mejor, el mínimo se deja pasar.
+        """
+        if not _row_es_minima_o_registro_minimo_excel_20260610(row):
+            return False
+
+        k = _radicado_concepto_key_excel_20260610(row)
+        if not k:
+            return False
+
+        return bool(mejores_por_radicado_concepto.get(k))
 
     def buscar_idx(row: Dict[str, Any]) -> int | None:
         """Busca por llave primaria y luego por llave legacy segura."""
@@ -1468,15 +1703,22 @@ def _consolidar_filas_por_upsert_excel_20260512(
             firma_por_idx[idx_existente] = _row_signature_excel_20260512(merged_row)
             registrar_keys(idx_existente, merged_row)
             registrar_keys(idx_existente, clean_row)
+            registrar_mejor(merged_row)
         else:
             idx = len(filas_ordenadas)
             filas_ordenadas.append(clean_row)
             firma_por_idx[idx] = _row_signature_excel_20260512(clean_row)
             registrar_keys(idx, clean_row)
+            registrar_mejor(clean_row)
 
     # 2) Upsert con filas nuevas.
     for row in nuevo.to_dict(orient="records"):
         clean_row = {col: row.get(col, "") for col in COLUMNAS_VALIDAS_FINALES}
+
+        if es_minima_duplicada_de_mejor(clean_row):
+            minimas_bloqueadas += 1
+            continue
+
         idx = buscar_idx(clean_row)
 
         if idx is not None:
@@ -1494,12 +1736,22 @@ def _consolidar_filas_por_upsert_excel_20260512(
 
             registrar_keys(idx, merged_row)
             registrar_keys(idx, clean_row)
+            registrar_mejor(merged_row)
         else:
             idx_nuevo = len(filas_ordenadas)
             filas_ordenadas.append(clean_row)
             firma_por_idx[idx_nuevo] = _row_signature_excel_20260512(clean_row)
             registrar_keys(idx_nuevo, clean_row)
+            registrar_mejor(clean_row)
             nuevas += 1
+
+    if minimas_bloqueadas:
+        facturas_aprox = minimas_bloqueadas // max(1, len(CONCEPTOS_BASE_FIJOS))
+        print(
+            "🛡️ [Excel anti-duplicado mínimo] "
+            f"filas_minimas_ignoradas={minimas_bloqueadas} | "
+            f"facturas_aprox={facturas_aprox}"
+        )
 
     final_df = pd.DataFrame(filas_ordenadas)
 

@@ -38,3 +38,25 @@ audit_runs_2026-02-24.csv.env.*
 .env_BACKUP*
 *_BACKUP*
 !.env.example
+
+# ============================================================
+# Contingencias, diagnósticos y respaldos locales
+# ============================================================
+data/contingencia_*/
+data/diagnosticos/
+
+# ============================================================
+# Scripts temporales de diagnóstico / contingencia
+# ============================================================
+scripts/crear_empalmado_*.py
+scripts/crear_excel_empalmado_*.py
+scripts/diagnosticar_*.py
+scripts/diagnostico_*.py
+scripts/probar_antiduplicado_minimo.py
+scripts/revisar_14_filas_empalmado.py
+scripts/revisar_radicados_nuevos_post_produccion.py
+scripts/validar_empalmado_*.py
+scripts/validar_facturas_*.py
+scripts/validar_processed_store_*.py
+scripts/validar_web_*.py
+scripts/verificar_env_facturas.py
