@@ -1,0 +1,493 @@
+# Snapshot seguro de .env
+# Generado: 2026-06-11T09:07:17
+# Los valores sensibles se reemplazan por ***REDACTED***
+
+# ============================================================
+
+# JOYCO - FACTURAS PROCESADOR
+
+# .env ÚNICO DE CONFIGURACIÓN
+
+# Versión documentada: 2026-06-09
+
+# ============================================================
+
+# ============================================================
+
+# OBJETIVO DE ESTE ARCHIVO
+
+# ------------------------------------------------------------
+
+# Este archivo es el PANEL DE CONTROL del automatizador.
+
+#
+
+# Regla oficial:
+
+# - Tú cambias la ejecución SOLO desde este archivo .env.
+
+# - NO cambies main_aprobadas_integrado.py para cambiar modo, días o límites.
+
+# - NO cambies controllers/aprobadas_controller.py para cambiar modo, días o límites.
+
+#
+
+# El main toma estas variables y se las pasa a los flujos:
+
+# 1. Flujo normal de facturas aprobadas.
+
+# 2. Flujo temporal de notas crédito Inbox, actualmente apagado.
+
+#
+
+# IMPORTANTE:
+
+# - Este archivo contiene secretos.
+
+# - NO subir .env a GitHub.
+
+# - Mantener .env en .gitignore.
+
+# ============================================================
+
+# ============================================================
+
+# 1. CREDENCIALES MICROSOFT / ENTRA ID
+
+# ============================================================
+
+# Estas credenciales permiten que Python se conecte a Microsoft Graph.
+
+# Se usan para leer correo, leer/actualizar SharePoint y actualizar Excel Web.
+
+#
+
+# IMPORTANTE:
+
+# Conserva aquí tus valores reales actuales.
+
+# No compartir. No subir a GitHub.
+
+# ============================================================
+
+TENANT_ID=***REDACTED***
+CLIENT_ID=***REDACTED***
+CLIENT_SECRET=***REDACTED***
+GRAPH_SCOPE=***REDACTED***
+
+# ============================================================
+
+# 2. SHAREPOINT PRINCIPAL - autoFacturas
+
+# ============================================================
+
+# Este bloque indica dónde está el SharePoint principal del proyecto.
+
+#
+
+# Aunque actualmente NO se suben PDF/XML/ZIP/adjuntos/extraídos a SharePoint,
+
+# esta configuración sigue siendo necesaria porque el sistema actualiza
+
+# el Excel Web por Workbook API.
+
+#
+
+# El Excel Web se espera dentro de:
+
+# SP_FOLDER/excel/facturas.xlsx
+
+# ============================================================
+
+SP_HOSTNAME=joycocia.sharepoint.com
+SP_SITE_PATH=/confin
+SP_DRIVE_ID=b!CY5d7fhsc0OhoSaMi5pTj3ZMdM95UX9Nq0zVVRcjqgdNrT94deddQafW3-2TKNRo
+SP_FOLDER=01 Causaciones y Facturacion/03 Pruebas Facturación
+
+# ============================================================
+
+# 3. SHAREPOINT GESTIÓN INFORMACIÓN / CORRESPONDENCIA
+
+# ============================================================
+
+# Este bloque se usa para datos relacionados con radicados/correspondencia.
+
+# No modificar salvo que Tecnología o el área cambien la ubicación real.
+
+# ============================================================
+
+SP_DRIVE_ID_RADICADOS=b!CY5d7fhsc0OhoSaMi5pTjwooglsTzWNMl9M6EzwMUwQ25hSZUYdxTJukkQfAGeeC
+SP_SITE_PATH_GESTION=/ginformacion
+SP_FOLDER_RADICADOS=Control de correspondencia Oficina Principal
+
+# ============================================================
+
+# 4. BUZÓN DE CORREO A LEER
+
+# ============================================================
+
+# Buzón que revisa el automatizador.
+
+#
+
+# Desde este buzón el sistema lee:
+
+# - Carpeta de aprobadas / solo aprobadas.
+
+# - Bandeja de entrada, si algún flujo especial se activa.
+
+# ============================================================
+
+MAILBOX_UPN=[radicacion@joyco.com.co](mailto:radicacion@joyco.com.co)
+APROB_FOLDER_NAME=solo aprobadas
+
+# ============================================================
+
+# 5. SSL
+
+# ============================================================
+
+# true  = valida certificados SSL. Recomendado en producción.
+
+# false = no valida certificados. Solo usar en pruebas puntuales.
+
+# ============================================================
+
+SSL_VERIFY=true
+
+# ============================================================
+
+# 6. PERFIL PRODUCCIÓN / EJECUCIÓN FRECUENTE
+
+# ============================================================
+
+# ESTE PERFIL ESTÁ ACTIVO.
+
+#
+
+# Uso recomendado:
+
+# - Cuando el sistema queda corriendo por Programador de tareas o VPS.
+
+# - Ejecución frecuente cada minuto o minuto y medio.
+
+# - Ventana corta de 6 días.
+
+# - Lee correos leídos y no leídos para no perder facturas abiertas manualmente.
+
+# - Usa ProcessedStore para evitar reprocesar.
+
+# - No marca correos como leídos.
+
+# - No procesa notas crédito desde Inbox.
+
+# - Las notas crédito y facturas sin aprobación se manejan desde "solo aprobadas"
+
+# cuando llegan como "No necesita aprobación".
+
+#
+
+# PARA ACTIVAR PRODUCCIÓN:
+
+# - Deja este punto 6 descomentado.
+
+# - Comenta TODO el punto 7 histórico.
+
+# ============================================================
+
+FACTURAS_MODO=PRODUCCION
+FACTURAS_SINCE_DAYS=6
+FACTURAS_MAX_MENSAJES=1000
+FACTURAS_MAX_ZIP_BUSCAR=1000
+FACTURAS_UNREAD_ONLY=0
+FACTURAS_USE_PROCESSED_STORE=1
+FACTURAS_MARCAR_LEIDO=0
+FACTURAS_RUN_APROBADAS=1
+FACTURAS_RUN_NOTAS_CREDITO=0
+FACTURAS_NOTA_CREDITO_VALORES_NEGATIVOS=0
+
+FACTURAS_ORDEN_HISTORICO=
+FACTURAS_PROCESAR_ANTIGUOS_PRIMERO=0
+FACTURAS_HISTORICO_DESDE=
+FACTURAS_HISTORICO_HASTA=
+FACTURAS_DISABLE_AUTOSTOP=0
+FACTURAS_HISTORICO_DRY_RUN=0
+
+AUTO_STOP_MIN_PROCESADOS=3
+AUTO_STOP_SIN_NUEVOS_CONSEC=3
+AUTO_STOP_SIN_MATCH_CONSEC=5
+
+LOCK_TTL_SECONDS=3600
+
+
+# ============================================================
+
+# 7. PERFIL HISTÓRICO / REPROCESO / PRUEBA LOCAL
+
+# ============================================================
+
+# ESTE PERFIL ESTÁ COMENTADO.
+
+#
+
+# Uso recomendado:
+
+# - Pruebas locales.
+
+# - Reproceso histórico desde abril.
+
+# - Comparaciones antes/después.
+
+# - Cargas grandes controladas.
+
+#
+
+# Qué hace:
+
+# - Busca una ventana amplia.
+
+# - Lee correos leídos y no leídos.
+
+# - No usa ProcessedStore.
+
+# - No marca correos como leídos.
+
+# - Procesa de más antiguo a más reciente.
+
+# - Desactiva auto-stop para no cortar el recorrido histórico.
+
+#
+
+# IMPORTANTE:
+
+# - Por seguridad inicia en DRY-RUN.
+
+# - Con FACTURAS_HISTORICO_DRY_RUN=1 solo valida el orden.
+
+# - No debe escribir Excel, no debe subir a SharePoint,
+
+# no debe descargar adjuntos y no debe marcar correos.
+
+#
+
+# PARA ACTIVAR HISTÓRICO:
+
+# - Comenta TODO el punto 6 producción.
+
+# - Descomenta TODO este punto 7.
+
+#
+
+# PARA HISTÓRICO REAL:
+
+# - Primero validar con DRY-RUN.
+
+# - Luego cambiar FACTURAS_HISTORICO_DRY_RUN=0.
+
+# - Subir límites si se va a correr completo.
+
+# ============================================================
+
+#FACTURAS_MODO=HISTORICO
+
+#FACTURAS_SINCE_DAYS=120
+
+#FACTURAS_MAX_MENSAJES=1000
+
+#FACTURAS_MAX_PROCESAR_HISTORICO=10
+
+#FACTURAS_MAX_ZIP_BUSCAR=1000
+
+#FACTURAS_UNREAD_ONLY=0
+
+#FACTURAS_USE_PROCESSED_STORE=1
+
+#FACTURAS_MARCAR_LEIDO=0
+
+#FACTURAS_RUN_APROBADAS=1
+
+#FACTURAS_RUN_NOTAS_CREDITO=0
+
+#FACTURAS_NOTA_CREDITO_VALORES_NEGATIVOS=0
+
+#FACTURAS_ORDEN_HISTORICO=ASC
+
+#FACTURAS_PROCESAR_ANTIGUOS_PRIMERO=1
+
+#FACTURAS_HISTORICO_DESDE=2026-04-01
+
+#FACTURAS_HISTORICO_HASTA=2026-06-09
+
+#FACTURAS_DISABLE_AUTOSTOP=1
+
+#FACTURAS_HISTORICO_DRY_RUN=0
+
+#AUTO_STOP_MIN_PROCESADOS=3
+
+#AUTO_STOP_SIN_NUEVOS_CONSEC=3
+
+#AUTO_STOP_SIN_MATCH_CONSEC=5
+
+#LOCK_TTL_SECONDS=14400
+
+# ============================================================
+
+# 8. STATE / PROCESSED STORE / AIDX
+
+# ============================================================
+
+# PROCESSED_MESSAGES_TTL_DAYS:
+
+# Días que se conserva el control de mensajes ya procesados.
+
+# Producción recomendado: 365.
+
+#
+
+# ATTACHMENT_INDEX_TTL_DAYS:
+
+# Días que se conserva el índice de adjuntos/ZIP/XML.
+
+# Esto ayuda al AIDX a encontrar archivos relacionados sin escanear todo.
+
+#
+
+# Recomendado:
+
+# 365 = un año.
+
+# 730 = dos años, si quieres más histórico.
+
+# ============================================================
+
+PROCESSED_MESSAGES_TTL_DAYS=365
+ATTACHMENT_INDEX_TTL_DAYS=365
+
+# ============================================================
+
+# 9. SHAREPOINT - DOCUMENTOS PESADOS
+
+# ============================================================
+
+# Esta es la mejora actual.
+
+#
+
+# FACTURAS_FORZAR_SOLO_EXCEL_SP=1 hace que el main fuerce internamente:
+
+# - SP_UPLOAD_DOCUMENTOS=0
+
+# - SP_UPLOAD_HISTORIAL=0
+
+# - SP_ENSURE_DOCUMENT_FOLDERS=0
+
+#
+
+# Resultado:
+
+# - Descargar PDF/XML/ZIP localmente: SÍ
+
+# - Extraer localmente: SÍ
+
+# - Procesar localmente: SÍ
+
+# - Limpiar temporales locales: SÍ
+
+# - Subir PDF/XML/ZIP/adjuntos/extraídos a SharePoint: NO
+
+# - Actualizar Excel Web por Workbook API: SÍ
+
+# - Actualizar Excel local: SÍ
+
+#
+
+# Déjalo en 1 para no volver a subir documentos pesados.
+
+# ============================================================
+
+FACTURAS_FORZAR_SOLO_EXCEL_SP=1
+SP_UPLOAD_DOCUMENTOS=0
+SP_UPLOAD_HISTORIAL=0
+SP_ENSURE_DOCUMENT_FOLDERS=0
+
+# ============================================================
+
+# 10. VARIABLES ANTIGUAS - NO USAR PARA CONTROLAR LA CORRIDA
+
+# ============================================================
+
+# Antes se usaban estas variables:
+
+# - MAIL_UNREAD_ONLY
+
+# - MAIL_LOOKBACK_DAYS
+
+# - MAX_MESSAGES
+
+# - STOP_AFTER_ALREADY_PROCESSED
+
+#
+
+# Ahora el control oficial está arriba con FACTURAS_*.
+
+#
+
+# El main sincroniza internamente:
+
+# - FACTURAS_SINCE_DAYS   -> MAIL_LOOKBACK_DAYS
+
+# - FACTURAS_UNREAD_ONLY  -> MAIL_UNREAD_ONLY
+
+# - FACTURAS_MAX_MENSAJES -> MAX_MESSAGES
+
+#
+
+# Por eso se dejan comentadas para evitar doble configuración.
+
+# ============================================================
+
+# MAIL_UNREAD_ONLY=false
+
+# MAIL_LOOKBACK_DAYS=90
+
+# MAX_MESSAGES=3000
+
+# STOP_AFTER_ALREADY_PROCESSED=5
+
+# ============================================================
+
+# 11. NOTA IMPORTANTE SOBRE PRODUCCIÓN
+
+# ============================================================
+
+# En producción dejamos:
+
+#
+
+# FACTURAS_UNREAD_ONLY=0
+
+#
+
+# Esto es intencional.
+
+#
+
+# Motivo:
+
+# Si alguien abre o lee manualmente un correo, y el sistema solo buscara
+
+# no leídos, esa factura podría quedar por fuera.
+
+#
+
+# Para evitar reprocesos infinitos usamos:
+
+#
+
+# FACTURAS_USE_PROCESSED_STORE=1
+
+#
+
+# Además, el Excel local/Web tiene dedupe para evitar duplicados.
+
+# ============================================================

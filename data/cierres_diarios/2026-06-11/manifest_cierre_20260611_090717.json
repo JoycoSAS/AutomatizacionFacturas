@@ -1,0 +1,57 @@
+{
+  "version": "2026-06-11-CIERRE-DIARIO-SEGURO-V2-SNAPSHOT-SEGURO",
+  "fecha": "2026-06-11",
+  "timestamp": "20260611_090717",
+  "estado": "OK",
+  "root": "C:\\Users\\Infraestructura\\Downloads\\facturas_procesador",
+  "destino": "C:\\Users\\Infraestructura\\Downloads\\facturas_procesador\\data\\cierres_diarios\\2026-06-11",
+  "locks": [],
+  "archivos": [
+    {
+      "origen": "C:\\Users\\Infraestructura\\Downloads\\facturas_procesador\\data\\audit\\audit_runs_2026-06-11.csv",
+      "existe": true,
+      "copiado": true,
+      "destino": "C:\\Users\\Infraestructura\\Downloads\\facturas_procesador\\data\\cierres_diarios\\2026-06-11\\audit_runs_2026-06-11.csv",
+      "size_bytes": 910,
+      "sha256": "4b20a261ebc4a39c5b1abad6f9c045e0f6111e3c29cabd4523dd31417e3ee39c",
+      "error": ""
+    },
+    {
+      "origen": "C:\\Users\\Infraestructura\\Downloads\\facturas_procesador\\data\\audit\\audit_detalle_2026-06-11.csv",
+      "existe": true,
+      "copiado": true,
+      "destino": "C:\\Users\\Infraestructura\\Downloads\\facturas_procesador\\data\\cierres_diarios\\2026-06-11\\audit_detalle_2026-06-11.csv",
+      "size_bytes": 1900,
+      "sha256": "613680a44a4964025ad503c859d6edd15c93a8e5afcd1ba33eb4279fc7a60171",
+      "error": ""
+    },
+    {
+      "origen": "C:\\Users\\Infraestructura\\Downloads\\facturas_procesador\\data\\state\\processed_messages.json",
+      "existe": true,
+      "copiado": true,
+      "destino": "C:\\Users\\Infraestructura\\Downloads\\facturas_procesador\\data\\cierres_diarios\\2026-06-11\\processed_messages.json",
+      "size_bytes": 18947,
+      "sha256": "099e5f898144c7b2f51d902bc72335fc46be1bf7cb502d74154a339ec37e9c88",
+      "error": ""
+    },
+    {
+      "origen": "C:\\Users\\Infraestructura\\Downloads\\facturas_procesador\\data\\state\\attachment_index_store.json",
+      "existe": true,
+      "copiado": true,
+      "destino": "C:\\Users\\Infraestructura\\Downloads\\facturas_procesador\\data\\cierres_diarios\\2026-06-11\\attachment_index_store.json",
+      "size_bytes": 12526898,
+      "sha256": "22c81db72e6acdbb30cc43546a16e29255e3876c832884bea40e5cf5dae7513c",
+      "error": ""
+    },
+    {
+      "origen": "C:\\Users\\Infraestructura\\Downloads\\facturas_procesador\\.env",
+      "existe": true,
+      "copiado": true,
+      "destino": "C:\\Users\\Infraestructura\\Downloads\\facturas_procesador\\data\\cierres_diarios\\2026-06-11\\env_snapshot_redacted_20260611_090717.txt",
+      "size_bytes": 10757,
+      "sha256": "5f8281580a5d3cf133c610c7c90826666ba598bf904d0c9eb08ec26155e4ddfe",
+      "error": "",
+      "tipo": "env_snapshot_redacted"
+    }
+  ]
+}
