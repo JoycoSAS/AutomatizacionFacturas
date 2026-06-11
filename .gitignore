@@ -60,3 +60,6 @@ scripts/validar_facturas_*.py
 scripts/validar_processed_store_*.py
 scripts/validar_web_*.py
 scripts/verificar_env_facturas.py
+
+data/cierres_diarios/
+data/backups_mensuales/
