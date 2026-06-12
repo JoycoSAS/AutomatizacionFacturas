@@ -6,6 +6,7 @@ import datetime
 import time
 import shutil
 import uuid
+import json
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 import xml.etree.ElementTree as ET
@@ -217,6 +218,200 @@ CONCEPTOS_BASE_FIJOS = (
     "Retención en la fuente",
     "Total",
 )
+
+
+
+# ============================================================
+# PATCH 2026-06-11 - AIDX incremental real / reducción de reproceso
+# ============================================================
+# Problema detectado:
+# - En cada ejecución se estaba recorriendo la ventana completa de Inbox
+#   y descargando/parsing ZIPs ya revisados en corridas anteriores.
+# - Para una sola factura el AIDX llegó a tomar ~165s.
+#
+# Corrección:
+# - Se mantiene AttachmentIndexStore como índice histórico.
+# - Se agrega cache de mensajes ya revisados por el prefetch.
+# - Si un mensaje ya tiene ZIPs indexados o ya fue revisado sin ZIPs,
+#   no se vuelve a listar/descargar/parsing en cada corrida.
+# - Los ZIPs históricos se siguen descargando bajo demanda cuando una
+#   factura aprobada los necesita para registrar el XML.
+# ============================================================
+
+AIDX_PREFETCH_SEEN_PATH = os.path.join(DATA_DIR, "state", "attachment_index_seen_messages.json")
+
+
+def _aidx_debug_verbose_controller_20260611() -> bool:
+    """
+    En producción el log detallado AIDX no debe imprimir cada mensaje/XML.
+    Para diagnóstico puntual activar en .env:
+        AIDX_DEBUG_VERBOSE=1
+    """
+    value = str(os.getenv("AIDX_DEBUG_VERBOSE", "0") or "0").strip().lower()
+    return value in {"1", "true", "yes", "si", "sí", "on"}
+
+
+
+
+def _env_bool_controller_20260612(name: str, default: str = "0") -> bool:
+    value = str(os.getenv(name, default) or default).strip().lower()
+    return value in {"1", "true", "yes", "si", "sí", "on"}
+
+
+def _aidx_fast_lookup_first_controller_20260612() -> bool:
+    """
+    Optimización conservadora:
+    - Primero intenta usar el índice histórico ya guardado.
+    - No construye el prefetch masivo al inicio.
+    - Si no encuentra match, el fallback completo puede construir el AIDX tradicional.
+    """
+    return _env_bool_controller_20260612("AIDX_FAST_LOOKUP_FIRST", "1")
+
+
+def _aidx_full_fallback_controller_20260612() -> bool:
+    """
+    Respaldo de seguridad:
+    Si la búsqueda rápida/histórica no encuentra el ZIP, se activa el
+    AIDX completo tradicional antes de caer a PDF fallback o registro mínimo.
+    Debe quedar activo en producción para no perder efectividad de match.
+    """
+    return _env_bool_controller_20260612("AIDX_FULL_FALLBACK", "1")
+
+
+def _match_debug_verbose_controller_20260612() -> bool:
+    """
+    Apaga logs pesados de MATCH en producción.
+    No cambia lógica de negocio ni reglas de match.
+    Para diagnosticar un caso puntual:
+        MATCH_DEBUG_VERBOSE=1
+    """
+    return _env_bool_controller_20260612("MATCH_DEBUG_VERBOSE", "0")
+
+
+def _leer_json_seguro_controller_20260611(path: str, default):
+    try:
+        if not path or not os.path.exists(path):
+            return default
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def _guardar_json_seguro_controller_20260611(path: str, data) -> None:
+    try:
+        folder = os.path.dirname(path)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+        os.replace(tmp, path)
+    except Exception as e:
+        print(f"[AIDX CACHE] No pude guardar cache de mensajes revisados: {e}")
+
+
+def _collect_msg_ids_from_any_controller_20260611(obj) -> set[str]:
+    """
+    Lee de forma tolerante attachment_index_store.json sin depender de
+    una estructura exacta. Busca cualquier campo que parezca msg_id.
+    """
+    ids: set[str] = set()
+
+    def walk(x):
+        if isinstance(x, dict):
+            mid = (
+                x.get("msg_id")
+                or x.get("message_id")
+                or x.get("id_mensaje")
+                or x.get("messageId")
+            )
+            if mid:
+                ids.add(str(mid))
+            for v in x.values():
+                walk(v)
+        elif isinstance(x, list):
+            for item in x:
+                walk(item)
+
+    walk(obj)
+    return ids
+
+
+def _aidx_msg_ids_ya_indexados_controller_20260611() -> set[str]:
+    data = _leer_json_seguro_controller_20260611(ATTACHMENT_INDEX_PATH, {})
+    return _collect_msg_ids_from_any_controller_20260611(data)
+
+
+def _leer_aidx_seen_controller_20260611() -> Dict[str, Dict[str, object]]:
+    data = _leer_json_seguro_controller_20260611(AIDX_PREFETCH_SEEN_PATH, {})
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): (v if isinstance(v, dict) else {}) for k, v in data.items() if k}
+
+
+def _guardar_aidx_seen_controller_20260611(
+    seen: Dict[str, Dict[str, object]],
+    ttl_days: int = 365,
+) -> None:
+    """
+    Guarda cache de mensajes revisados, eliminando entradas vencidas.
+    Usa como TTL el mismo horizonte del AIDX para que no crezca sin control.
+    """
+    if not isinstance(seen, dict):
+        return
+
+    try:
+        ttl_days = max(1, int(ttl_days or 365))
+    except Exception:
+        ttl_days = 365
+
+    limite = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=ttl_days)
+    limpio: Dict[str, Dict[str, object]] = {}
+
+    for mid, info in seen.items():
+        if not mid:
+            continue
+
+        info = info if isinstance(info, dict) else {}
+        ts = str(info.get("seen_at") or "").strip()
+
+        if ts:
+            try:
+                dt = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=datetime.timezone.utc)
+                if dt < limite:
+                    continue
+            except Exception:
+                pass
+
+        limpio[str(mid)] = info
+
+    _guardar_json_seguro_controller_20260611(AIDX_PREFETCH_SEEN_PATH, limpio)
+
+
+def _aidx_seen_marcar_controller_20260611(
+    seen: Dict[str, Dict[str, object]],
+    msg_id: str,
+    *,
+    subject: str = "",
+    received_dt: str = "",
+    zip_count: int = 0,
+    status: str = "ok",
+) -> None:
+    if not msg_id:
+        return
+
+    seen[str(msg_id)] = {
+        "seen_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "receivedDateTime": received_dt or "",
+        "subject": (subject or "")[:300],
+        "zip_count": int(zip_count or 0),
+        "status": status or "ok",
+    }
 
 
 def _float_seguro(valor) -> float:
@@ -1235,7 +1430,7 @@ def _push_detalle(
 # - Medir explícitamente el tiempo de construcción/uso inicial de AIDX.
 # ============================================================
 
-_AUDIT_20260611_VERSION = "2026-06-11-AUDIT-TIEMPOS-CALIDAD-NO-VACIOS"
+_AUDIT_20260611_VERSION = "2026-06-12-AUDIT-ITERROWS-AIDX-FAST-FALLBACK"
 
 
 def _audit_str_20260611(value) -> str:
@@ -1281,34 +1476,81 @@ def _audit_float_20260611(value) -> float:
 
 
 def _audit_cargar_filas_excel_20260611() -> List[Dict[str, object]]:
-    """Carga facturas.xlsx en formato lista de dict para diagnóstico de auditoría."""
+    """
+    Carga facturas.xlsx para diagnóstico de auditoría usando lectura lineal.
+
+    Corrección 2026-06-11 V2:
+    - NO usar ws.cell(row, column) en read_only porque openpyxl vuelve a
+      recorrer el XML interno muchas veces y puede dejar la ejecución colgada.
+    - Usar ws.iter_rows(values_only=True), que recorre el Excel una sola vez.
+    """
+    t0 = time.perf_counter()
+    wb = None
+
     try:
         from openpyxl import load_workbook
+
         if not os.path.exists(ARCHIVO_EXCEL):
             return []
-        wb = load_workbook(ARCHIVO_EXCEL, data_only=True, read_only=True)
+
+        wb = load_workbook(
+            ARCHIVO_EXCEL,
+            data_only=True,
+            read_only=True,
+            keep_links=False,
+        )
         ws = wb["Facturas"] if "Facturas" in wb.sheetnames else wb.active
-        headers = [
-            _audit_str_20260611(ws.cell(row=1, column=c).value)
-            for c in range(1, ws.max_column + 1)
-        ]
+
+        rows_iter = ws.iter_rows(values_only=True)
+        header_row = next(rows_iter, None)
+        if not header_row:
+            return []
+
+        # Guardamos posiciones reales para evitar columnas vacías del Excel.
+        header_positions = []
+        for idx, raw_header in enumerate(header_row):
+            h = _audit_str_20260611(raw_header)
+            if h:
+                header_positions.append((idx, h))
+
+        if not header_positions:
+            return []
+
         rows: List[Dict[str, object]] = []
-        for r in range(2, ws.max_row + 1):
-            item = {}
-            for i, h in enumerate(headers, start=1):
-                if h:
-                    item[h] = ws.cell(row=r, column=i).value
-            if item:
+
+        for values in rows_iter:
+            if values is None:
+                continue
+
+            item: Dict[str, object] = {}
+            tiene_valor = False
+
+            for idx, h in header_positions:
+                value = values[idx] if idx < len(values) else None
+                item[h] = value
+                if value not in (None, ""):
+                    tiene_valor = True
+
+            if tiene_valor:
                 rows.append(item)
-        try:
-            wb.close()
-        except Exception:
-            pass
+
+        secs = time.perf_counter() - t0
+        print(
+            f"[AUDIT 20260611] Excel cargado por iter_rows: "
+            f"filas={len(rows)} | columnas={len(header_positions)} | tiempo={secs:.2f}s"
+        )
         return rows
+
     except Exception as e:
         print(f"[AUDIT 20260611] No pude cargar Excel para calidad: {e}")
         return []
 
+    finally:
+        try:
+            if wb is not None:
+                wb.close()
+        except Exception:
+            pass
 
 def _audit_match_filas_excel_20260611(
     detalle: Dict[str, object],
@@ -2712,6 +2954,9 @@ def _seleccionar_mejor_pdf(
 
 
 def _debug_top_similares_idx(idx_num: Dict[str, Tuple[str, bytes]], numero: str, limite: int = 15):
+    if not _match_debug_verbose_controller_20260612():
+        return
+
     try:
         objetivo = _solo_alnum(numero or "")
         if not objetivo:
@@ -2802,6 +3047,8 @@ def _build_zip_index(
     idx_num: Dict[str, Tuple[str, bytes]] = {}
     idx_num_match: Dict[str, Tuple[str, bytes]] = {}
 
+    verbose = _aidx_debug_verbose_controller_20260611()
+
     mensajes_fuente = []
 
     try:
@@ -2855,33 +3102,66 @@ def _build_zip_index(
 
     print(f"📦 Prefetch ZIPs: {len(candidatos)} mensajes candidatos (ventana {since_days} día(s))")
 
+    # Cache incremental:
+    # 1) aidx_msg_ids: mensajes que ya dejaron ZIP/XML indexado en attachment_index_store.json.
+    # 2) aidx_seen: mensajes ya revisados por el prefetch, incluso si no tenían ZIP.
+    # Con esto no volvemos a descargar/parsing los mismos ZIPs en cada ejecución.
+    aidx_seen = _leer_aidx_seen_controller_20260611()
+    aidx_msg_ids = _aidx_msg_ids_ya_indexados_controller_20260611()
+
     vistos_zip_ids = set()
+    aidx_skip_revisados = 0
+    mensajes_revisados_nuevos = 0
+    zips_descargados = 0
+    zips_errores = 0
 
     for i_msg, imsg in enumerate(candidatos, start=1):
         mid = imsg.get("id")
         if not mid:
             continue
 
+        mid_str = str(mid)
+
+        if mid_str in aidx_msg_ids or mid_str in aidx_seen:
+            aidx_skip_revisados += 1
+            continue
+
         try:
             zips = listar_adjuntos_zip(mid) or []
         except Exception as e:
-            print(f"[AIDX DEBUG] No pude listar adjuntos ZIP del mensaje {mid}: {e}")
+            print(f"[AIDX] No pude listar adjuntos ZIP del mensaje {mid}: {e}")
             zips = []
+            zips_errores += 1
 
-        try:
-            print(
-                f"[AIDX DEBUG] mensaje={mid} | "
-                f"asunto={(imsg.get('subject') or '')[:120]} | "
-                f"zip_count={len(zips)} | "
-                f"progreso={i_msg}/{len(candidatos)}"
-            )
-        except Exception:
-            pass
+        mensajes_revisados_nuevos += 1
 
+        if verbose:
+            try:
+                print(
+                    f"[AIDX DEBUG] mensaje={mid} | "
+                    f"asunto={(imsg.get('subject') or '')[:120]} | "
+                    f"zip_count={len(zips)} | "
+                    f"progreso={i_msg}/{len(candidatos)}"
+                )
+            except Exception:
+                pass
+
+        # Si no trae ZIP, ya queda revisado para no volver a consultar adjuntos
+        # en próximas corridas.
         if not zips:
+            _aidx_seen_marcar_controller_20260611(
+                aidx_seen,
+                mid_str,
+                subject=imsg.get("subject") or "",
+                received_dt=imsg.get("receivedDateTime", "") or "",
+                zip_count=0,
+                status="sin_zip",
+            )
             continue
 
         asunto_zip = imsg.get("subject") or ""
+        error_en_mensaje = False
+        zips_utiles_mensaje = 0
 
         for z in zips:
             zid = z.get("id")
@@ -2894,19 +3174,24 @@ def _build_zip_index(
 
             zname = z.get("name") or f"{zid}.zip"
 
-            try:
-                print(f"[AIDX DEBUG] ZIP detectado: {zname} | id={zid}")
-            except Exception:
-                pass
+            if verbose:
+                try:
+                    print(f"[AIDX DEBUG] ZIP detectado: {zname} | id={zid}")
+                except Exception:
+                    pass
 
             tmp_zip = os.path.join(TMP_DIR, f"prefetch_{uuid.uuid4().hex}_{re.sub(r'[^A-Za-z0-9_. -]', '_', zname)}")
             if not descargar_adjunto_por_id(mid, zid, tmp_zip):
-                print(f"[AIDX DEBUG] No se pudo descargar ZIP: {zname}")
+                if verbose:
+                    print(f"[AIDX DEBUG] No se pudo descargar ZIP: {zname}")
+                error_en_mensaje = True
+                zips_errores += 1
                 continue
 
             try:
                 with open(tmp_zip, "rb") as f:
                     zip_bytes = f.read()
+                zips_descargados += 1
             finally:
                 try:
                     os.remove(tmp_zip)
@@ -2915,7 +3200,7 @@ def _build_zip_index(
 
             idents_xml = _peek_ident_xml_from_zip_bytes(zip_bytes)
 
-            if not idents_xml:
+            if not idents_xml and verbose:
                 print(f"[AIDX DEBUG] ZIP sin XMLs útiles o no legibles: {zname}")
 
             for tk in _tokens_match_from_text(asunto_zip):
@@ -2937,14 +3222,15 @@ def _build_zip_index(
                 fec_raw = (ident_xml.get("FECHA") or "").strip()
                 fec_norm = (normalizar_fecha(fec_raw) or fec_raw) if fec_raw else ""
 
-                try:
-                    print(
-                        f"[AIDX DEBUG] XML en ZIP={zname} | "
-                        f"xml_name={ident_xml.get('xml_name')} | "
-                        f"CUFE={cufe or '-'} | NUMERO={num_raw or '-'} | FECHA={fec_norm or '-'}"
-                    )
-                except Exception:
-                    pass
+                if verbose:
+                    try:
+                        print(
+                            f"[AIDX DEBUG] XML en ZIP={zname} | "
+                            f"xml_name={ident_xml.get('xml_name')} | "
+                            f"CUFE={cufe or '-'} | NUMERO={num_raw or '-'} | FECHA={fec_norm or '-'}"
+                        )
+                    except Exception:
+                        pass
 
                 try:
                     aidx.upsert_zip(
@@ -2956,8 +3242,11 @@ def _build_zip_index(
                         att_name=zname,
                         received_dt_iso=imsg.get("receivedDateTime", "") or "",
                     )
+                    zips_utiles_mensaje += 1
                 except Exception as e:
                     print(f"[AIDX] No pude upsert ZIP index: {e}")
+                    error_en_mensaje = True
+                    zips_errores += 1
 
                 if cufe and cufe not in idx_cufe:
                     idx_cufe[cufe] = (zname, zip_bytes)
@@ -2973,43 +3262,95 @@ def _build_zip_index(
 
             if len(idx_cufe) >= 2500 and len(idx_num_match) >= 2500:
                 print("🛑 Índice suficiente; deteniendo prefetch temprano.")
-                print(f"✅ Índice parcial: {len(idx_cufe)} por CUFE, {len(idx_num)} por NUMERO, {len(idx_num_match)} por MATCH")
+
+                if not error_en_mensaje:
+                    _aidx_seen_marcar_controller_20260611(
+                        aidx_seen,
+                        mid_str,
+                        subject=imsg.get("subject") or "",
+                        received_dt=imsg.get("receivedDateTime", "") or "",
+                        zip_count=len(zips),
+                        status="zip_indexado",
+                    )
+
+                _guardar_aidx_seen_controller_20260611(
+                    aidx_seen,
+                    ttl_days=ATTACHMENT_INDEX_TTL_DAYS,
+                )
+
+                print(
+                    f"✅ Índice parcial: {len(idx_cufe)} por CUFE, "
+                    f"{len(idx_num)} por NUMERO, {len(idx_num_match)} por MATCH"
+                )
+                print(
+                    f"♻️ [AIDX] omitidos_cache={aidx_skip_revisados} | "
+                    f"mensajes_revisados_nuevos={mensajes_revisados_nuevos} | "
+                    f"zips_descargados={zips_descargados} | errores={zips_errores}"
+                )
                 return idx_cufe, idx_num, idx_num_match
 
-    print(f"✅ Índice listo: {len(idx_cufe)} por CUFE, {len(idx_num)} por NUMERO, {len(idx_num_match)} por MATCH")
-    return idx_cufe, idx_num, idx_num_match
+        # Solo marcamos como visto si la revisión del mensaje fue limpia.
+        # Si hubo error de descarga/parsing/upsert, se podrá reintentar en
+        # una próxima ejecución.
+        if not error_en_mensaje:
+            _aidx_seen_marcar_controller_20260611(
+                aidx_seen,
+                mid_str,
+                subject=imsg.get("subject") or "",
+                received_dt=imsg.get("receivedDateTime", "") or "",
+                zip_count=len(zips),
+                status="zip_indexado" if zips_utiles_mensaje > 0 else "zip_sin_xml_util",
+            )
 
+    _guardar_aidx_seen_controller_20260611(
+        aidx_seen,
+        ttl_days=ATTACHMENT_INDEX_TTL_DAYS,
+    )
+
+    print(f"✅ Índice listo: {len(idx_cufe)} por CUFE, {len(idx_num)} por NUMERO, {len(idx_num_match)} por MATCH")
+    print(
+        f"♻️ [AIDX] omitidos_cache={aidx_skip_revisados} | "
+        f"mensajes_revisados_nuevos={mensajes_revisados_nuevos} | "
+        f"zips_descargados={zips_descargados} | errores={zips_errores}"
+    )
+    return idx_cufe, idx_num, idx_num_match
 
 def _buscar_zip_por_numero(
     idx_num: Dict[str, Tuple[str, bytes]],
     *numeros: str
 ) -> Tuple[Optional[str], Optional[bytes], Optional[str]]:
+    verbose = _match_debug_verbose_controller_20260612()
     vistos = []
     for n in numeros:
         for v in _numero_variantes(n):
             if v not in vistos:
                 vistos.append(v)
 
-    print(f"[DEBUG NUMERO] candidatos exactos idx_num={vistos}")
+    if verbose:
+        print(f"[DEBUG NUMERO] candidatos exactos idx_num={vistos}")
 
     for cand in vistos:
         if cand in idx_num:
             zname, zbytes = idx_num[cand]
-            print(f"[DEBUG NUMERO] MATCH EXACTO -> cand={cand} | zip={zname}")
+            if verbose:
+                print(f"[DEBUG NUMERO] MATCH EXACTO -> cand={cand} | zip={zname}")
             return zname, zbytes, cand
 
     cand_alnum = [_solo_alnum(x) for x in vistos if x]
-    print(f"[DEBUG NUMERO] candidatos alnum idx_num={cand_alnum}")
+    if verbose:
+        print(f"[DEBUG NUMERO] candidatos alnum idx_num={cand_alnum}")
 
     for k, val in idx_num.items():
         k_alnum = _solo_alnum(k)
         for c in cand_alnum:
             if c and k_alnum == c:
                 zname, zbytes = val
-                print(f"[DEBUG NUMERO] MATCH ALNUM -> cand={c} | idx={k} | zip={zname}")
+                if verbose:
+                    print(f"[DEBUG NUMERO] MATCH ALNUM -> cand={c} | idx={k} | zip={zname}")
                 return zname, zbytes, c
 
-    print("[DEBUG NUMERO] sin match en idx_num")
+    if verbose:
+        print("[DEBUG NUMERO] sin match en idx_num")
     return None, None, None
 
 
@@ -3017,6 +3358,7 @@ def _buscar_zip_por_numero_match(
     idx_num_match: Dict[str, Tuple[str, bytes]],
     *numeros: str
 ) -> Tuple[Optional[str], Optional[bytes], Optional[str]]:
+    verbose = _match_debug_verbose_controller_20260612()
     vistos = []
 
     for n in numeros:
@@ -3026,16 +3368,94 @@ def _buscar_zip_por_numero_match(
             if v not in vistos:
                 vistos.append(v)
 
-    print(f"[DEBUG MATCH] candidatos idx_num_match={vistos}")
+    if verbose:
+        print(f"[DEBUG MATCH] candidatos idx_num_match={vistos}")
 
     for cand in vistos:
         if cand in idx_num_match:
             zname, zbytes = idx_num_match[cand]
-            print(f"[DEBUG MATCH] MATCH -> cand={cand} | zip={zname}")
+            if verbose:
+                print(f"[DEBUG MATCH] MATCH -> cand={cand} | zip={zname}")
             return zname, zbytes, cand
 
-    print("[DEBUG MATCH] sin match en idx_num_match")
+    if verbose:
+        print("[DEBUG MATCH] sin match en idx_num_match")
     return None, None, None
+
+
+
+def _intentar_match_con_indices_controller_20260612(
+    *,
+    idx_cufe: Dict[str, Tuple[str, bytes]],
+    idx_num: Dict[str, Tuple[str, bytes]],
+    idx_num_match: Dict[str, Tuple[str, bytes]],
+    cufe_pdf: str,
+    ident_pdf: Dict[str, str],
+    subj_num: str,
+    numero_principal: str,
+    pdf_name: str,
+) -> Tuple[bool, Optional[str], Optional[bytes], str]:
+    """
+    Reintenta el mismo match normal contra los índices en memoria.
+
+    Se usa después del AIDX_FULL_FALLBACK para conservar la efectividad:
+    CUFE -> número normalizado -> número exacto -> token del PDF -> nombre.
+    """
+    if cufe_pdf and cufe_pdf in idx_cufe:
+        zname, zbytes = idx_cufe[cufe_pdf]
+        return True, zname, zbytes, "CUFE"
+
+    num_pdf = ident_pdf.get("NUMERO") or ""
+    num_aprob = ident_pdf.get("NUMERO_APROB") or ""
+    num_asunto = subj_num or ""
+    num_principal = numero_principal or ""
+
+    zname, zbytes, variante = _buscar_zip_por_numero_match(
+        idx_num_match,
+        num_aprob,
+        num_asunto,
+        num_principal,
+        num_pdf,
+    )
+    if zname and zbytes:
+        return True, zname, zbytes, f"NUM_MATCH:{variante}"
+
+    zname, zbytes, variante = _buscar_zip_por_numero(
+        idx_num,
+        num_aprob,
+        num_asunto,
+        num_pdf,
+    )
+    if zname and zbytes:
+        return True, zname, zbytes, f"NUMERO:{variante}"
+
+    if not _is_uuid_like_name(pdf_name):
+        for tk in _tokens_match_from_text(Path(pdf_name).stem):
+            if not _token_es_util_para_match(tk):
+                continue
+            zname, zbytes, variante = _buscar_zip_por_numero_match(idx_num_match, tk)
+            if zname and zbytes:
+                return True, zname, zbytes, f"PDF_TOKEN:{variante}"
+
+    if not _is_uuid_like_name(pdf_name):
+        pdf_base = Path(pdf_name).stem.lower()
+        pdf_clean = re.sub(r"[^a-z0-9]", "", pdf_base)
+
+        if len(pdf_clean) >= 8:
+            vistos = set()
+            for zn, zbytes in list(idx_cufe.values()) + list(idx_num.values()) + list(idx_num_match.values()):
+                if zn in vistos:
+                    continue
+                vistos.add(zn)
+
+                zbase = Path(zn).stem.lower()
+                zclean = re.sub(r"[^a-z0-9]", "", zbase)
+
+                if pdf_clean == zclean or pdf_clean in zclean or zclean in pdf_clean:
+                    return True, zn, zbytes, "NOMBRE"
+
+    return False, None, None, ""
+
 
 
 def _buscar_pdf_en_correo_validaciones_dian(
@@ -5550,14 +5970,28 @@ def run_desde_aprobadas(
     #             pass
     #         return
 
-    t0_aidx_20260611 = time.perf_counter()
-    idx_cufe, idx_num, idx_num_match = _build_zip_index(
-        since_days=since_days,
-        max_zip_buscar=max_zip_buscar,
-        aidx=aidx
-    )
-    tiempo_aidx_s_20260611 = time.perf_counter() - t0_aidx_20260611
-    print(f"⏱️ [AIDX] Tiempo construcción/actualización índice: {tiempo_aidx_s_20260611:.2f} s")
+    tiempo_aidx_s_20260611 = 0.0
+    aidx_full_index_built_20260612 = False
+
+    if _aidx_fast_lookup_first_controller_20260612():
+        idx_cufe: Dict[str, Tuple[str, bytes]] = {}
+        idx_num: Dict[str, Tuple[str, bytes]] = {}
+        idx_num_match: Dict[str, Tuple[str, bytes]] = {}
+        print(
+            "⚡ [AIDX FAST] Activo: se omite prefetch masivo inicial. "
+            "Primero se usará attachment_index_store.json; si no hay match, "
+            "se activará AIDX completo como respaldo."
+        )
+    else:
+        t0_aidx_20260611 = time.perf_counter()
+        idx_cufe, idx_num, idx_num_match = _build_zip_index(
+            since_days=since_days,
+            max_zip_buscar=max_zip_buscar,
+            aidx=aidx
+        )
+        tiempo_aidx_s_20260611 = time.perf_counter() - t0_aidx_20260611
+        aidx_full_index_built_20260612 = True
+        print(f"⏱️ [AIDX] Tiempo construcción/actualización índice: {tiempo_aidx_s_20260611:.2f} s")
 
     t0_procesamiento_facturas_20260611 = time.perf_counter()
 
@@ -6802,36 +7236,37 @@ def run_desde_aprobadas(
                         print(f"🔄 Emparejado por nombre: {pdf_name} ↔ {zn}")
                         break
 
-        print("\n[MATCH DEBUG] =====================================")
-        print(f"[MATCH DEBUG] PDF: {pdf_name}")
-        print(f"[MATCH DEBUG] ASUNTO: {subj}")
-        print(f"[MATCH DEBUG] CUFE PDF: {cufe_pdf}")
-        print(f"[MATCH DEBUG] FECHA PDF: {fecha_pdf}")
-        print(f"[MATCH DEBUG] NUMERO PDF: {ident_pdf.get('NUMERO')}")
-        print(f"[MATCH DEBUG] NUMERO_APROB: {ident_pdf.get('NUMERO_APROB')}")
-        print(f"[MATCH DEBUG] NUMERO PRINCIPAL: {numero_principal}")
-        print(f"[MATCH DEBUG] SUBJECT NUM: {subj_num}")
-        print(f"[MATCH DEBUG] found_match={found_match}")
-        print(f"[MATCH DEBUG] found_zip_name={found_zip_name}")
-        print(f"[MATCH DEBUG] fuente_match={fuente_match}")
-        print(f"[MATCH DEBUG] idx_cufe_size={len(idx_cufe)} | idx_num_size={len(idx_num)} | idx_num_match_size={len(idx_num_match)}")
+        if _match_debug_verbose_controller_20260612():
+            print("\n[MATCH DEBUG] =====================================")
+            print(f"[MATCH DEBUG] PDF: {pdf_name}")
+            print(f"[MATCH DEBUG] ASUNTO: {subj}")
+            print(f"[MATCH DEBUG] CUFE PDF: {cufe_pdf}")
+            print(f"[MATCH DEBUG] FECHA PDF: {fecha_pdf}")
+            print(f"[MATCH DEBUG] NUMERO PDF: {ident_pdf.get('NUMERO')}")
+            print(f"[MATCH DEBUG] NUMERO_APROB: {ident_pdf.get('NUMERO_APROB')}")
+            print(f"[MATCH DEBUG] NUMERO PRINCIPAL: {numero_principal}")
+            print(f"[MATCH DEBUG] SUBJECT NUM: {subj_num}")
+            print(f"[MATCH DEBUG] found_match={found_match}")
+            print(f"[MATCH DEBUG] found_zip_name={found_zip_name}")
+            print(f"[MATCH DEBUG] fuente_match={fuente_match}")
+            print(f"[MATCH DEBUG] idx_cufe_size={len(idx_cufe)} | idx_num_size={len(idx_num)} | idx_num_match_size={len(idx_num_match)}")
 
-        if cufe_pdf:
-            print(f"[MATCH DEBUG] cufe_pdf_en_idx_cufe={cufe_pdf in idx_cufe}")
+            if cufe_pdf:
+                print(f"[MATCH DEBUG] cufe_pdf_en_idx_cufe={cufe_pdf in idx_cufe}")
 
-        for base_num in [
-            ident_pdf.get("NUMERO_APROB") or "",
-            subj_num or "",
-            numero_principal or "",
-            ident_pdf.get("NUMERO") or "",
-        ]:
-            if base_num:
-                print(f"[MATCH DEBUG] numero base={base_num}")
-                print(f"[MATCH DEBUG] variantes numero={_numero_variantes(base_num)}")
-                print(f"[MATCH DEBUG] variantes match={_variantes_match_numero(base_num)}")
-                _debug_top_similares_idx(idx_num, base_num, limite=10)
+            for base_num in [
+                ident_pdf.get("NUMERO_APROB") or "",
+                subj_num or "",
+                numero_principal or "",
+                ident_pdf.get("NUMERO") or "",
+            ]:
+                if base_num:
+                    print(f"[MATCH DEBUG] numero base={base_num}")
+                    print(f"[MATCH DEBUG] variantes numero={_numero_variantes(base_num)}")
+                    print(f"[MATCH DEBUG] variantes match={_variantes_match_numero(base_num)}")
+                    _debug_top_similares_idx(idx_num, base_num, limite=10)
 
-        print("[MATCH DEBUG] =====================================\n")
+            print("[MATCH DEBUG] =====================================\n")
 
         if not found_match or not found_zip_name or not found_zip_bytes:
             entry = None
@@ -6852,7 +7287,8 @@ def run_desde_aprobadas(
                         if not n:
                             continue
 
-                        print(f"[AIDX DEBUG BUSQ] buscando por numero base={n}")
+                        if _match_debug_verbose_controller_20260612():
+                            print(f"[AIDX DEBUG BUSQ] buscando por numero base={n}")
 
                         variantes = _numero_variantes(n)
                         variantes_match = _variantes_match_numero(n)
@@ -6862,12 +7298,14 @@ def run_desde_aprobadas(
                             if x and x not in todas:
                                 todas.append(x)
 
-                        print(f"[AIDX DEBUG BUSQ] variantes={todas}")
+                        if _match_debug_verbose_controller_20260612():
+                            print(f"[AIDX DEBUG BUSQ] variantes={todas}")
 
                         for vn in todas:
                             entry = aidx.find_zip_by_numero(vn)
                             if entry:
-                                print(f"[AIDX DEBUG BUSQ] MATCH AIDX por numero={vn} -> {entry.get('att_name')}")
+                                if _match_debug_verbose_controller_20260612():
+                                    print(f"[AIDX DEBUG BUSQ] MATCH AIDX por numero={vn} -> {entry.get('att_name')}")
                                 break
 
                         if entry:
@@ -6901,6 +7339,53 @@ def run_desde_aprobadas(
                             print(f"✅ [AIDX] ZIP histórico listo en memoria: {found_zip_name}")
                 except Exception as e:
                     print(f"⚠️ [AIDX] Falló descarga ZIP histórico: {e}")
+
+        if (
+            (not found_match or not found_zip_name or not found_zip_bytes)
+            and _aidx_full_fallback_controller_20260612()
+            and not aidx_full_index_built_20260612
+        ):
+            print(
+                "🛡️ [AIDX FULL FALLBACK] La búsqueda rápida/histórica no encontró ZIP. "
+                "Se activa el prefetch completo tradicional antes de cualquier fallback."
+            )
+            t0_aidx_full_fallback_20260612 = time.perf_counter()
+
+            try:
+                idx_cufe, idx_num, idx_num_match = _build_zip_index(
+                    since_days=since_days,
+                    max_zip_buscar=max_zip_buscar,
+                    aidx=aidx,
+                )
+                aidx_full_index_built_20260612 = True
+                extra_aidx_s_20260612 = time.perf_counter() - t0_aidx_full_fallback_20260612
+                tiempo_aidx_s_20260611 += extra_aidx_s_20260612
+                print(
+                    f"⏱️ [AIDX FULL FALLBACK] Índice completo construido en "
+                    f"{extra_aidx_s_20260612:.2f}s"
+                )
+
+                retry_match, retry_name, retry_bytes, retry_fuente = _intentar_match_con_indices_controller_20260612(
+                    idx_cufe=idx_cufe,
+                    idx_num=idx_num,
+                    idx_num_match=idx_num_match,
+                    cufe_pdf=cufe_pdf,
+                    ident_pdf=ident_pdf,
+                    subj_num=subj_num or "",
+                    numero_principal=numero_principal or "",
+                    pdf_name=pdf_name,
+                )
+
+                if retry_match and retry_name and retry_bytes:
+                    found_match = True
+                    found_zip_name = retry_name
+                    found_zip_bytes = retry_bytes
+                    fuente_match = f"AIDX_FULL_FALLBACK:{retry_fuente}"
+                    print(f"✅ [AIDX FULL FALLBACK] Match recuperado: {found_zip_name} | fuente={retry_fuente}")
+                else:
+                    print("ℹ️ [AIDX FULL FALLBACK] No recuperó match; continúa flujo normal de respaldo.")
+            except Exception as e:
+                print(f"⚠️ [AIDX FULL FALLBACK] Error construyendo índice completo: {e}")
 
         if not found_match or not found_zip_name or not found_zip_bytes:
             print(f"❌ No se encontró ZIP que coincida para PDF {pdf_name}.")
@@ -8824,4 +9309,4 @@ def run_notas_credito_inbox_prueba(
 
 
 
-print("🔥 CONTROLLER VERSION ACTIVA: 2026-06-11-AUDIT-TIEMPOS-CALIDAD-NO-VACIOS")
+print("🔥 CONTROLLER VERSION ACTIVA: 2026-06-12-AUDIT-ITERROWS-AIDX-FAST-FALLBACK")
