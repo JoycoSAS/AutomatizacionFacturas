@@ -1,207 +1,87 @@
-﻿import os
-import sys
-import time
-import json
-import hashlib
-import datetime
-from pathlib import Path
-from urllib.parse import quote
-from typing import Optional, Any
+# -*- coding: utf-8 -*-
+"""
+JOYCO - Facturas Procesador
+Backup mensual local seguro
 
-import requests
+Objetivo:
+- Generar un backup mensual local en ZIP.
+- Incluir Excel operativo, auditorías, logs relevantes, state/AIDX y configuración redactada.
+- Generar manifest con hash SHA256 por archivo.
+- NO subir a SharePoint. La subida se hace con scripts/subir_backup_mensual_sharepoint.py.
+- NO incluir .env real ni secretos.
+"""
+
+from __future__ import annotations
+
+import datetime as _dt
+import hashlib
+import json
+import os
+import re
+import shutil
+import sys
+import zipfile
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 try:
-    import config  # noqa: F401  # Carga .env del proyecto
+    import config  # noqa: F401
 except Exception:
+    # El backup local no debe depender de que config imprima o cargue perfecto.
     pass
 
-from services.m365.token import get_access_token
-from services.m365.sp_graph import SP_FOLDER as BASE_SP
-
-VERSION_UPLOAD = "2026-06-17-UPLOAD-BACKUP-MENSUAL-SP-V4-HASH-EXACTO"
-GRAPH = "https://graph.microsoft.com/v1.0"
+VERSION_BACKUP_MENSUAL = "2026-06-17-BACKUP-MENSUAL-SEGURO-V2-LOCAL-RESTAURADO"
 
 DATA_DIR = ROOT / "data"
-BACKUPS_DIR = DATA_DIR / "backups_mensuales"
-TMP_VERIFY_DIR = DATA_DIR / "_tmp_verificacion_sharepoint_mensual"
+AUDIT_DIR = DATA_DIR / "audit"
+STATE_DIR = DATA_DIR / "state"
+LOGS_DIR = ROOT / "logs"
+DATA_LOGS_DIR = DATA_DIR / "logs"
+BACKUPS_MENSUALES_DIR = DATA_DIR / "backups_mensuales"
 
-NOW = datetime.datetime.now()
+NOW = _dt.datetime.now()
 MES = NOW.strftime("%Y-%m")
 MES_FILE = NOW.strftime("%Y_%m")
-MES_DIR = BACKUPS_DIR / MES
+STAMP = NOW.strftime("%Y%m%d_%H%M%S")
 
-SP_DRIVE_ID = (os.getenv("SP_DRIVE_ID") or "").strip()
-SP_BACKUP_ROOT = (os.getenv("SP_BACKUP_ROOT") or f"{BASE_SP}/Backups").strip("/")
-SP_BACKUP_MENSUALES_DIR = (os.getenv("SP_BACKUP_MENSUALES_DIR") or "02_Backups_Mensuales").strip("/")
-SP_MENSUAL_DIR_PRINCIPAL = f"{SP_BACKUP_ROOT}/{SP_BACKUP_MENSUALES_DIR}/{MES}".strip("/")
+BACKUP_MES_DIR = BACKUPS_MENSUALES_DIR / MES
+ZIP_NAME = f"backup_mensual_{MES_FILE}_{STAMP}.zip"
+MANIFEST_NAME = f"manifest_backup_mensual_{MES_FILE}_{STAMP}.json"
+RESUMEN_NAME = f"RESUMEN_BACKUP_MENSUAL_{MES}_{STAMP}.txt"
 
-SP_BACKUP2_HOSTNAME = (os.getenv("SP_BACKUP2_HOSTNAME") or "").strip()
-SP_BACKUP2_SITE_PATH = (os.getenv("SP_BACKUP2_SITE_PATH") or "").strip()
-SP_BACKUP2_DRIVE_ID = (os.getenv("SP_BACKUP2_DRIVE_ID") or "").strip()
-SP_BACKUP2_FOLDER = (os.getenv("SP_BACKUP2_FOLDER") or "").strip().strip("/")
-SP_BACKUP2_MENSUALES_DIR = (os.getenv("SP_BACKUP2_MENSUALES_DIR") or "02_Backups_Mensuales").strip("/")
-SP_MENSUAL_DIR_SECUNDARIA = (
-    f"{SP_BACKUP2_FOLDER}/{SP_BACKUP2_MENSUALES_DIR}/{MES}".strip("/")
-    if SP_BACKUP2_FOLDER
-    else ""
+ZIP_PATH = BACKUP_MES_DIR / ZIP_NAME
+MANIFEST_PATH = BACKUP_MES_DIR / MANIFEST_NAME
+RESUMEN_PATH = BACKUP_MES_DIR / RESUMEN_NAME
+
+SECRET_PATTERNS = (
+    "SECRET",
+    "PASSWORD",
+    "PASS",
+    "TOKEN",
+    "CLIENT_SECRET",
+    "TENANT_ID",
+    "CLIENT_ID",
+    "AUTHORITY",
 )
 
-EXCLUIR_NOMBRES = {".env"}
-EXCLUIR_EXT = {".tmp", ".lock"}
-
-
-def ssl_verify() -> bool:
-    return (os.getenv("SSL_VERIFY") or "true").strip().lower() not in {"0", "false", "no", "off"}
-
-
-def headers() -> dict:
-    token = get_access_token()
-    return {"Authorization": f"Bearer {token}"}
-
-
-def h_json() -> dict:
-    h = headers()
-    h["Content-Type"] = "application/json"
-    return h
-
-
-def encode_path(path: str) -> str:
-    return quote(str(path).strip("/"), safe="/")
-
-
-def encode_drive_id(drive_id: str) -> str:
-    return quote(str(drive_id), safe="!")
-
-
-def graph_get(url: str, *, ok=(200,), timeout=60):
-    r = requests.get(url, headers=headers(), timeout=timeout, verify=ssl_verify())
-    if r.status_code not in ok:
-        raise RuntimeError(f"GET {r.status_code} {url} -> {r.text[:500]}")
-    return r
-
-
-def graph_post(url: str, body: dict, *, ok=(200, 201), timeout=60):
-    r = requests.post(url, headers=h_json(), json=body, timeout=timeout, verify=ssl_verify())
-    if r.status_code not in ok:
-        raise RuntimeError(f"POST {r.status_code} {url} -> {r.text[:500]}")
-    return r
-
-
-def graph_put_content(drive_id: str, remote_path: str, local_file: Path) -> dict:
-    url = f"{GRAPH}/drives/{encode_drive_id(drive_id)}/root:/{encode_path(remote_path)}:/content"
-    data = local_file.read_bytes()
-    r = requests.put(url, headers=headers(), data=data, timeout=300, verify=ssl_verify())
-    if r.status_code not in (200, 201):
-        raise RuntimeError(f"PUT {r.status_code} {url} -> {r.text[:500]}")
-    return r.json()
-
-
-def graph_download_item_content(drive_id: str, item_id: str) -> bytes:
-    url = f"{GRAPH}/drives/{encode_drive_id(drive_id)}/items/{quote(item_id, safe='')}/content"
-    r = requests.get(url, headers=headers(), timeout=300, verify=ssl_verify(), allow_redirects=True)
-    if r.status_code != 200:
-        raise RuntimeError(f"DOWNLOAD {r.status_code} {url} -> {r.text[:500]}")
-    return r.content
-
-
-def existe_path(drive_id: str, remote_path: str) -> bool:
-    if not remote_path.strip("/"):
-        return True
-    url = f"{GRAPH}/drives/{encode_drive_id(drive_id)}/root:/{encode_path(remote_path)}:"
-    r = requests.get(url, headers=headers(), timeout=60, verify=ssl_verify())
-    if r.status_code == 200:
-        return True
-    if r.status_code == 404:
-        return False
-    raise RuntimeError(f"GET {r.status_code} {url} -> {r.text[:500]}")
-
-
-def crear_folder(drive_id: str, parent_path: str, folder_name: str) -> None:
-    body = {
-        "name": folder_name,
-        "folder": {},
-        "@microsoft.graph.conflictBehavior": "fail",
-    }
-    if parent_path.strip("/"):
-        url = f"{GRAPH}/drives/{encode_drive_id(drive_id)}/root:/{encode_path(parent_path)}:/children"
-    else:
-        url = f"{GRAPH}/drives/{encode_drive_id(drive_id)}/root/children"
-
-    r = requests.post(url, headers=h_json(), json=body, timeout=60, verify=ssl_verify())
-    if r.status_code in (200, 201, 409):
-        return
-    raise RuntimeError(f"POST {r.status_code} {url} -> {r.text[:500]}")
-
-
-def ensure_folder_recursive(drive_id: str, folder_path: str) -> None:
-    folder_path = folder_path.strip("/")
-    if not folder_path:
-        return
-
-    actual = ""
-    for parte in [p for p in folder_path.split("/") if p]:
-        siguiente = f"{actual}/{parte}".strip("/")
-        if not existe_path(drive_id, siguiente):
-            crear_folder(drive_id, actual, parte)
-        actual = siguiente
-
-
-def validar_drive_id(drive_id: str):
-    if not drive_id:
-        return None
-    url = f"{GRAPH}/drives/{encode_drive_id(drive_id)}?$select=id,name,webUrl"
-    r = requests.get(url, headers=headers(), timeout=60, verify=ssl_verify())
-    if r.status_code == 200:
-        return r.json()
-    print(f"⚠️ Drive ID no válido o no accesible: {drive_id}")
-    print(f"   Respuesta Graph: {r.status_code} {r.text[:250]}")
-    return None
-
-
-def listar_drives_site(hostname: str, site_path: str):
-    if not hostname or not site_path:
-        return []
-    site_path = site_path if site_path.startswith("/") else f"/{site_path}"
-    url = f"{GRAPH}/sites/{hostname}:{site_path}:/drives?$select=id,name,webUrl"
-    r = graph_get(url, timeout=60)
-    return r.json().get("value", [])
-
-
-def resolver_drive_secundario() -> str:
-    drive = validar_drive_id(SP_BACKUP2_DRIVE_ID)
-    if drive:
-        print(f"✅ Drive secundario validado por ID: {drive.get('name')} | {drive.get('id')}")
-        return drive["id"]
-
-    print("🔎 Buscando drive secundario desde hostname/site_path...")
-    drives = listar_drives_site(SP_BACKUP2_HOSTNAME, SP_BACKUP2_SITE_PATH)
-    if not drives:
-        raise RuntimeError("No se encontraron drives para el site secundario.")
-
-    print("📚 Drives encontrados en site secundario:")
-    for d in drives:
-        print(f"   - {d.get('name')} | {d.get('id')}")
-
-    preferidos = {"documentos", "documents", "shared documents"}
-    elegido = None
-    for d in drives:
-        if (d.get("name") or "").strip().lower() in preferidos:
-            elegido = d
-            break
-    if not elegido:
-        elegido = drives[0]
-
-    print(f"✅ Drive secundario resuelto: {elegido.get('name')} | {elegido.get('id')}")
-    print("💡 Si este ID funciona, actualiza SP_BACKUP2_DRIVE_ID en .env con este valor.")
-    return elegido["id"]
-
-
-def sha256_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
+EXCLUIR_DIRS = {
+    "__pycache__",
+    ".git",
+    ".venv",
+    "venv",
+    "env",
+    "temp",
+    "tmp",
+    "adjuntos",
+    "extraidos",
+    "temp_check",
+    "cierres_diarios",
+    "backups_mensuales",
+}
 
 
 def sha256_file(path: Path) -> str:
@@ -212,196 +92,221 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def buscar_ultimo_zip_mensual() -> Optional[Path]:
-    if not MES_DIR.exists():
+def normalizar_rel(path: Path) -> str:
+    return path.as_posix().replace("\\", "/")
+
+
+def redactar_env_line(line: str) -> str:
+    raw = line.rstrip("\n\r")
+    if not raw or raw.lstrip().startswith("#") or "=" not in raw:
+        return raw
+    key, value = raw.split("=", 1)
+    key_upper = key.strip().upper()
+    if any(p in key_upper for p in SECRET_PATTERNS):
+        return f"{key}=***REDACTADO***"
+    # También redacción defensiva para valores con apariencia de secreto largo.
+    if re.search(r"[A-Za-z0-9_\-]{32,}", value) and key_upper not in {
+        "SP_DRIVE_ID",
+        "SP_DRIVE_ID_RADICADOS",
+        "SP_BACKUP2_DRIVE_ID",
+    }:
+        return f"{key}=***REDACTADO***"
+    return raw
+
+
+def crear_snapshot_env_redactado(work_dir: Path) -> Optional[Path]:
+    env_path = ROOT / ".env"
+    if not env_path.exists():
         return None
-    archivos = sorted(
-        MES_DIR.glob(f"backup_mensual_{MES_FILE}_*.zip"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    return archivos[0] if archivos else None
-
-
-def extraer_timestamp_backup(zip_file: Path) -> str:
-    # backup_mensual_2026_06_20260617_110935.zip -> 20260617_110935
-    stem = zip_file.stem
-    prefix = f"backup_mensual_{MES_FILE}_"
-    if stem.startswith(prefix):
-        return stem[len(prefix):]
-    return ""
-
-
-def archivos_backup_actual() -> list[Path]:
-    zip_file = buscar_ultimo_zip_mensual()
-    if not zip_file:
-        raise RuntimeError(f"No se encontró ZIP mensual en {MES_DIR} con patrón backup_mensual_{MES_FILE}_*.zip")
-
-    ts = extraer_timestamp_backup(zip_file)
-    archivos = [zip_file]
-
-    manifest = MES_DIR / f"manifest_backup_mensual_{MES_FILE}_{ts}.json" if ts else None
-    resumen = MES_DIR / f"RESUMEN_BACKUP_MENSUAL_{MES}_{ts}.txt" if ts else None
-
-    if manifest and manifest.exists():
-        archivos.append(manifest)
-    else:
-        raise RuntimeError(f"No se encontró manifest correspondiente al ZIP: {manifest}")
-
-    if resumen and resumen.exists():
-        archivos.append(resumen)
-    else:
-        print(f"⚠️ No se encontró resumen mensual correspondiente: {resumen}")
-        print("   Se continuará con ZIP + manifest.")
-
-    return archivos
-
-
-def verificar_archivo_subido(local: Path, drive_id: str, item: dict) -> bool:
-    item_id = item.get("id")
-    if not item_id:
-        raise RuntimeError("Graph no devolvió item.id; no se puede verificar descarga exacta.")
-
-    remote_bytes = graph_download_item_content(drive_id, item_id)
-    hash_local = sha256_file(local)
-    hash_sp = sha256_bytes(remote_bytes)
-
-    if hash_local != hash_sp:
-        print(f"❌ Hash distinto: {local.name}")
-        print(f"   SHA256 local: {hash_local}")
-        print(f"   SHA256 SP:    {hash_sp}")
-        print(f"   bytes_local={local.stat().st_size} | bytes_sp={len(remote_bytes)}")
-        return False
-
-    print(f"✅ Archivo verificado por SHA256 exacto: {local.name} ({local.stat().st_size} bytes)")
-    return True
-
-
-def subir_y_verificar_con_reintentos(nombre_destino: str, drive_id: str, remote_path: str, local: Path) -> bool:
-    item = graph_put_content(drive_id, remote_path, local)
-
-    intentos = 4
-    espera = 2
-    ultimo_error = None
-    for intento in range(1, intentos + 1):
-        try:
-            if verificar_archivo_subido(local, drive_id, item):
-                return True
-        except Exception as e:
-            ultimo_error = e
-            print(f"⚠️ Verificación intento {intento}/{intentos} falló para {local.name}: {e}")
-
-        if intento < intentos:
-            print(f"   Reintentando verificación en {espera}s...")
-            time.sleep(espera)
-            espera *= 2
-
-    if ultimo_error:
-        print(f"❌ Verificación definitiva fallida para {local.name}: {ultimo_error}")
-    else:
-        print(f"❌ Verificación definitiva fallida para {local.name}.")
-    return False
-
-
-def subir_archivos_destino(nombre_destino: str, drive_id: str, carpeta_sp: str, archivos: list[Path]) -> bool:
-    print("-" * 100)
-    print(f"📁 Verificando/creando destino: {nombre_destino}")
-    print(f"   Drive ID: {drive_id}")
-    print(f"   SP_DIR:   {carpeta_sp}")
-
+    destino_dir = work_dir / "05_config_redactada"
+    destino_dir.mkdir(parents=True, exist_ok=True)
+    destino = destino_dir / f"snapshot_env_redactado_{MES}_{STAMP}.txt"
     try:
-        ensure_folder_recursive(drive_id, carpeta_sp)
-        print(f"✅ Carpeta SharePoint verificada/creada: {nombre_destino}")
-    except Exception as e:
-        print(f"❌ No se pudo verificar/crear carpeta SharePoint en {nombre_destino}: {e}")
-        return False
-
-    ok_todos = True
-    for local in archivos:
-        remote_path = f"{carpeta_sp}/{local.name}".strip("/")
-        try:
-            print("☁️ Subiendo a SharePoint:")
-            print(f"   Destino: {nombre_destino}")
-            print(f"   Local:   {local}")
-            print(f"   SP:      {remote_path}")
-            ok = subir_y_verificar_con_reintentos(nombre_destino, drive_id, remote_path, local)
-            if not ok:
-                ok_todos = False
-        except Exception as e:
-            print(f"❌ Error subiendo/verificando {local.name} a {nombre_destino}: {e}")
-            ok_todos = False
-
-    return ok_todos
+        txt = env_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        txt = env_path.read_text(errors="replace").splitlines()
+    destino.write_text("\n".join(redactar_env_line(x) for x in txt) + "\n", encoding="utf-8")
+    return destino
 
 
-def main() -> int:
+def copiar_si_existe(origen: Path, destino_rel: str, work_dir: Path, archivos: List[Tuple[Path, str]]) -> None:
+    if not origen.exists() or not origen.is_file():
+        return
+    destino = work_dir / destino_rel
+    destino.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(origen, destino)
+    archivos.append((destino, normalizar_rel(Path(destino_rel))))
+
+
+def incluir_patron(base: Path, patron: str, destino_base: str, work_dir: Path, archivos: List[Tuple[Path, str]]) -> None:
+    if not base.exists():
+        return
+    for p in sorted(base.glob(patron)):
+        if not p.is_file():
+            continue
+        rel = Path(destino_base) / p.name
+        copiar_si_existe(p, normalizar_rel(rel), work_dir, archivos)
+
+
+def incluir_logs(base: Path, destino_base: str, work_dir: Path, archivos: List[Tuple[Path, str]]) -> None:
+    if not base.exists():
+        return
+    for p in sorted(base.rglob("*")):
+        if not p.is_file():
+            continue
+        partes = {x.lower() for x in p.relative_to(base).parts}
+        if partes & EXCLUIR_DIRS:
+            continue
+        # Evita subir logs enormes o binarios raros; los logs esperados son texto/csv/json.
+        if p.suffix.lower() not in {".log", ".txt", ".csv", ".json"}:
+            continue
+        rel = Path(destino_base) / p.relative_to(base)
+        copiar_si_existe(p, normalizar_rel(rel), work_dir, archivos)
+
+
+def crear_manifest(archivos: List[Tuple[Path, str]]) -> Dict[str, object]:
+    items = []
+    total_bytes = 0
+    for path, rel in archivos:
+        size = path.stat().st_size
+        total_bytes += size
+        items.append(
+            {
+                "ruta_relativa": rel,
+                "nombre": path.name,
+                "bytes": size,
+                "sha256": sha256_file(path),
+                "modificado_local": _dt.datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds"),
+            }
+        )
+    return {
+        "tipo": "backup_mensual_local",
+        "proyecto": "Automatizacion de Facturas JOYCO",
+        "version_script": VERSION_BACKUP_MENSUAL,
+        "generado_en": NOW.isoformat(timespec="seconds"),
+        "mes": MES,
+        "root": str(ROOT),
+        "zip": ZIP_NAME,
+        "total_archivos": len(items),
+        "total_bytes": total_bytes,
+        "items": items,
+        "nota_seguridad": "El archivo .env real no se incluye. Solo se incluye snapshot redactado si existe.",
+    }
+
+
+def escribir_resumen(manifest: Dict[str, object]) -> None:
+    lines = [
+        "BACKUP MENSUAL LOCAL SEGURO - FACTURAS JOYCO",
+        "=" * 80,
+        f"Versión: {VERSION_BACKUP_MENSUAL}",
+        f"Fecha generación: {manifest['generado_en']}",
+        f"Mes: {MES}",
+        f"Root: {ROOT}",
+        f"Carpeta destino: {BACKUP_MES_DIR}",
+        f"ZIP: {ZIP_PATH}",
+        f"Manifest: {MANIFEST_PATH}",
+        f"Total archivos incluidos: {manifest['total_archivos']}",
+        f"Total bytes incluidos: {manifest['total_bytes']}",
+        "",
+        "Contenido principal incluido:",
+        "- Excel operativo local y/o historial si existen.",
+        "- Auditorías CSV disponibles.",
+        "- State/AIDX/ProcessedStore.",
+        "- Logs relevantes si existen.",
+        "- Snapshot .env redactado, sin secretos.",
+        "",
+        "Regla de seguridad:",
+        "- No se incluye .env real ni secretos.",
+        "- No se incluyen carpetas temporales, adjuntos pesados, extraídos, cierres diarios ni backups mensuales previos.",
+        "=" * 80,
+    ]
+    RESUMEN_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def generar_backup() -> int:
     print("=" * 100)
-    print("SUBIDA BACKUP MENSUAL A SHAREPOINT - FACTURAS JOYCO")
+    print("BACKUP MENSUAL LOCAL SEGURO - FACTURAS JOYCO")
     print("=" * 100)
-    print(f"Versión: {VERSION_UPLOAD}")
+    print(f"Versión: {VERSION_BACKUP_MENSUAL}")
     print(f"Root: {ROOT}")
     print(f"Mes: {MES}")
-    print(f"Carpeta local: {MES_DIR}")
-    print(f"Ruta principal:   {SP_MENSUAL_DIR_PRINCIPAL}")
-    print(f"Ruta secundaria:  {SP_MENSUAL_DIR_SECUNDARIA}")
+    print(f"Carpeta destino: {BACKUP_MES_DIR}")
     print("-" * 100)
 
-    try:
-        archivos = archivos_backup_actual()
-    except Exception as e:
-        print(f"❌ No se pudo preparar backup mensual para subida: {e}")
-        return 1
+    BACKUP_MES_DIR.mkdir(parents=True, exist_ok=True)
+    work_dir = BACKUP_MES_DIR / f"_work_backup_mensual_{STAMP}"
+    if work_dir.exists():
+        shutil.rmtree(work_dir, ignore_errors=True)
+    work_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"📦 Archivos mensuales a subir: {len(archivos)}")
-    for p in archivos:
-        print(f"   - {p.name} ({p.stat().st_size} bytes) | sha256={sha256_file(p)}")
-
-    if not SP_DRIVE_ID:
-        print("❌ Falta SP_DRIVE_ID en .env para la ruta principal.")
-        return 1
-    if not SP_MENSUAL_DIR_SECUNDARIA:
-        print("❌ Falta SP_BACKUP2_FOLDER en .env para la ruta secundaria.")
-        return 1
+    archivos: List[Tuple[Path, str]] = []
 
     try:
-        print("🔐 Validando drive principal...")
-        principal = validar_drive_id(SP_DRIVE_ID)
-        if not principal:
-            print("❌ SP_DRIVE_ID principal no es válido o no es accesible.")
+        # Excel operativo e historial.
+        copiar_si_existe(DATA_DIR / "facturas.xlsx", "01_excel/facturas.xlsx", work_dir, archivos)
+        copiar_si_existe(DATA_DIR / "historial_ejecuciones.xlsx", "01_excel/historial_ejecuciones.xlsx", work_dir, archivos)
+
+        # Auditorías: soporta tanto data/audit como archivos audit_* en data root.
+        incluir_patron(AUDIT_DIR, "audit_*.csv", "02_auditoria", work_dir, archivos)
+        incluir_patron(DATA_DIR, "audit_*.csv", "02_auditoria", work_dir, archivos)
+
+        # State crítico.
+        copiar_si_existe(STATE_DIR / "processed_messages.json", "03_state/processed_messages.json", work_dir, archivos)
+        copiar_si_existe(STATE_DIR / "attachment_index_store.json", "03_state/attachment_index_store.json", work_dir, archivos)
+        copiar_si_existe(STATE_DIR / "attachment_index_seen_messages.json", "03_state/attachment_index_seen_messages.json", work_dir, archivos)
+
+        # Logs si existen.
+        incluir_logs(LOGS_DIR, "04_logs", work_dir, archivos)
+        incluir_logs(DATA_LOGS_DIR, "04_logs_data", work_dir, archivos)
+
+        # Config redactada.
+        env_redactado = crear_snapshot_env_redactado(work_dir)
+        if env_redactado:
+            archivos.append((env_redactado, normalizar_rel(Path("05_config_redactada") / env_redactado.name)))
+
+        if not archivos:
+            print("❌ No se encontraron archivos para incluir en el backup mensual.")
             return 1
-        print(f"✅ Drive principal validado: {principal.get('name')} | {principal.get('id')}")
 
-        print("🔐 Validando/resolviendo drive secundario...")
-        drive_secundario = resolver_drive_secundario()
-    except Exception as e:
-        print(f"❌ Error validando drives: {e}")
-        return 1
+        manifest = crear_manifest(archivos)
+        MANIFEST_PATH.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        escribir_resumen(manifest)
 
-    ok_principal = subir_archivos_destino(
-        "PRINCIPAL_CONTABILIDAD",
-        SP_DRIVE_ID,
-        SP_MENSUAL_DIR_PRINCIPAL,
-        archivos,
-    )
-    ok_secundaria = subir_archivos_destino(
-        "SECUNDARIA_CONTROL_INTERNO",
-        drive_secundario,
-        SP_MENSUAL_DIR_SECUNDARIA,
-        archivos,
-    )
+        # También incluir manifest y resumen dentro del ZIP para que el ZIP sea autocontenido.
+        archivos_zip = list(archivos)
+        archivos_zip.append((MANIFEST_PATH, MANIFEST_NAME))
+        archivos_zip.append((RESUMEN_PATH, RESUMEN_NAME))
 
-    print("-" * 100)
-    if ok_principal and ok_secundaria:
-        print("✅ Subida mensual terminada correctamente en AMBAS rutas.")
-        print("✅ Verificación aplicada: ZIP/JSON/TXT descargados desde SharePoint y comparados por SHA256 exacto.")
+        if ZIP_PATH.exists():
+            ZIP_PATH.unlink()
+        with zipfile.ZipFile(ZIP_PATH, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+            for path, rel in archivos_zip:
+                zf.write(path, arcname=rel)
+
+        zip_hash = sha256_file(ZIP_PATH)
+        manifest["zip_bytes"] = ZIP_PATH.stat().st_size
+        manifest["zip_sha256"] = zip_hash
+        MANIFEST_PATH.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        print(f"✅ Archivos incluidos: {manifest['total_archivos']}")
+        print(f"✅ ZIP generado: {ZIP_PATH}")
+        print(f"✅ ZIP bytes: {ZIP_PATH.stat().st_size}")
+        print(f"✅ ZIP SHA256: {zip_hash}")
+        print(f"✅ Manifest: {MANIFEST_PATH}")
+        print(f"✅ Resumen: {RESUMEN_PATH}")
+        print("=" * 100)
+        print("✅ Backup mensual local generado correctamente.")
+        print("Siguiente paso: python scripts\\subir_backup_mensual_sharepoint.py")
         print("=" * 100)
         return 0
 
-    print("❌ Subida mensual terminó con errores en una o más rutas.")
-    print("⚠️ No borres ni archives localmente hasta revisar el error.")
-    print("=" * 100)
-    return 1
+    except Exception as exc:
+        print(f"❌ Error generando backup mensual local: {exc}")
+        print("⚠️ No subas ni archives nada hasta revisar el error.")
+        return 1
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(generar_backup())
