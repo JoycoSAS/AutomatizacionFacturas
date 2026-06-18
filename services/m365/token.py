@@ -19,6 +19,10 @@ TOKEN_DEBUG = str(os.getenv("GRAPH_TOKEN_DEBUG", "0") or "0").strip().lower() in
     "1", "true", "yes", "y", "si", "sí", "on"
 }
 
+TOKEN_SSL_VERIFY = str(os.getenv("SSL_VERIFY", "true") or "true").strip().lower() not in {
+    "0", "false", "no", "off"
+}
+
 
 def _credenciales_configuradas() -> bool:
     """Valida que existan las variables mínimas sin imprimir valores sensibles."""
@@ -103,7 +107,7 @@ def get_access_token() -> str:
     }
 
     try:
-        r = requests.post(url, data=data, timeout=TOKEN_TIMEOUT_SECONDS)
+        r = requests.post(url, data=data, timeout=TOKEN_TIMEOUT_SECONDS, verify=TOKEN_SSL_VERIFY)
 
         if r.status_code >= 400:
             _mensaje_error_token(r.status_code, r.text)
