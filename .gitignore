@@ -63,3 +63,4 @@ scripts/verificar_env_facturas.py
 
 data/cierres_diarios/
 data/backups_mensuales/
+data/cierres_trimestrales/
