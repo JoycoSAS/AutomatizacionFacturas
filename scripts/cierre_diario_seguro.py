@@ -1,14 +1,46 @@
-import datetime
+# -*- coding: utf-8 -*-
+"""
+JOYCO - Facturas Procesador
+Cierre diario local seguro V2
+
+Política V2:
+- El cierre diario NO copia el histórico completo de facturas.xlsx.
+- Genera un Excel diario con las facturas registradas/procesadas en la fecha del cierre.
+- Incluye auditorías del día, logs de producción del día, manifest, resumen y validación local.
+- No sube a OneDrive/SharePoint. La subida se hará con el script remoto correspondiente.
+- No incluye .env real ni secretos.
+
+Estructura generada:
+  data/cierres_diarios/YYYY/YYYY-MM_MesNombre/SEMANA_YYYY-MM-DD_a_YYYY-MM-DD/01_Cierres_Diarios/cierre_diario_YYYY-MM-DD/
+    01_Excel_Diario/facturas_diario_YYYY-MM-DD.xlsx
+    02_Auditoria/audit_*.csv
+    03_Logs/logs_produccion_YYYY-MM-DD/
+    04_Manifest/manifest_diario_YYYY-MM-DD.json
+    04_Manifest/resumen_diario_YYYY-MM-DD.txt
+    05_Validaciones/validacion_local_YYYY-MM-DD.json
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import datetime as _dt
 import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import socket
 import sys
 import time
+import unicodedata
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from openpyxl import Workbook, load_workbook
+from openpyxl.worksheet.table import Table, TableStyleInfo
+from openpyxl.utils import get_column_letter
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -19,41 +51,21 @@ try:
 except Exception:
     pass
 
-VERSION_CIERRE = "2026-06-12-CIERRE-DIARIO-SEGURO-V4-LOCAL-MKDIR-CONFIG"
+VERSION_CIERRE = "2026-07-08-CIERRE-DIARIO-SEGURO-V2-ESTRUCTURA-ANIO-MES-SEMANA"
 
 DATA_DIR = ROOT / "data"
-STATE_DIR = DATA_DIR / "state"
-LOGS_DIR = DATA_DIR / "logs"
+AUDIT_DIR = DATA_DIR / "audit"
+LOGS_DIR = ROOT / "logs"
+DATA_LOGS_DIR = DATA_DIR / "logs"
 CIERRES_DIR = DATA_DIR / "cierres_diarios"
 LOCKS_DIR = DATA_DIR / "locks"
 
-NOW = datetime.datetime.now()
-FECHA = NOW.strftime("%Y-%m-%d")
-MES = NOW.strftime("%Y-%m")
-STAMP = NOW.strftime("%Y%m%d_%H%M%S")
+FACTURAS_PATH = Path(os.getenv("ARCHIVO_EXCEL_LOCAL", str(DATA_DIR / "facturas.xlsx")))
+if not FACTURAS_PATH.is_absolute():
+    FACTURAS_PATH = ROOT / FACTURAS_PATH
 
-CIERRE_DIA_DIR = CIERRES_DIR / FECHA
 LOCK_FILE = LOCKS_DIR / "cierre_diario_seguro.lock"
 LOCK_TTL_SECONDS = int(os.getenv("LOCK_TTL_SECONDS", "3600") or "3600")
-
-NOMBRES_ESTADO = [
-    "processed_messages.json",
-    "attachment_index_store.json",
-    "attachment_index_seen_messages.json",
-]
-
-ARCHIVOS_BASE = [
-    DATA_DIR / "facturas.xlsx",
-    DATA_DIR / "historial_ejecuciones.xlsx",
-]
-
-PATRONES_AUDIT = [
-    f"audit_detalle_{FECHA}.csv",
-    f"audit_runs_{FECHA}.csv",
-    f"audit_*_{FECHA}.csv",
-]
-
-PATRONES_LOGS = ["*.log", "*.txt"]
 
 PALABRAS_SENSIBLES = (
     "SECRET",
@@ -74,12 +86,112 @@ NOMBRES_EXCLUIDOS = {
     "msal_cache.bin",
 }
 
+COLUMNAS_FECHA_PROCESO_CANDIDATAS = [
+    "fecha_procesamiento",
+    "fecha procesamiento",
+    "fecha proceso",
+    "procesado_en",
+    "procesado en",
+    "fecha_registro",
+    "fecha registro",
+    "fecha de registro",
+    "fecha_carga",
+    "fecha carga",
+    "creado_en",
+    "created_at",
+]
+
+COLS_NUMERO = ["número de factura", "numero de factura", "numerofactura", "numero factura", "factura", "numero"]
+COLS_RADICADO = ["radicado"]
+COLS_CUFE = ["cufe", "cude", "cufe/cude", "uuid"]
+COLS_ARCHIVO = ["archivo", "archivo origen", "nombre archivo", "pdf", "xml"]
+COLS_CONCEPTO = ["concepto"]
+
+EXT_LOGS = {".log", ".txt", ".csv", ".json"}
+EXCEL_SHEET_NAME = "Facturas"
+EXCEL_TABLE_NAME = "TblFacturasDiario"
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Genera cierre diario local seguro V2.")
+    parser.add_argument(
+        "--fecha",
+        default=_dt.datetime.now().strftime("%Y-%m-%d"),
+        help="Fecha del cierre en formato YYYY-MM-DD. Default: hoy.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Solo diagnostica qué se generaría. No crea/copia archivos.",
+    )
+    parser.add_argument(
+        "--permitir-vacio",
+        action="store_true",
+        help="Permite generar cierre aunque el Excel diario quede sin filas. Útil si no hubo facturas nuevas.",
+    )
+    return parser.parse_args()
+
+
+def validar_fecha(fecha: str) -> _dt.date:
+    try:
+        return _dt.datetime.strptime(fecha, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise RuntimeError(f"Fecha inválida {fecha!r}. Usa formato YYYY-MM-DD.") from exc
+
+
+def rango_semana_lunes_domingo(fecha: _dt.date) -> tuple[_dt.date, _dt.date]:
+    inicio = fecha - _dt.timedelta(days=fecha.weekday())
+    fin = inicio + _dt.timedelta(days=6)
+    return inicio, fin
+
+MESES_ES = {
+    1: "Enero",
+    2: "Febrero",
+    3: "Marzo",
+    4: "Abril",
+    5: "Mayo",
+    6: "Junio",
+    7: "Julio",
+    8: "Agosto",
+    9: "Septiembre",
+    10: "Octubre",
+    11: "Noviembre",
+    12: "Diciembre",
+}
+
+
+def nombre_mes_dir(fecha: _dt.date) -> str:
+    return f"{fecha.strftime('%Y-%m')}_{MESES_ES[int(fecha.strftime('%m'))]}"
+
+
 
 def rel(path: Path) -> str:
     try:
         return str(path.resolve().relative_to(ROOT.resolve())).replace("\\", "/")
     except Exception:
         return str(path).replace("\\", "/")
+
+
+def norm(value: Any) -> str:
+    s = "" if value is None else str(value)
+    s = s.strip().replace("\xa0", " ")
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    s = re.sub(r"\s+", " ", s)
+    return s.lower()
+
+
+def norm_key(value: Any) -> str:
+    s = norm(value)
+    return re.sub(r"[^a-z0-9]+", "", s)
+
+
+def clean_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (_dt.datetime, _dt.date)):
+        return value.isoformat()
+    return str(value).strip()
 
 
 def sha256_file(path: Path) -> str:
@@ -92,7 +204,7 @@ def sha256_file(path: Path) -> str:
 
 def iso_mtime(path: Path) -> str:
     try:
-        return datetime.datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds")
+        return _dt.datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds")
     except Exception:
         return ""
 
@@ -114,7 +226,7 @@ def acquire_lock() -> Tuple[bool, str]:
         "script": "cierre_diario_seguro.py",
         "version": VERSION_CIERRE,
         "pid": os.getpid(),
-        "started_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "started_at": _dt.datetime.now().isoformat(timespec="seconds"),
         "host": socket.gethostname(),
     }
     LOCK_FILE.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -123,43 +235,42 @@ def acquire_lock() -> Tuple[bool, str]:
 
 def release_lock() -> None:
     try:
-        if LOCK_FILE.exists():
-            LOCK_FILE.unlink()
+        LOCK_FILE.unlink(missing_ok=True)
     except Exception:
         pass
 
 
-def es_sensible(linea: str) -> bool:
-    if "=" not in linea:
-        return False
-    clave = linea.split("=", 1)[0].strip().upper()
-    return any(palabra in clave for palabra in PALABRAS_SENSIBLES)
+def es_sensible(clave: str) -> bool:
+    clave_upper = str(clave or "").strip().upper()
+    return any(palabra in clave_upper for palabra in PALABRAS_SENSIBLES)
 
 
-def crear_snapshot_env_redactado(destino_dir: Path) -> Optional[Dict[str, Any]]:
-    env_path = ROOT / ".env"
-    if not env_path.exists():
+def redactar_env_line(linea: str) -> str:
+    if not linea.strip() or linea.lstrip().startswith("#") or "=" not in linea:
+        return linea
+    clave, valor = linea.split("=", 1)
+    if es_sensible(clave):
+        return f"{clave}=***REDACTADO***"
+    if re.search(r"[A-Za-z0-9_\-]{32,}", valor) and clave.strip().upper() not in {
+        "SP_DRIVE_ID",
+        "SP_DRIVE_ID_RADICADOS",
+        "SP_BACKUP2_DRIVE_ID",
+        "ONEDRIVE_BACKUP_DRIVE_ID",
+        "BACKUP_DRIVE_ID",
+    }:
+        return f"{clave}=***REDACTADO***"
+    return linea
+
+
+def copiar_archivo(origen: Path, destino: Path) -> Optional[Dict[str, Any]]:
+    if not origen.exists() or not origen.is_file() or origen.name in NOMBRES_EXCLUIDOS:
         return None
-
-    destino_dir.mkdir(parents=True, exist_ok=True)
-    destino = destino_dir / f"snapshot_env_redactado_{FECHA}.txt"
-    lineas_out: List[str] = []
-
-    for linea in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
-        if not linea.strip() or linea.lstrip().startswith("#") or "=" not in linea:
-            lineas_out.append(linea)
-            continue
-        clave, valor = linea.split("=", 1)
-        if es_sensible(clave):
-            lineas_out.append(f"{clave}=***REDACTADO***")
-        else:
-            lineas_out.append(f"{clave}={valor}")
-
-    destino.write_text("\n".join(lineas_out) + "\n", encoding="utf-8")
-    return info_archivo(destino, "config_redactada", ROOT / ".env")
+    destino.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(origen, destino)
+    return info_archivo(destino, origen=origen)
 
 
-def info_archivo(destino: Path, categoria: str, origen: Optional[Path] = None) -> Dict[str, Any]:
+def info_archivo(destino: Path, origen: Optional[Path] = None, categoria: str = "") -> Dict[str, Any]:
     st = destino.stat()
     return {
         "categoria": categoria,
@@ -173,20 +284,35 @@ def info_archivo(destino: Path, categoria: str, origen: Optional[Path] = None) -
     }
 
 
-def copiar_archivo(origen: Path, subcarpeta: str, categoria: str) -> Optional[Dict[str, Any]]:
-    if not origen.exists() or not origen.is_file():
-        return None
-    if origen.name in NOMBRES_EXCLUIDOS:
-        return None
+def leer_csv_dicts(path: Path) -> list[dict[str, str]]:
+    for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            with path.open("r", encoding=encoding, newline="") as f:
+                reader = csv.DictReader(f)
+                return [dict(r or {}) for r in reader]
+        except UnicodeDecodeError:
+            continue
+        except Exception:
+            return []
+    return []
 
-    destino_dir = CIERRE_DIA_DIR / subcarpeta
-    destino_dir.mkdir(parents=True, exist_ok=True)
-    destino = destino_dir / origen.name
-    shutil.copy2(origen, destino)
-    return info_archivo(destino, categoria, origen)
 
+def recolectar_audits(fecha: str) -> list[Path]:
+    patrones = [
+        f"audit_detalle_{fecha}.csv",
+        f"audit_runs_{fecha}.csv",
+        f"audit_*_{fecha}.csv",
+        f"*{fecha}*.csv",
+    ]
+    rutas: list[Path] = []
+    for base in (AUDIT_DIR, DATA_DIR, ROOT):
+        if not base.exists():
+            continue
+        for patron in patrones:
+            for p in base.glob(patron):
+                if p.is_file() and "audit" in p.name.lower():
+                    rutas.append(p)
 
-def archivos_unicos(rutas: List[Path]) -> List[Path]:
     vistos = set()
     out = []
     for p in rutas:
@@ -197,80 +323,495 @@ def archivos_unicos(rutas: List[Path]) -> List[Path]:
         if key not in vistos:
             vistos.add(key)
             out.append(p)
+    return sorted(out)
+
+
+def log_corresponde_fecha(path: Path, fecha: str) -> bool:
+    name = path.name.lower()
+    fecha_compacta = fecha.replace("-", "")
+    if fecha in name or fecha_compacta in name:
+        return True
+    try:
+        mdate = _dt.datetime.fromtimestamp(path.stat().st_mtime).date().isoformat()
+        return mdate == fecha
+    except Exception:
+        return False
+
+
+def recolectar_logs(fecha: str) -> list[Path]:
+    rutas: list[Path] = []
+    for base in (LOGS_DIR, DATA_LOGS_DIR):
+        if not base.exists():
+            continue
+        for p in base.rglob("*"):
+            if not p.is_file():
+                continue
+            if p.suffix.lower() not in EXT_LOGS:
+                continue
+            if log_corresponde_fecha(p, fecha):
+                rutas.append(p)
+
+    vistos = set()
+    out = []
+    for p in rutas:
+        try:
+            key = str(p.resolve()).lower()
+        except Exception:
+            key = str(p).lower()
+        if key not in vistos:
+            vistos.add(key)
+            out.append(p)
+    return sorted(out)
+
+
+def find_col(headers: Sequence[Any], candidates: Sequence[str]) -> Optional[int]:
+    candidate_norms = {norm(c) for c in candidates}
+    candidate_keys = {norm_key(c) for c in candidates}
+    for idx, header in enumerate(headers):
+        hn = norm(header)
+        hk = norm_key(header)
+        if hn in candidate_norms or hk in candidate_keys:
+            return idx
+    return None
+
+
+def all_header_map(headers: Sequence[Any]) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for i, h in enumerate(headers):
+        if str(h or "").strip():
+            out[norm(h)] = i
+            out[norm_key(h)] = i
     return out
 
 
-def recolectar_audits() -> List[Path]:
-    rutas: List[Path] = []
-    for base in (DATA_DIR, ROOT):
-        if not base.exists():
-            continue
-        for patron in PATRONES_AUDIT:
-            rutas.extend(base.glob(patron))
-    return archivos_unicos([p for p in rutas if p.is_file()])
+def fecha_valor_coincide(value: Any, fecha: str) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, _dt.datetime):
+        return value.date().isoformat() == fecha
+    if isinstance(value, _dt.date):
+        return value.isoformat() == fecha
+    s = str(value).strip()
+    if not s:
+        return False
+    if fecha in s:
+        return True
+    # Soporta ISO datetime o dd/mm/yyyy de forma básica.
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+        try:
+            return _dt.datetime.strptime(s[:10], fmt).date().isoformat() == fecha
+        except Exception:
+            pass
+    return False
 
 
-def recolectar_estado() -> List[Path]:
-    rutas: List[Path] = []
-    for nombre in NOMBRES_ESTADO:
-        rutas.append(STATE_DIR / nombre)
-    return [p for p in rutas if p.exists() and p.is_file()]
+def extraer_valor_row(row: dict[str, Any], candidates: Sequence[str]) -> str:
+    by_norm = {norm(k): v for k, v in row.items()}
+    by_key = {norm_key(k): v for k, v in row.items()}
+    for c in candidates:
+        if norm(c) in by_norm:
+            return clean_value(by_norm[norm(c)])
+        if norm_key(c) in by_key:
+            return clean_value(by_key[norm_key(c)])
+    return ""
 
 
-def recolectar_logs_recientes() -> List[Path]:
-    if not LOGS_DIR.exists():
-        return []
-    limite = time.time() - (48 * 3600)
-    rutas: List[Path] = []
-    for patron in PATRONES_LOGS:
-        rutas.extend(LOGS_DIR.glob(patron))
-    return archivos_unicos([p for p in rutas if p.is_file() and p.stat().st_mtime >= limite])
+def extraer_candidatos_desde_audits(audit_files: list[Path]) -> dict[str, set[str]]:
+    candidatos: dict[str, set[str]] = {
+        "cufe": set(),
+        "numero": set(),
+        "radicado": set(),
+        "archivo": set(),
+        "numero_radicado": set(),
+        "numero_archivo": set(),
+        "radicado_archivo": set(),
+    }
+
+    for audit in audit_files:
+        for row in leer_csv_dicts(audit):
+            cufe = extraer_valor_row(row, COLS_CUFE)
+            numero = extraer_valor_row(row, COLS_NUMERO)
+            radicado = extraer_valor_row(row, COLS_RADICADO)
+            archivo = extraer_valor_row(row, COLS_ARCHIVO)
+
+            if cufe:
+                candidatos["cufe"].add(norm_key(cufe))
+            if numero:
+                candidatos["numero"].add(norm_key(numero))
+            if radicado:
+                candidatos["radicado"].add(norm_key(radicado))
+            if archivo:
+                candidatos["archivo"].add(norm_key(archivo))
+            if numero and radicado:
+                candidatos["numero_radicado"].add(f"{norm_key(numero)}|{norm_key(radicado)}")
+            if numero and archivo:
+                candidatos["numero_archivo"].add(f"{norm_key(numero)}|{norm_key(archivo)}")
+            if radicado and archivo:
+                candidatos["radicado_archivo"].add(f"{norm_key(radicado)}|{norm_key(archivo)}")
+
+    return candidatos
 
 
-def escribir_resumen(manifest: Dict[str, Any]) -> Dict[str, Any]:
-    destino = CIERRE_DIA_DIR / f"RESUMEN_CIERRE_DIARIO_{FECHA}.txt"
-    conteos: Dict[str, int] = {}
-    for item in manifest["archivos"]:
-        conteos[item["categoria"]] = conteos.get(item["categoria"], 0) + 1
+def fila_match_candidatos(
+    row_values: Sequence[Any],
+    headers: Sequence[Any],
+    candidatos: dict[str, set[str]],
+) -> bool:
+    idx_cufe = find_col(headers, COLS_CUFE)
+    idx_numero = find_col(headers, COLS_NUMERO)
+    idx_radicado = find_col(headers, COLS_RADICADO)
+    idx_archivo = find_col(headers, COLS_ARCHIVO)
 
-    lineas = [
-        "CIERRE DIARIO LOCAL SEGURO - FACTURAS JOYCO",
-        "=" * 80,
-        f"Version: {VERSION_CIERRE}",
-        f"Fecha: {FECHA}",
+    cufe = norm_key(row_values[idx_cufe]) if idx_cufe is not None and idx_cufe < len(row_values) else ""
+    numero = norm_key(row_values[idx_numero]) if idx_numero is not None and idx_numero < len(row_values) else ""
+    radicado = norm_key(row_values[idx_radicado]) if idx_radicado is not None and idx_radicado < len(row_values) else ""
+    archivo = norm_key(row_values[idx_archivo]) if idx_archivo is not None and idx_archivo < len(row_values) else ""
+
+    if cufe and cufe in candidatos["cufe"]:
+        return True
+    if numero and radicado and f"{numero}|{radicado}" in candidatos["numero_radicado"]:
+        return True
+    if numero and archivo and f"{numero}|{archivo}" in candidatos["numero_archivo"]:
+        return True
+    if radicado and archivo and f"{radicado}|{archivo}" in candidatos["radicado_archivo"]:
+        return True
+
+    # Fallback más flexible, solo cuando hay combinación para reducir falsos positivos.
+    if numero and radicado and numero in candidatos["numero"] and radicado in candidatos["radicado"]:
+        return True
+    if numero and archivo and numero in candidatos["numero"] and archivo in candidatos["archivo"]:
+        return True
+
+    return False
+
+
+def obtener_filas_diarias_desde_excel(
+    fecha: str,
+    audit_files: list[Path],
+) -> tuple[list[Any], list[list[Any]], dict[str, Any]]:
+    if not FACTURAS_PATH.exists():
+        raise RuntimeError(f"No existe Excel operativo local: {FACTURAS_PATH}")
+
+    print(f"?? Leyendo Excel operativo: {FACTURAS_PATH}")
+
+    wb = load_workbook(FACTURAS_PATH, data_only=True, read_only=True)
+    try:
+        if EXCEL_SHEET_NAME in wb.sheetnames:
+            ws = wb[EXCEL_SHEET_NAME]
+        else:
+            ws = wb[wb.sheetnames[0]]
+
+        print(f"?? Hoja usada: {ws.title} | max_row={ws.max_row} | max_column={ws.max_column}")
+
+        rows_iter = ws.iter_rows(values_only=True)
+
+        try:
+            headers_raw = next(rows_iter)
+        except StopIteration:
+            raise RuntimeError("El Excel operativo no tiene filas.")
+
+        headers = list(headers_raw or [])
+        total_cols = len(headers)
+
+        rows_all: list[list[Any]] = []
+        leidas = 0
+
+        for values in rows_iter:
+            leidas += 1
+
+            row = list(values or [])
+
+            if total_cols > 0:
+                if len(row) < total_cols:
+                    row.extend([None] * (total_cols - len(row)))
+                elif len(row) > total_cols:
+                    row = row[:total_cols]
+
+            if any(v not in (None, "") for v in row):
+                rows_all.append(row)
+
+            if leidas % 1000 == 0:
+                print(f"   ... filas le?das desde Excel: {leidas} | filas con datos: {len(rows_all)}")
+
+        print(f"? Lectura Excel terminada: filas le?das={leidas} | filas con datos={len(rows_all)}")
+
+        meta: dict[str, Any] = {
+            "excel_operativo": rel(FACTURAS_PATH),
+            "hoja_usada": ws.title,
+            "filas_operativas_total": len(rows_all),
+            "metodo_seleccion": "",
+            "advertencias": [],
+        }
+
+        idx_fecha = find_col(headers, COLUMNAS_FECHA_PROCESO_CANDIDATAS)
+        if idx_fecha is not None:
+            rows_fecha = [
+                row for row in rows_all
+                if idx_fecha < len(row) and fecha_valor_coincide(row[idx_fecha], fecha)
+            ]
+            meta["metodo_seleccion"] = "columna_fecha_procesamiento"
+            meta["columna_fecha_procesamiento"] = headers[idx_fecha]
+            return headers, rows_fecha, meta
+
+        candidatos = extraer_candidatos_desde_audits(audit_files)
+        total_candidates = sum(len(v) for v in candidatos.values())
+
+        meta["audit_files_usados"] = [rel(p) for p in audit_files]
+        meta["candidatos_extraidos"] = {k: len(v) for k, v in candidatos.items()}
+
+        if total_candidates <= 0:
+            meta["metodo_seleccion"] = "sin_candidatos_auditoria"
+            meta["advertencias"].append(
+                "No se encontr? columna de fecha de procesamiento ni candidatos suficientes en auditor?a. "
+                "Se genera Excel diario solo con encabezados."
+            )
+            return headers, [], meta
+
+        print(f"?? Cruzando Excel operativo contra auditor?a del d?a. Candidatos={total_candidates}")
+
+        rows_match = []
+        for idx, row in enumerate(rows_all, start=1):
+            if fila_match_candidatos(row, headers, candidatos):
+                rows_match.append(row)
+
+            if idx % 1000 == 0:
+                print(f"   ... cruce auditor?a: {idx}/{len(rows_all)} | matches={len(rows_match)}")
+
+        meta["metodo_seleccion"] = "auditoria_del_dia_vs_excel_operativo"
+        return headers, rows_match, meta
+
+    finally:
+        wb.close()
+
+def ajustar_ancho_columnas(ws) -> None:
+    for column_cells in ws.columns:
+        max_len = 0
+        col_letter = get_column_letter(column_cells[0].column)
+        for cell in column_cells[:80]:
+            try:
+                max_len = max(max_len, len(str(cell.value or "")))
+            except Exception:
+                pass
+        ws.column_dimensions[col_letter].width = min(max(max_len + 2, 10), 45)
+
+
+def crear_excel_diario(destino: Path, headers: list[Any], rows: list[list[Any]]) -> dict[str, Any]:
+    destino.parent.mkdir(parents=True, exist_ok=True)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = EXCEL_SHEET_NAME
+
+    header_clean = ["" if h is None else str(h).strip() for h in headers]
+    ws.append(header_clean)
+
+    for row in rows:
+        normalized = list(row)
+        if len(normalized) < len(header_clean):
+            normalized += [None] * (len(header_clean) - len(normalized))
+        ws.append(normalized[: len(header_clean)])
+
+    max_col = max(1, len(header_clean))
+    max_row = max(1, len(rows) + 1)
+    last_col = get_column_letter(max_col)
+    table_ref = f"A1:{last_col}{max_row}"
+
+    # Excel permite tabla de solo encabezado. Mantiene estructura aunque no haya registros del día.
+    tab = Table(displayName=EXCEL_TABLE_NAME, ref=table_ref)
+    tab.tableStyleInfo = TableStyleInfo(
+        name="TableStyleMedium2",
+        showFirstColumn=False,
+        showLastColumn=False,
+        showRowStripes=True,
+        showColumnStripes=False,
+    )
+    ws.add_table(tab)
+    ws.freeze_panes = "A2"
+    ajustar_ancho_columnas(ws)
+
+    wb.save(destino)
+    wb.close()
+
+    return {
+        "ruta": rel(destino),
+        "filas_datos": len(rows),
+        "columnas": len(header_clean),
+        "tabla": EXCEL_TABLE_NAME,
+        "bytes": destino.stat().st_size,
+        "sha256": sha256_file(destino),
+    }
+
+
+def copiar_auditorias(audit_files: list[Path], destino_dir: Path) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    destino_dir.mkdir(parents=True, exist_ok=True)
+    for origen in audit_files:
+        destino = destino_dir / origen.name
+        info = copiar_archivo(origen, destino)
+        if info:
+            info["categoria"] = "auditoria"
+            items.append(info)
+    return items
+
+
+def copiar_logs(log_files: list[Path], destino_dir: Path) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    destino_dir.mkdir(parents=True, exist_ok=True)
+    for origen in log_files:
+        # Evita colisiones si hay logs con el mismo nombre en logs/ y data/logs/.
+        try:
+            if origen.resolve().is_relative_to(LOGS_DIR.resolve()):
+                rel_log = origen.resolve().relative_to(LOGS_DIR.resolve())
+            elif origen.resolve().is_relative_to(DATA_LOGS_DIR.resolve()):
+                rel_log = origen.resolve().relative_to(DATA_LOGS_DIR.resolve())
+            else:
+                rel_log = Path(origen.name)
+        except Exception:
+            rel_log = Path(origen.name)
+        destino = destino_dir / rel_log
+        info = copiar_archivo(origen, destino)
+        if info:
+            info["categoria"] = "log_produccion"
+            items.append(info)
+    return items
+
+
+def crear_snapshot_env_redactado(destino_dir: Path, fecha: str) -> Optional[dict[str, Any]]:
+    env_path = ROOT / ".env"
+    if not env_path.exists():
+        return None
+    destino_dir.mkdir(parents=True, exist_ok=True)
+    destino = destino_dir / f"snapshot_env_redactado_{fecha}.txt"
+    lineas = env_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    destino.write_text("\n".join(redactar_env_line(x) for x in lineas) + "\n", encoding="utf-8")
+    info = info_archivo(destino, origen=env_path, categoria="config_redactada")
+    return info
+
+
+def validar_excel_generado(path: Path, expected_columns: int) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "archivo": rel(path),
+        "existe": path.exists(),
+        "abre_ok": False,
+        "hojas": [],
+        "filas_datos": 0,
+        "columnas": 0,
+        "errores": [],
+    }
+    if not path.exists():
+        out["errores"].append("No existe Excel diario.")
+        return out
+
+    try:
+        wb = load_workbook(path, read_only=True, data_only=True)
+        try:
+            out["abre_ok"] = True
+            out["hojas"] = list(wb.sheetnames)
+            ws = wb[EXCEL_SHEET_NAME] if EXCEL_SHEET_NAME in wb.sheetnames else wb[wb.sheetnames[0]]
+            out["columnas"] = int(ws.max_column or 0)
+            out["filas_datos"] = max(int(ws.max_row or 0) - 1, 0)
+            if expected_columns and out["columnas"] != expected_columns:
+                out["errores"].append(
+                    f"Columnas distintas. Esperadas={expected_columns}, detectadas={out['columnas']}"
+                )
+        finally:
+            wb.close()
+    except Exception as exc:
+        out["errores"].append(f"No se pudo abrir Excel diario: {type(exc).__name__}: {exc}")
+
+    return out
+
+
+def generar_resumen_txt(path: Path, manifest: dict[str, Any]) -> None:
+    lines = [
+        "CIERRE DIARIO LOCAL SEGURO V2 - FACTURAS JOYCO",
+        "=" * 90,
+        f"Versión: {manifest['version']}",
+        f"Fecha cierre: {manifest['fecha']}",
         f"Generado: {manifest['generado_en']}",
-        f"Root: {ROOT}",
-        f"Carpeta cierre: {CIERRE_DIA_DIR}",
+        f"Root: {manifest['root']}",
+        f"Carpeta cierre: {manifest['carpeta_cierre']}",
         "",
-        "Contenido copiado:",
+        "Resumen:",
+        f"- Filas en Excel diario: {manifest['excel_diario']['filas_datos']}",
+        f"- Columnas en Excel diario: {manifest['excel_diario']['columnas']}",
+        f"- Método selección: {manifest['seleccion_filas'].get('metodo_seleccion')}",
+        f"- Auditorías copiadas: {manifest['conteos']['auditorias']}",
+        f"- Logs copiados: {manifest['conteos']['logs']}",
+        f"- Total archivos evidencia: {manifest['total_archivos']}",
+        f"- Total bytes evidencia: {manifest['total_bytes']}",
+        "",
+        "Regla aplicada:",
+        "- Este cierre diario contiene únicamente lo registrado/procesado en la fecha del cierre, no el histórico completo.",
+        "- Si no hubo registros del día, el Excel diario queda solo con encabezados y el manifest deja advertencia.",
+        "- No se incluye .env real ni secretos.",
+        "- No se sube nada desde este script; la subida remota se hace en el paso de OneDrive.",
+        "",
     ]
-    for categoria, cantidad in sorted(conteos.items()):
-        lineas.append(f"- {categoria}: {cantidad}")
-    lineas.extend([
-        "",
-        f"Total archivos en manifest: {len(manifest['archivos'])}",
-        f"Total bytes: {manifest['total_bytes']}",
-        "",
-        "Regla de seguridad:",
-        "- No se copia .env con secretos reales.",
-        "- Solo se genera snapshot .env redactado si existe archivo .env.",
-        "- No se copian adjuntos, extraidos, ZIP/PDF/XML temporales ni carpetas pesadas.",
-        "- Este cierre local debe subirse luego con subir_cierre_diario_sharepoint.py.",
-        "",
-    ])
-    destino.write_text("\n".join(lineas), encoding="utf-8")
-    return info_archivo(destino, "resumen", None)
+    advertencias = manifest.get("advertencias") or []
+    if advertencias:
+        lines.append("Advertencias:")
+        for adv in advertencias:
+            lines.append(f"- {adv}")
+        lines.append("")
+    lines.append("=" * 90)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def listar_archivos_para_manifest(base: Path, excluir: Optional[set[Path]] = None) -> list[dict[str, Any]]:
+    excluir_resolved = {p.resolve() for p in (excluir or set()) if p.exists()}
+    items: list[dict[str, Any]] = []
+    for p in sorted(base.rglob("*")):
+        if not p.is_file():
+            continue
+        try:
+            if p.resolve() in excluir_resolved:
+                continue
+        except Exception:
+            pass
+        items.append(info_archivo(p, categoria="evidencia"))
+    return items
 
 
 def main() -> int:
+    args = _parse_args()
+    fecha_date = validar_fecha(args.fecha)
+    fecha = fecha_date.isoformat()
+    mes = fecha_date.strftime("%Y-%m")
+    anio = fecha_date.strftime("%Y")
+    mes_nombre = nombre_mes_dir(fecha_date)
+    semana_inicio, semana_fin = rango_semana_lunes_domingo(fecha_date)
+    semana_nombre = f"SEMANA_{semana_inicio.isoformat()}_a_{semana_fin.isoformat()}"
+
+    cierre_dia_dir = (
+        CIERRES_DIR
+        / anio
+        / mes_nombre
+        / semana_nombre
+        / "01_Cierres_Diarios"
+        / f"cierre_diario_{fecha}"
+    )
+    excel_dir = cierre_dia_dir / "01_Excel_Diario"
+    auditoria_dir = cierre_dia_dir / "02_Auditoria"
+    logs_dir = cierre_dia_dir / "03_Logs" / f"logs_produccion_{fecha}"
+    manifest_dir = cierre_dia_dir / "04_Manifest"
+    validaciones_dir = cierre_dia_dir / "05_Validaciones"
+
+    excel_diario_path = excel_dir / f"facturas_diario_{fecha}.xlsx"
+    manifest_path = manifest_dir / f"manifest_diario_{fecha}.json"
+    resumen_path = manifest_dir / f"resumen_diario_{fecha}.txt"
+    validacion_path = validaciones_dir / f"validacion_local_{fecha}.json"
+
     print("=" * 100)
-    print("CIERRE DIARIO LOCAL SEGURO - FACTURAS JOYCO")
+    print("CIERRE DIARIO LOCAL SEGURO V2 - FACTURAS JOYCO")
     print("=" * 100)
     print(f"Versión: {VERSION_CIERRE}")
     print(f"Root: {ROOT}")
-    print(f"Fecha: {FECHA}")
-    print(f"Mes: {MES}")
-    print(f"Carpeta local destino: {CIERRE_DIA_DIR}")
+    print(f"Fecha: {fecha}")
+    print(f"Mes carpeta: {mes_nombre}")
+    print(f"Semana: {semana_inicio.isoformat()} a {semana_fin.isoformat()}")
+    print(f"Carpeta local destino: {cierre_dia_dir}")
+    print(f"Dry-run: {args.dry_run}")
     print("-" * 100)
 
     ok_lock, msg_lock = acquire_lock()
@@ -280,89 +821,136 @@ def main() -> int:
         return 2
 
     try:
-        CIERRE_DIA_DIR.mkdir(parents=True, exist_ok=True)
+        audit_files = recolectar_audits(fecha)
+        log_files = recolectar_logs(fecha)
+        headers, filas_diarias, meta_seleccion = obtener_filas_diarias_desde_excel(fecha, audit_files)
 
-        manifest: Dict[str, Any] = {
-            "tipo": "cierre_diario_local_seguro",
+        advertencias: list[str] = []
+        advertencias.extend(meta_seleccion.get("advertencias", []))
+        if not audit_files:
+            advertencias.append("No se encontraron archivos de auditoría del día.")
+        if not log_files:
+            advertencias.append("No se encontraron logs específicos del día.")
+        if not filas_diarias:
+            advertencias.append("El Excel diario no tendrá filas de datos para esta fecha.")
+
+        print(f"📌 Auditorías detectadas: {len(audit_files)}")
+        print(f"📌 Logs detectados: {len(log_files)}")
+        print(f"📌 Método selección filas: {meta_seleccion.get('metodo_seleccion')}")
+        print(f"📌 Filas diarias detectadas: {len(filas_diarias)}")
+
+        if args.dry_run:
+            print("-" * 100)
+            print("DRY-RUN: no se generaron archivos.")
+            if advertencias:
+                print("⚠️ Advertencias:")
+                for adv in advertencias:
+                    print(f"  - {adv}")
+            return 0
+
+        if cierre_dia_dir.exists():
+            print(f"⚠️ Ya existe carpeta de cierre diario. Se regenerará: {cierre_dia_dir}")
+            shutil.rmtree(cierre_dia_dir, ignore_errors=True)
+
+        for d in (excel_dir, auditoria_dir, logs_dir, manifest_dir, validaciones_dir):
+            d.mkdir(parents=True, exist_ok=True)
+
+        excel_info = crear_excel_diario(excel_diario_path, list(headers), filas_diarias)
+        auditorias_info = copiar_auditorias(audit_files, auditoria_dir)
+        logs_info = copiar_logs(log_files, logs_dir)
+        env_info = crear_snapshot_env_redactado(manifest_dir, fecha)
+
+        validacion_excel = validar_excel_generado(excel_diario_path, expected_columns=len(headers))
+        validacion = {
+            "tipo": "validacion_local_cierre_diario",
             "version": VERSION_CIERRE,
-            "fecha": FECHA,
-            "mes": MES,
-            "generado_en": datetime.datetime.now().isoformat(timespec="seconds"),
+            "fecha": fecha,
+            "generado_en": _dt.datetime.now().isoformat(timespec="seconds"),
+            "excel": validacion_excel,
+            "auditorias_detectadas": len(audit_files),
+            "auditorias_copiadas": len(auditorias_info),
+            "logs_detectados": len(log_files),
+            "logs_copiados": len(logs_info),
+            "ok": bool(validacion_excel.get("abre_ok")) and not validacion_excel.get("errores"),
+            "advertencias": advertencias,
+        }
+        validacion_path.write_text(json.dumps(validacion, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        manifest = {
+            "tipo": "cierre_diario_local_seguro_v2",
+            "version": VERSION_CIERRE,
+            "fecha": fecha,
+            "anio": anio,
+            "mes": mes,
+            "mes_nombre": mes_nombre,
+            "semana_inicio": semana_inicio.isoformat(),
+            "semana_fin": semana_fin.isoformat(),
+            "semana_nombre": semana_nombre,
+            "generado_en": _dt.datetime.now().isoformat(timespec="seconds"),
             "root": str(ROOT),
             "host": socket.gethostname(),
             "platform": platform.platform(),
             "python": sys.version.replace("\n", " "),
-            "archivos": [],
-            "advertencias": [],
+            "carpeta_cierre": rel(cierre_dia_dir),
+            "excel_diario": excel_info,
+            "seleccion_filas": meta_seleccion,
+            "conteos": {
+                "filas_diarias": len(filas_diarias),
+                "auditorias": len(auditorias_info),
+                "logs": len(logs_info),
+                "config_redactada": 1 if env_info else 0,
+            },
+            "validacion_local": rel(validacion_path),
+            "advertencias": advertencias,
+            "nota": "Cierre diario V2: evidencia solo del día, no histórico completo.",
         }
 
-        copiados = 0
+        # Totales preliminares antes de generar el resumen.
+        # Esto evita KeyError si el resumen consulta total_archivos/total_bytes.
+        archivos_evidencia_pre_resumen = listar_archivos_para_manifest(cierre_dia_dir, excluir={manifest_path})
+        manifest["archivos"] = archivos_evidencia_pre_resumen
+        manifest["total_archivos"] = len(archivos_evidencia_pre_resumen)
+        manifest["total_bytes"] = sum(
+            int(x.get("bytes", 0) or 0)
+            for x in archivos_evidencia_pre_resumen
+        )
+        generar_resumen_txt(resumen_path, manifest)
 
-        for origen in ARCHIVOS_BASE:
-            info = copiar_archivo(origen, "01_excel", "excel_operativo")
-            if info:
-                manifest["archivos"].append(info)
-                copiados += 1
-            elif origen.name == "facturas.xlsx":
-                manifest["advertencias"].append(f"No existe archivo obligatorio esperado: {rel(origen)}")
+        # El manifest se escribe después del resumen/validación para registrar la evidencia final.
+        archivos_evidencia = listar_archivos_para_manifest(cierre_dia_dir, excluir={manifest_path})
+        manifest["archivos"] = archivos_evidencia
+        manifest["total_archivos"] = len(archivos_evidencia)
+        manifest["total_bytes"] = sum(int(x.get("bytes", 0) or 0) for x in archivos_evidencia)
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        for origen in recolectar_audits():
-            info = copiar_archivo(origen, "02_auditoria", "auditoria")
-            if info:
-                manifest["archivos"].append(info)
-                copiados += 1
-
-        for origen in recolectar_estado():
-            info = copiar_archivo(origen, "03_state", "state")
-            if info:
-                manifest["archivos"].append(info)
-                copiados += 1
-
-        for origen in recolectar_logs_recientes():
-            info = copiar_archivo(origen, "04_logs_recientes", "logs_recientes")
-            if info:
-                manifest["archivos"].append(info)
-                copiados += 1
-
-        env_info = crear_snapshot_env_redactado(CIERRE_DIA_DIR / "05_config_redactada")
-        if env_info:
-            manifest["archivos"].append(env_info)
-            copiados += 1
-
-        manifest["total_archivos"] = len(manifest["archivos"])
-        manifest["total_bytes"] = sum(int(item.get("bytes", 0) or 0) for item in manifest["archivos"])
-
-        resumen_info = escribir_resumen(manifest)
-        manifest["archivos"].append(resumen_info)
-        manifest["total_archivos"] = len(manifest["archivos"])
-        manifest["total_bytes"] = sum(int(item.get("bytes", 0) or 0) for item in manifest["archivos"])
-
-        manifest_path = CIERRE_DIA_DIR / f"manifest_cierre_diario_{FECHA}.json"
-        manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
-
-        print(f"✅ Archivos copiados: {copiados}")
+        print(f"✅ Excel diario: {excel_diario_path}")
+        print(f"✅ Filas Excel diario: {excel_info['filas_datos']}")
+        print(f"✅ Auditorías copiadas: {len(auditorias_info)}")
+        print(f"✅ Logs copiados: {len(logs_info)}")
         print(f"✅ Manifest: {manifest_path}")
-        print(f"✅ Resumen: {CIERRE_DIA_DIR / f'RESUMEN_CIERRE_DIARIO_{FECHA}.txt'}")
-        print(f"✅ Total archivos manifest: {manifest['total_archivos']}")
-        print(f"✅ Total bytes: {manifest['total_bytes']}")
+        print(f"✅ Resumen: {resumen_path}")
+        print(f"✅ Validación local: {validacion_path}")
+        print(f"✅ Total archivos evidencia: {manifest['total_archivos']}")
+        print(f"✅ Total bytes evidencia: {manifest['total_bytes']}")
 
-        if manifest["advertencias"]:
+        if advertencias:
             print("⚠️ Advertencias:")
-            for adv in manifest["advertencias"]:
+            for adv in advertencias:
                 print(f"  - {adv}")
 
-        if copiados <= 0:
-            print("❌ No se copió ningún archivo operativo. Revisa rutas de data/.")
-            return 1
+        if not args.permitir_vacio and len(filas_diarias) == 0:
+            print("⚠️ Cierre generado sin filas diarias. Se devuelve código 3 para revisión controlada.")
+            print("   Si el día realmente no tuvo facturas nuevas, usa --permitir-vacio.")
+            return 3
 
         print("=" * 100)
-        print("✅ Cierre diario local generado correctamente.")
-        print("Siguiente paso: python scripts\\subir_cierre_diario_sharepoint.py")
+        print("✅ Cierre diario local V2 generado correctamente.")
+        print("Siguiente paso: subir/validar en OneDrive con el script remoto V2.")
         print("=" * 100)
         return 0
 
     except Exception as exc:
-        print(f"❌ Error generando cierre diario local: {exc}")
+        print(f"❌ Error generando cierre diario local V2: {type(exc).__name__}: {exc}")
         print("⚠️ No subas ni archives nada hasta revisar el error.")
         return 1
     finally:
