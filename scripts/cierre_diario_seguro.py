@@ -6,7 +6,7 @@ Cierre diario local seguro V2
 Política V2:
 - El cierre diario NO copia el histórico completo de facturas.xlsx.
 - Genera un Excel diario con las facturas registradas/procesadas en la fecha del cierre.
-- Incluye auditorías del día, logs de producción del día, manifest, resumen y validación local.
+- Incluye auditorías del día, logs de producción local/VPS, manifest, resumen y validación local.
 - No sube a OneDrive/SharePoint. La subida se hará con el script remoto correspondiente.
 - No incluye .env real ni secretos.
 
@@ -51,12 +51,22 @@ try:
 except Exception:
     pass
 
-VERSION_CIERRE = "2026-07-08-CIERRE-DIARIO-SEGURO-V2-ESTRUCTURA-ANIO-MES-SEMANA"
+VERSION_CIERRE = "2026-07-15-CIERRE-DIARIO-SEGURO-V2-MINIMOS-LOGS-VPS"
 
 DATA_DIR = ROOT / "data"
 AUDIT_DIR = DATA_DIR / "audit"
 LOGS_DIR = ROOT / "logs"
 DATA_LOGS_DIR = DATA_DIR / "logs"
+
+# En local, los logs pueden permanecer dentro del repositorio.
+# En el VPS se almacenan fuera del código para separar aplicación y operación.
+VPS_LOG_ROOT = Path(
+    os.getenv(
+        "FACTURAS_LOG_ROOT",
+        "/var/log/joyco/facturas-procesador",
+    )
+)
+
 CIERRES_DIR = DATA_DIR / "cierres_diarios"
 LOCKS_DIR = DATA_DIR / "locks"
 
@@ -101,11 +111,43 @@ COLUMNAS_FECHA_PROCESO_CANDIDATAS = [
     "created_at",
 ]
 
-COLS_NUMERO = ["número de factura", "numero de factura", "numerofactura", "numero factura", "factura", "numero"]
+COLS_NUMERO = [
+    "número de factura",
+    "numero de factura",
+    "numerofactura",
+    "numero factura",
+    "factura",
+    "numero",
+]
 COLS_RADICADO = ["radicado"]
 COLS_CUFE = ["cufe", "cude", "cufe/cude", "uuid"]
 COLS_ARCHIVO = ["archivo", "archivo origen", "nombre archivo", "pdf", "xml"]
+COLS_ARCHIVO_AUDIT_FALLBACK = [
+    "pdf_name",
+    "pdf name",
+    "archivo_pdf",
+    "archivo pdf",
+    "nombre_pdf",
+    "nombre pdf",
+    "attachment_name",
+    "attachment name",
+]
+COLS_ASUNTO_AUDIT = [
+    "subject",
+    "subj",
+    "asunto",
+    "email_subject",
+    "email subject",
+    "mail_subject",
+    "mail subject",
+]
 COLS_CONCEPTO = ["concepto"]
+
+PATRON_RADICADO_ASUNTO = re.compile(
+    r"(?i)\bradicado"
+    r"(?:\s*(?:n[.°ºo]*|no\.?))?"
+    r"\s*[-:#]?\s*(\d{4,})\b"
+)
 
 EXT_LOGS = {".log", ".txt", ".csv", ".json"}
 EXCEL_SHEET_NAME = "Facturas"
@@ -338,11 +380,46 @@ def log_corresponde_fecha(path: Path, fecha: str) -> bool:
         return False
 
 
+def bases_logs_disponibles() -> list[tuple[str, Path]]:
+    """
+    Devuelve las ubicaciones de logs compatibles con local y VPS.
+
+    Los paths se deduplican por ruta resuelta para evitar copiar dos veces
+    el mismo directorio cuando data/logs es un enlace simbólico.
+    """
+    candidatos = [
+        ("app_logs", LOGS_DIR),
+        ("data_logs", DATA_LOGS_DIR),
+        ("runtime", VPS_LOG_ROOT / "runtime"),
+        ("runs", VPS_LOG_ROOT / "runs"),
+        ("cron", VPS_LOG_ROOT / "cron"),
+    ]
+
+    vistos: set[str] = set()
+    bases: list[tuple[str, Path]] = []
+
+    for etiqueta, base in candidatos:
+        if not base.exists() or not base.is_dir():
+            continue
+
+        try:
+            key = str(base.resolve()).casefold()
+        except Exception:
+            key = str(base).casefold()
+
+        if key in vistos:
+            continue
+
+        vistos.add(key)
+        bases.append((etiqueta, base))
+
+    return bases
+
+
 def recolectar_logs(fecha: str) -> list[Path]:
     rutas: list[Path] = []
-    for base in (LOGS_DIR, DATA_LOGS_DIR):
-        if not base.exists():
-            continue
+
+    for _etiqueta, base in bases_logs_disponibles():
         for p in base.rglob("*"):
             if not p.is_file():
                 continue
@@ -351,17 +428,20 @@ def recolectar_logs(fecha: str) -> list[Path]:
             if log_corresponde_fecha(p, fecha):
                 rutas.append(p)
 
-    vistos = set()
-    out = []
+    vistos: set[str] = set()
+    out: list[Path] = []
+
     for p in rutas:
         try:
-            key = str(p.resolve()).lower()
+            key = str(p.resolve()).casefold()
         except Exception:
-            key = str(p).lower()
+            key = str(p).casefold()
+
         if key not in vistos:
             vistos.add(key)
             out.append(p)
-    return sorted(out)
+
+    return sorted(out, key=lambda p: str(p).casefold())
 
 
 def find_col(headers: Sequence[Any], candidates: Sequence[str]) -> Optional[int]:
@@ -416,7 +496,65 @@ def extraer_valor_row(row: dict[str, Any], candidates: Sequence[str]) -> str:
     return ""
 
 
-def extraer_candidatos_desde_audits(audit_files: list[Path]) -> dict[str, set[str]]:
+def extraer_primer_valor_no_vacio(
+    row: dict[str, Any],
+    candidates: Sequence[str],
+) -> str:
+    """
+    Busca el primer valor no vacío entre varios nombres posibles de columna.
+
+    A diferencia de extraer_valor_row(), no se detiene cuando una columna
+    existe pero viene vacía. Esto es necesario para auditorías que conservan
+    columnas antiguas vacías y guardan el dato real en una columna nueva.
+    """
+    by_norm = {norm(k): v for k, v in row.items()}
+    by_key = {norm_key(k): v for k, v in row.items()}
+
+    for candidate in candidates:
+        values: list[Any] = []
+
+        candidate_norm = norm(candidate)
+        candidate_key = norm_key(candidate)
+
+        if candidate_norm in by_norm:
+            values.append(by_norm[candidate_norm])
+
+        if candidate_key in by_key:
+            values.append(by_key[candidate_key])
+
+        for value in values:
+            cleaned = clean_value(value)
+            if cleaned:
+                return cleaned
+
+    return ""
+
+
+def extraer_radicado_desde_asunto(asunto: str) -> str:
+    if not asunto:
+        return ""
+
+    match = PATRON_RADICADO_ASUNTO.search(str(asunto))
+    return match.group(1) if match else ""
+
+
+def extraer_candidatos_desde_audits(
+    audit_files: list[Path],
+) -> dict[str, set[str]]:
+    """
+    Extrae identificadores de las auditorías del día.
+
+    Los registros normales suelen coincidir por CUFE. Los registros mínimos
+    pueden no tener CUFE, pero conservan número, radicado y archivo. En esos
+    casos:
+
+    - el radicado puede venir dentro del asunto del correo;
+    - el archivo puede venir en pdf_name u otra columna equivalente.
+
+    Nunca se habilita una coincidencia únicamente por número. Las
+    combinaciones número+radicado, número+archivo o radicado+archivo reducen
+    el riesgo de incluir registros de otro día.
+    """
     candidatos: dict[str, set[str]] = {
         "cufe": set(),
         "numero": set(),
@@ -429,25 +567,50 @@ def extraer_candidatos_desde_audits(audit_files: list[Path]) -> dict[str, set[st
 
     for audit in audit_files:
         for row in leer_csv_dicts(audit):
-            cufe = extraer_valor_row(row, COLS_CUFE)
-            numero = extraer_valor_row(row, COLS_NUMERO)
-            radicado = extraer_valor_row(row, COLS_RADICADO)
-            archivo = extraer_valor_row(row, COLS_ARCHIVO)
+            cufe = extraer_primer_valor_no_vacio(row, COLS_CUFE)
+            numero = extraer_primer_valor_no_vacio(row, COLS_NUMERO)
+            radicado = extraer_primer_valor_no_vacio(row, COLS_RADICADO)
+            archivo = extraer_primer_valor_no_vacio(row, COLS_ARCHIVO)
 
-            if cufe:
-                candidatos["cufe"].add(norm_key(cufe))
-            if numero:
-                candidatos["numero"].add(norm_key(numero))
-            if radicado:
-                candidatos["radicado"].add(norm_key(radicado))
-            if archivo:
-                candidatos["archivo"].add(norm_key(archivo))
-            if numero and radicado:
-                candidatos["numero_radicado"].add(f"{norm_key(numero)}|{norm_key(radicado)}")
-            if numero and archivo:
-                candidatos["numero_archivo"].add(f"{norm_key(numero)}|{norm_key(archivo)}")
-            if radicado and archivo:
-                candidatos["radicado_archivo"].add(f"{norm_key(radicado)}|{norm_key(archivo)}")
+            if not archivo:
+                archivo = extraer_primer_valor_no_vacio(
+                    row,
+                    COLS_ARCHIVO_AUDIT_FALLBACK,
+                )
+
+            if not radicado:
+                asunto = extraer_primer_valor_no_vacio(
+                    row,
+                    COLS_ASUNTO_AUDIT,
+                )
+                radicado = extraer_radicado_desde_asunto(asunto)
+
+            cufe_key = norm_key(cufe)
+            numero_key = norm_key(numero)
+            radicado_key = norm_key(radicado)
+            archivo_key = norm_key(archivo)
+
+            if cufe_key:
+                candidatos["cufe"].add(cufe_key)
+            if numero_key:
+                candidatos["numero"].add(numero_key)
+            if radicado_key:
+                candidatos["radicado"].add(radicado_key)
+            if archivo_key:
+                candidatos["archivo"].add(archivo_key)
+
+            if numero_key and radicado_key:
+                candidatos["numero_radicado"].add(
+                    f"{numero_key}|{radicado_key}"
+                )
+            if numero_key and archivo_key:
+                candidatos["numero_archivo"].add(
+                    f"{numero_key}|{archivo_key}"
+                )
+            if radicado_key and archivo_key:
+                candidatos["radicado_archivo"].add(
+                    f"{radicado_key}|{archivo_key}"
+                )
 
     return candidatos
 
@@ -654,25 +817,35 @@ def copiar_auditorias(audit_files: list[Path], destino_dir: Path) -> list[dict[s
     return items
 
 
-def copiar_logs(log_files: list[Path], destino_dir: Path) -> list[dict[str, Any]]:
+def copiar_logs(
+    log_files: list[Path],
+    destino_dir: Path,
+) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     destino_dir.mkdir(parents=True, exist_ok=True)
+    bases = bases_logs_disponibles()
+
     for origen in log_files:
-        # Evita colisiones si hay logs con el mismo nombre en logs/ y data/logs/.
-        try:
-            if origen.resolve().is_relative_to(LOGS_DIR.resolve()):
-                rel_log = origen.resolve().relative_to(LOGS_DIR.resolve())
-            elif origen.resolve().is_relative_to(DATA_LOGS_DIR.resolve()):
-                rel_log = origen.resolve().relative_to(DATA_LOGS_DIR.resolve())
-            else:
-                rel_log = Path(origen.name)
-        except Exception:
-            rel_log = Path(origen.name)
+        rel_log: Optional[Path] = None
+
+        for etiqueta, base in bases:
+            try:
+                rel_origen = origen.resolve().relative_to(base.resolve())
+                rel_log = Path(etiqueta) / rel_origen
+                break
+            except Exception:
+                continue
+
+        if rel_log is None:
+            rel_log = Path("otros") / origen.name
+
         destino = destino_dir / rel_log
         info = copiar_archivo(origen, destino)
+
         if info:
             info["categoria"] = "log_produccion"
             items.append(info)
+
     return items
 
 
