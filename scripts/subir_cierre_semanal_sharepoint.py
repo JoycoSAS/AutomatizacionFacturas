@@ -47,8 +47,18 @@ except Exception:
 
 from services.m365.token import get_access_token
 
-VERSION_UPLOAD = "2026-07-08-UPLOAD-CIERRE-SEMANAL-V1-REPO-BACKUPS-UNICO"
+VERSION_UPLOAD = "2026-07-21-UPLOAD-CIERRE-SEMANAL-V1-REINTENTOS-GRAPH"
 GRAPH = "https://graph.microsoft.com/v1.0"
+
+# Microsoft Graph puede responder temporalmente con 429 o 5xx incluso cuando
+# la ruta y el archivo son validos. La subida se reintenta sobre la misma ruta,
+# por lo que no crea duplicados: un nuevo PUT reemplaza el contenido del mismo
+# archivo remoto. Los errores definitivos (por ejemplo 400/401/403/404) no se
+# reintentan para no ocultar problemas de configuracion o permisos.
+HTTP_REINTENTABLES_SUBIDA = {408, 429, 500, 502, 503, 504}
+INTENTOS_SUBIDA = 4
+ESPERA_BASE_SUBIDA_SEGUNDOS = 2
+ESPERA_MAX_SUBIDA_SEGUNDOS = 60
 
 DATA_DIR = ROOT / "data"
 CIERRES_DIR = DATA_DIR / "cierres_diarios"
@@ -159,13 +169,82 @@ def ensure_folder_recursive(drive_id: str, folder_path: str) -> None:
         actual = siguiente
 
 
+def espera_reintento_subida(respuesta: Optional[requests.Response], intento: int) -> int:
+    """Calcula la espera respetando Retry-After cuando Graph lo informa."""
+    if respuesta is not None:
+        retry_after = str(respuesta.headers.get("Retry-After", "") or "").strip()
+        if retry_after:
+            try:
+                return max(1, min(int(float(retry_after)), ESPERA_MAX_SUBIDA_SEGUNDOS))
+            except (TypeError, ValueError):
+                pass
+    espera = ESPERA_BASE_SUBIDA_SEGUNDOS * (2 ** max(0, intento - 1))
+    return min(espera, ESPERA_MAX_SUBIDA_SEGUNDOS)
+
+
 def graph_put_content(drive_id: str, remote_path: str, local_file: Path) -> dict[str, Any]:
     url = f"{GRAPH}/drives/{encode_drive_id(drive_id)}/root:/{encode_path(remote_path)}:/content"
     data = local_file.read_bytes()
-    r = requests.put(url, headers=headers(), data=data, timeout=300, verify=ssl_verify())
-    if r.status_code not in (200, 201):
-        raise RuntimeError(f"PUT {r.status_code} {url} -> {r.text[:700]}")
-    return r.json()
+    ultimo_error = ""
+
+    for intento in range(1, INTENTOS_SUBIDA + 1):
+        respuesta: Optional[requests.Response] = None
+        try:
+            respuesta = requests.put(
+                url,
+                headers=headers(),
+                data=data,
+                timeout=300,
+                verify=ssl_verify(),
+            )
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            ultimo_error = (
+                f"PUT interrumpido para {remote_path} en intento "
+                f"{intento}/{INTENTOS_SUBIDA}: {type(exc).__name__}: {exc}"
+            )
+            if intento >= INTENTOS_SUBIDA:
+                raise RuntimeError(ultimo_error) from exc
+            espera = espera_reintento_subida(None, intento)
+            print(ultimo_error)
+            print(f"Reintentando subida en {espera}s sobre la misma ruta remota...")
+            time.sleep(espera)
+            continue
+        except requests.RequestException as exc:
+            raise RuntimeError(
+                f"PUT no reintentable para {remote_path}: {type(exc).__name__}: {exc}"
+            ) from exc
+
+        if respuesta.status_code in (200, 201):
+            item = respuesta.json()
+            item["_joyco_intento_subida"] = intento
+            item["_joyco_codigo_http_subida"] = respuesta.status_code
+            if intento > 1:
+                print(
+                    f"Subida recuperada correctamente en intento "
+                    f"{intento}/{INTENTOS_SUBIDA}: {remote_path}"
+                )
+            return item
+
+        ultimo_error = (
+            f"PUT {respuesta.status_code} para {remote_path} -> "
+            f"{respuesta.text[:700]}"
+        )
+        if respuesta.status_code not in HTTP_REINTENTABLES_SUBIDA:
+            raise RuntimeError(ultimo_error)
+        if intento >= INTENTOS_SUBIDA:
+            raise RuntimeError(
+                f"{ultimo_error} | reintentos agotados: {INTENTOS_SUBIDA}"
+            )
+
+        espera = espera_reintento_subida(respuesta, intento)
+        print(
+            f"Subida intento {intento}/{INTENTOS_SUBIDA} fallo temporalmente "
+            f"con HTTP {respuesta.status_code}: {remote_path}"
+        )
+        print(f"Reintentando subida en {espera}s sobre la misma ruta remota...")
+        time.sleep(espera)
+
+    raise RuntimeError(ultimo_error or f"PUT fallido para {remote_path}")
 
 
 def graph_download_item_content(drive_id: str, item_id: str) -> bytes:
@@ -381,6 +460,8 @@ def subir_y_verificar_con_reintentos(
     rel: str,
 ) -> tuple[bool, dict[str, Any]]:
     item = graph_put_content(drive_id, remote_path, local)
+    intento_subida = int(item.pop("_joyco_intento_subida", 1) or 1)
+    codigo_http_subida = int(item.pop("_joyco_codigo_http_subida", 0) or 0)
     intentos = 4
     espera = 2
     ultimo_error = None
@@ -388,6 +469,8 @@ def subir_y_verificar_con_reintentos(
     for intento in range(1, intentos + 1):
         try:
             ok, resultado = verificar_archivo_subido(local=local, rel=rel, drive_id=drive_id, item=item)
+            resultado["intento_subida"] = intento_subida
+            resultado["codigo_http_subida"] = codigo_http_subida
             resultado["intento_verificacion"] = intento
             if ok:
                 return True, resultado
@@ -398,6 +481,8 @@ def subir_y_verificar_con_reintentos(
                 "rel": rel,
                 "ok": False,
                 "error": str(exc),
+                "intento_subida": intento_subida,
+                "codigo_http_subida": codigo_http_subida,
                 "intento_verificacion": intento,
             }
             print(f"Verificacion intento {intento}/{intentos} fallo para {rel}: {exc}")
