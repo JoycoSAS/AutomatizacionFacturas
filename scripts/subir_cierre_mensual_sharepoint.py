@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 JOYCO - Facturas Procesador
-Subida remota de cierre mensual V1 a repositorio unico de backups.
+Subida remota de cierre mensual V2 a repositorio unico de backups.
 
 Politica:
 - El cierre mensual NO se sube al SharePoint principal de operacion.
@@ -10,7 +10,10 @@ Politica:
   BACKUP_ROOT_FOLDER / ONEDRIVE_BACKUP_FOLDER / SP_BACKUP2_FOLDER
 - La verificacion remota descarga cada archivo subido y compara:
   - Excel: datos internos hoja/celda.
-  - CSV/JSON/TXT: SHA256 exacto.
+  - Los demas archivos, incluido ZIP: SHA256 exacto.
+- Reintenta errores temporales de Graph sobre la misma ruta remota.
+- Permite reanudar una ejecucion incompleta y procesar solo los archivos fallidos.
+- Registra los 20 dias de retencion local solo despues de validar toda la subida.
 """
 
 from __future__ import annotations
@@ -20,11 +23,21 @@ import datetime as _dt
 import hashlib
 import json
 import os
+import shutil
 import sys
 import time
+import zipfile
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
+
+try:
+    import truststore
+except ImportError:
+    truststore = None
+else:
+    truststore.inject_into_ssl()
 
 import requests
 from openpyxl import load_workbook
@@ -39,12 +52,19 @@ except Exception:
 
 from services.m365.token import get_access_token
 
-VERSION_UPLOAD = "2026-07-09-UPLOAD-CIERRE-MENSUAL-V1-REPO-BACKUPS-UNICO"
+VERSION_UPLOAD = "2026-07-22-UPLOAD-CIERRE-MENSUAL-V2-REANUDAR-FALLIDOS"
 GRAPH = "https://graph.microsoft.com/v1.0"
+
+HTTP_REINTENTABLES_SUBIDA = {408, 429, 500, 502, 503, 504}
+INTENTOS_SUBIDA = 4
+ESPERA_BASE_SUBIDA_SEGUNDOS = 2
+ESPERA_MAX_SUBIDA_SEGUNDOS = 60
+RETENCION_LOCAL_DIAS = 20
+ZONA_HORARIA = ZoneInfo("America/Bogota")
 
 DATA_DIR = ROOT / "data"
 CIERRES_DIR = DATA_DIR / "cierres_diarios"
-TMP_VERIFY_DIR = DATA_DIR / "_tmp_verificacion_cierre_mensual_v1"
+TMP_VERIFY_DIR = DATA_DIR / "_tmp_verificacion_cierre_mensual_v2"
 
 EXCLUIR_NOMBRES = {".env", ".env.local", ".env.production"}
 EXCLUIR_EXT = {".tmp", ".lock"}
@@ -60,16 +80,20 @@ def ssl_verify() -> bool:
     return str(os.getenv("SSL_VERIFY", "true")).strip().lower() not in {"0", "false", "no", "off"}
 
 
-def env_first(*names: str) -> str:
+def env_first(*names: str, default: str = "") -> str:
     for name in names:
         value = (os.getenv(name) or "").strip()
         if value:
             return value
-    return ""
+    return default
 
 
 def encode_path(path: str) -> str:
-    return "/".join(quote(part, safe="") for part in path.strip("/").split("/") if part)
+    return quote(str(path).strip("/"), safe="/")
+
+
+def encode_drive_id(drive_id: str) -> str:
+    return quote(str(drive_id), safe="!")
 
 
 def headers() -> dict[str, str]:
@@ -77,36 +101,214 @@ def headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
-def graph_get(url: str, **kwargs) -> requests.Response:
-    return requests.get(url, headers=headers(), timeout=kwargs.pop("timeout", 120), verify=ssl_verify(), **kwargs)
+def h_json() -> dict[str, str]:
+    h = headers()
+    h["Content-Type"] = "application/json"
+    return h
+
+
+def graph_get(
+    url: str, *, ok: Tuple[int, ...] = (200,), timeout: int = 60
+) -> requests.Response:
+    r = requests.get(url, headers=headers(), timeout=timeout, verify=ssl_verify())
+    if r.status_code not in ok:
+        raise RuntimeError(f"GET {r.status_code} {url} -> {r.text[:700]}")
+    return r
+
+
+def espera_reintento_subida(
+    respuesta: Optional[requests.Response], intento: int
+) -> int:
+    if respuesta is not None:
+        retry_after = str(respuesta.headers.get("Retry-After", "") or "").strip()
+        if retry_after:
+            try:
+                return max(1, min(int(float(retry_after)), ESPERA_MAX_SUBIDA_SEGUNDOS))
+            except (TypeError, ValueError):
+                pass
+    espera = ESPERA_BASE_SUBIDA_SEGUNDOS * (2 ** max(0, intento - 1))
+    return min(espera, ESPERA_MAX_SUBIDA_SEGUNDOS)
 
 
 def graph_put_content(drive_id: str, remote_path: str, local_file: Path) -> dict[str, Any]:
-    url = f"{GRAPH}/drives/{quote(drive_id, safe='')}/root:/{encode_path(remote_path)}:/content"
+    url = f"{GRAPH}/drives/{encode_drive_id(drive_id)}/root:/{encode_path(remote_path)}:/content"
     data = local_file.read_bytes()
-    r = requests.put(url, headers=headers(), data=data, timeout=300, verify=ssl_verify())
-    if r.status_code not in (200, 201):
-        raise RuntimeError(f"PUT {r.status_code} {url} -> {r.text[:800]}")
-    return r.json()
+    ultimo_error = ""
+    for intento in range(1, INTENTOS_SUBIDA + 1):
+        respuesta: Optional[requests.Response] = None
+        try:
+            respuesta = requests.put(
+                url, headers=headers(), data=data, timeout=300, verify=ssl_verify()
+            )
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            ultimo_error = (
+                f"PUT interrumpido para {remote_path} en intento "
+                f"{intento}/{INTENTOS_SUBIDA}: {type(exc).__name__}: {exc}"
+            )
+            if intento >= INTENTOS_SUBIDA:
+                raise RuntimeError(ultimo_error) from exc
+            espera = espera_reintento_subida(None, intento)
+            print(ultimo_error)
+            print(f"Reintentando subida en {espera}s sobre la misma ruta remota...")
+            time.sleep(espera)
+            continue
+        except requests.RequestException as exc:
+            raise RuntimeError(
+                f"PUT no reintentable para {remote_path}: {type(exc).__name__}: {exc}"
+            ) from exc
+
+        if respuesta.status_code in (200, 201):
+            item = respuesta.json()
+            item["_joyco_intento_subida"] = intento
+            item["_joyco_codigo_http_subida"] = respuesta.status_code
+            if intento > 1:
+                print(
+                    f"Subida recuperada en intento {intento}/{INTENTOS_SUBIDA}: "
+                    f"{remote_path}"
+                )
+            return item
+
+        ultimo_error = (
+            f"PUT {respuesta.status_code} para {remote_path} -> {respuesta.text[:700]}"
+        )
+        if respuesta.status_code not in HTTP_REINTENTABLES_SUBIDA:
+            raise RuntimeError(ultimo_error)
+        if intento >= INTENTOS_SUBIDA:
+            raise RuntimeError(
+                f"{ultimo_error} | reintentos agotados: {INTENTOS_SUBIDA}"
+            )
+        espera = espera_reintento_subida(respuesta, intento)
+        print(
+            f"Subida intento {intento}/{INTENTOS_SUBIDA} fallo temporalmente "
+            f"con HTTP {respuesta.status_code}: {remote_path}"
+        )
+        print(f"Reintentando subida en {espera}s sobre la misma ruta remota...")
+        time.sleep(espera)
+    raise RuntimeError(ultimo_error or f"PUT fallido para {remote_path}")
 
 
-def graph_download(download_url: str, destino: Path) -> None:
-    destino.parent.mkdir(parents=True, exist_ok=True)
-    r = requests.get(download_url, timeout=300, verify=ssl_verify())
+def graph_download_item_content(drive_id: str, item_id: str) -> bytes:
+    url = f"{GRAPH}/drives/{encode_drive_id(drive_id)}/items/{quote(item_id, safe='')}/content"
+    r = requests.get(
+        url, headers=headers(), timeout=300, verify=ssl_verify(), allow_redirects=True
+    )
     if r.status_code != 200:
-        raise RuntimeError(f"DOWNLOAD {r.status_code} -> {r.text[:500]}")
-    destino.write_bytes(r.content)
+        raise RuntimeError(f"DOWNLOAD {r.status_code} {url} -> {r.text[:700]}")
+    return r.content
 
 
-def validar_drive(drive_id: str) -> dict[str, Any]:
-    url = f"{GRAPH}/drives/{quote(drive_id, safe='')}?$select=id,name,webUrl,driveType"
-    r = graph_get(url)
-    if r.status_code != 200:
-        raise RuntimeError(f"No se pudo validar drive {drive_id}: {r.status_code} {r.text[:500]}")
-    data = r.json()
-    print(f"Drive backup validado: {data.get('name')} | {data.get('id')}")
-    print(f"Repositorio destino: {data.get('name')} | {data.get('webUrl')}")
-    return data
+def validar_drive_id(drive_id: str) -> Optional[dict[str, Any]]:
+    if not drive_id:
+        return None
+    url = f"{GRAPH}/drives/{encode_drive_id(drive_id)}?$select=id,name,webUrl,driveType"
+    r = requests.get(url, headers=headers(), timeout=60, verify=ssl_verify())
+    if r.status_code == 200:
+        return r.json()
+    print(f"Drive ID no valido o no accesible: {drive_id}")
+    print(f"Respuesta Graph: {r.status_code} {r.text[:350]}")
+    return None
+
+
+def listar_drives_site(hostname: str, site_path: str) -> list[dict[str, Any]]:
+    if not hostname or not site_path:
+        return []
+    site_path = site_path if site_path.startswith("/") else f"/{site_path}"
+    url = f"{GRAPH}/sites/{hostname}:{site_path}:/drives?$select=id,name,webUrl,driveType"
+    return graph_get(url, timeout=60).json().get("value", [])
+
+
+def resolver_drive_backup() -> tuple[str, dict[str, Any]]:
+    drive_id = env_first(
+        "BACKUP_DRIVE_ID", "ONEDRIVE_BACKUP_DRIVE_ID", "SP_BACKUP2_DRIVE_ID"
+    )
+    drive = validar_drive_id(drive_id)
+    if drive:
+        print(f"Drive backup validado: {drive.get('name')} | {drive.get('id')}")
+        return str(drive["id"]), drive
+
+    hostname = env_first(
+        "BACKUP_HOSTNAME", "ONEDRIVE_BACKUP_HOSTNAME", "SP_BACKUP2_HOSTNAME"
+    )
+    site_path = env_first(
+        "BACKUP_SITE_PATH", "ONEDRIVE_BACKUP_SITE_PATH", "SP_BACKUP2_SITE_PATH"
+    )
+    if hostname and site_path:
+        drives = listar_drives_site(hostname, site_path)
+        if not drives:
+            raise RuntimeError("No se encontraron drives para el repositorio de backups.")
+        preferidos = {"documentos", "documents", "shared documents", "onedrive"}
+        elegido = next(
+            (d for d in drives if str(d.get("name", "")).strip().lower() in preferidos),
+            drives[0],
+        )
+        print(f"Drive backup resuelto: {elegido.get('name')} | {elegido.get('id')}")
+        return str(elegido["id"]), elegido
+    raise RuntimeError(
+        "No hay drive de backups configurado. Define BACKUP_DRIVE_ID, "
+        "ONEDRIVE_BACKUP_DRIVE_ID o SP_BACKUP2_DRIVE_ID en .env."
+    )
+
+
+def existe_path(drive_id: str, remote_path: str) -> bool:
+    remote_path = remote_path.strip("/")
+    if not remote_path:
+        return True
+    url = f"{GRAPH}/drives/{encode_drive_id(drive_id)}/root:/{encode_path(remote_path)}:"
+    ultimo_error = ""
+    for intento in range(1, INTENTOS_SUBIDA + 1):
+        respuesta: Optional[requests.Response] = None
+        try:
+            respuesta = requests.get(
+                url, headers=headers(), timeout=60, verify=ssl_verify()
+            )
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            ultimo_error = (
+                f"GET interrumpido para {remote_path} en intento "
+                f"{intento}/{INTENTOS_SUBIDA}: {type(exc).__name__}: {exc}"
+            )
+            if intento >= INTENTOS_SUBIDA:
+                raise RuntimeError(ultimo_error) from exc
+            espera = espera_reintento_subida(None, intento)
+            print(ultimo_error)
+            print(f"Reintentando consulta de ruta en {espera}s...")
+            time.sleep(espera)
+            continue
+
+        if respuesta.status_code == 200:
+            return True
+        if respuesta.status_code == 404:
+            return False
+
+        ultimo_error = (
+            f"GET {respuesta.status_code} para {remote_path} -> "
+            f"{respuesta.text[:700]}"
+        )
+        if respuesta.status_code not in HTTP_REINTENTABLES_SUBIDA:
+            raise RuntimeError(ultimo_error)
+        if intento >= INTENTOS_SUBIDA:
+            raise RuntimeError(
+                f"{ultimo_error} | reintentos agotados: {INTENTOS_SUBIDA}"
+            )
+        espera = espera_reintento_subida(respuesta, intento)
+        print(
+            f"Consulta de ruta intento {intento}/{INTENTOS_SUBIDA} "
+            f"fallo temporalmente con HTTP {respuesta.status_code}: {remote_path}"
+        )
+        print(f"Reintentando consulta de ruta en {espera}s...")
+        time.sleep(espera)
+    raise RuntimeError(ultimo_error or f"GET fallido para {remote_path}")
+
+
+def crear_folder(drive_id: str, parent_path: str, folder_name: str) -> None:
+    parent_path = parent_path.strip("/")
+    if parent_path:
+        url = f"{GRAPH}/drives/{encode_drive_id(drive_id)}/root:/{encode_path(parent_path)}:/children"
+    else:
+        url = f"{GRAPH}/drives/{encode_drive_id(drive_id)}/root/children"
+    body = {"name": folder_name, "folder": {}, "@microsoft.graph.conflictBehavior": "fail"}
+    r = requests.post(url, headers=h_json(), json=body, timeout=60, verify=ssl_verify())
+    if r.status_code not in (200, 201, 409):
+        raise RuntimeError(f"POST {r.status_code} {url} -> {r.text[:700]}")
 
 
 def ensure_folder_recursive(drive_id: str, folder_path: str) -> None:
@@ -115,20 +317,8 @@ def ensure_folder_recursive(drive_id: str, folder_path: str) -> None:
     for part in parts:
         parent = current
         current = f"{current}/{part}".strip("/")
-        check_url = f"{GRAPH}/drives/{quote(drive_id, safe='')}/root:/{encode_path(current)}"
-        r = graph_get(check_url)
-        if r.status_code == 200:
-            continue
-        if r.status_code != 404:
-            raise RuntimeError(f"No se pudo verificar carpeta {current}: {r.status_code} {r.text[:500]}")
-        if parent:
-            create_url = f"{GRAPH}/drives/{quote(drive_id, safe='')}/root:/{encode_path(parent)}:/children"
-        else:
-            create_url = f"{GRAPH}/drives/{quote(drive_id, safe='')}/root/children"
-        payload = {"name": part, "folder": {}, "@microsoft.graph.conflictBehavior": "replace"}
-        cr = requests.post(create_url, headers={**headers(), "Content-Type": "application/json"}, json=payload, timeout=120, verify=ssl_verify())
-        if cr.status_code not in (200, 201):
-            raise RuntimeError(f"No se pudo crear carpeta {current}: {cr.status_code} {cr.text[:500]}")
+        if not existe_path(drive_id, current):
+            crear_folder(drive_id, parent, part)
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -143,56 +333,146 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def normalizar_valor_excel(value: Any) -> str:
+    if value is None:
+        return "<NULL>"
+    if isinstance(value, (_dt.datetime, _dt.date, _dt.time)):
+        return value.isoformat()
+    if isinstance(value, float):
+        return repr(value)
+    return f"{type(value).__name__}:{value}"
+
+
 def excel_digest(path: Path) -> dict[str, Any]:
-    wb = load_workbook(path, read_only=True, data_only=True)
+    wb = load_workbook(path, read_only=True, data_only=False, keep_links=False)
     try:
         digest = hashlib.sha256()
-        hojas = []
+        hojas: list[dict[str, Any]] = []
         celdas = 0
+        digest.update(json.dumps(list(wb.sheetnames), ensure_ascii=False).encode("utf-8"))
         for ws in wb.worksheets:
-            hojas.append(ws.title)
-            digest.update(f"SHEET:{ws.title}\n".encode("utf-8"))
-            for row in ws.iter_rows(values_only=True):
-                vals = []
-                for v in row:
-                    if v is None:
-                        vals.append("")
-                    else:
-                        vals.append(str(v))
-                        celdas += 1
-                digest.update(("\t".join(vals) + "\n").encode("utf-8", errors="replace"))
-        return {"sha256_datos": digest.hexdigest(), "hojas": hojas, "celdas_no_vacias": celdas}
+            info = {
+                "title": ws.title,
+                "max_row": int(ws.max_row or 0),
+                "max_column": int(ws.max_column or 0),
+                "non_empty_cells": 0,
+            }
+            digest.update(
+                f"\n[SHEET]{ws.title}|{ws.max_row}|{ws.max_column}".encode("utf-8")
+            )
+            for row in ws.iter_rows():
+                for cell in row:
+                    if cell.value is None:
+                        continue
+                    info["non_empty_cells"] += 1
+                    celdas += 1
+                    payload = (
+                        f"{ws.title}|{cell.coordinate}|"
+                        f"{normalizar_valor_excel(cell.value)}\n"
+                    )
+                    digest.update(payload.encode("utf-8", errors="replace"))
+            hojas.append(info)
+        return {
+            "sha256_datos": digest.hexdigest(),
+            "hojas": hojas,
+            "celdas_no_vacias": celdas,
+        }
     finally:
         wb.close()
 
 
-def verificar_archivo_subido(local: Path, item: dict[str, Any], rel_path: str) -> dict[str, Any]:
-    download_url = item.get("@microsoft.graph.downloadUrl")
-    if not download_url:
-        raise RuntimeError(f"Graph no devolvio downloadUrl para {rel_path}")
-    TMP_VERIFY_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = TMP_VERIFY_DIR / rel_path.replace("/", "__")
-    graph_download(download_url, tmp)
+def verificar_archivo_subido(
+    *, local: Path, item: dict[str, Any], rel_path: str, drive_id: str
+) -> tuple[bool, dict[str, Any]]:
+    item_id = item.get("id")
+    if not item_id:
+        raise RuntimeError(f"Graph no devolvio item.id para {rel_path}")
+    remote_bytes = graph_download_item_content(drive_id, str(item_id))
+    base = {
+        "archivo": rel_path,
+        "local": str(local),
+        "remote_item_id": item_id,
+        "remote_web_url": item.get("webUrl"),
+        "bytes_local": local.stat().st_size,
+        "bytes_remoto": len(remote_bytes),
+    }
     if local.suffix.lower() in EXCEL_EXT:
+        TMP_VERIFY_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = TMP_VERIFY_DIR / rel_path.replace("/", "__").replace("\\", "__")
+        tmp.write_bytes(remote_bytes)
         local_digest = excel_digest(local)
         remote_digest = excel_digest(tmp)
         ok = local_digest["sha256_datos"] == remote_digest["sha256_datos"]
-        if not ok:
-            raise RuntimeError(f"Excel no coincide por datos: {rel_path}")
-        print(f"Excel verificado por DATOS: {rel_path} | celdas_no_vacias={remote_digest['celdas_no_vacias']} | hojas={len(remote_digest['hojas'])}")
-        return {"archivo": rel_path, "tipo": "excel_datos", "ok": True, "local": local_digest, "remoto": remote_digest}
+        tmp.unlink(missing_ok=True)
+        base.update({
+            "tipo": "excel_datos_hoja_celda",
+            "ok": ok,
+            "local_digest": local_digest,
+            "remoto_digest": remote_digest,
+        })
+        if ok:
+            print(
+                f"Excel verificado por DATOS: {rel_path} | "
+                f"celdas_no_vacias={remote_digest['celdas_no_vacias']} | "
+                f"hojas={len(remote_digest['hojas'])}"
+            )
+        return ok, base
     local_sha = sha256_file(local)
-    remote_sha = sha256_file(tmp)
-    if local_sha != remote_sha:
-        raise RuntimeError(f"SHA256 no coincide para {rel_path}: local={local_sha}, remoto={remote_sha}")
-    print(f"Archivo verificado por SHA256 exacto: {rel_path} ({local.stat().st_size} bytes)")
-    return {"archivo": rel_path, "tipo": "sha256", "ok": True, "sha256": local_sha, "bytes": local.stat().st_size}
+    remote_sha = sha256_bytes(remote_bytes)
+    ok = local_sha == remote_sha
+    base.update({
+        "tipo": "sha256_binario_exacto",
+        "ok": ok,
+        "sha256_local": local_sha,
+        "sha256_remoto": remote_sha,
+    })
+    if ok:
+        print(f"Archivo verificado por SHA256 exacto: {rel_path} ({local.stat().st_size} bytes)")
+    return ok, base
+
+
+def subir_y_verificar_con_reintentos(
+    *, drive_id: str, remote_path: str, local: Path, rel_path: str
+) -> tuple[bool, dict[str, Any]]:
+    item = graph_put_content(drive_id, remote_path, local)
+    intento_subida = int(item.pop("_joyco_intento_subida", 1) or 1)
+    codigo_http = int(item.pop("_joyco_codigo_http_subida", 0) or 0)
+    ultimo: dict[str, Any] = {}
+    for intento in range(1, 5):
+        try:
+            ok, resultado = verificar_archivo_subido(
+                local=local, item=item, rel_path=rel_path, drive_id=drive_id
+            )
+            resultado.update({
+                "intento_subida": intento_subida,
+                "codigo_http_subida": codigo_http,
+                "intento_verificacion": intento,
+            })
+            ultimo = resultado
+            if ok:
+                return True, resultado
+        except Exception as exc:
+            ultimo = {
+                "archivo": rel_path,
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "intento_subida": intento_subida,
+                "codigo_http_subida": codigo_http,
+                "intento_verificacion": intento,
+            }
+            print(f"Verificacion intento {intento}/4 fallo para {rel_path}: {exc}")
+        if intento < 4:
+            espera = 2 ** intento
+            print(f"Reintentando verificacion en {espera}s...")
+            time.sleep(espera)
+    return False, ultimo
 
 
 def parse_fecha(fecha: str) -> _dt.date:
     if fecha:
         return _dt.date.fromisoformat(fecha)
-    return _dt.date.today()
+    hoy = _dt.datetime.now(ZONA_HORARIA).date()
+    return hoy.replace(day=1) - _dt.timedelta(days=1)
 
 
 def ultimo_dia_mes(fecha: _dt.date) -> _dt.date:
@@ -216,8 +496,16 @@ def rango_desde_args(args: argparse.Namespace) -> tuple[_dt.date, _dt.date]:
         fin = _dt.date.fromisoformat(args.fin)
         if fin < inicio:
             raise RuntimeError("El --fin no puede ser menor que --inicio.")
-        return inicio, fin
-    return rango_mes(parse_fecha(args.fecha))
+    else:
+        inicio, fin = rango_mes(parse_fecha(args.fecha))
+    if inicio.day != 1 or fin != ultimo_dia_mes(inicio):
+        raise RuntimeError("La subida mensual exige un mes calendario completo.")
+    if (inicio.year, inicio.month) != (fin.year, fin.month):
+        raise RuntimeError("El inicio y el fin deben pertenecer al mismo mes.")
+    primer_dia_actual = _dt.datetime.now(ZONA_HORARIA).date().replace(day=1)
+    if fin >= primer_dia_actual:
+        raise RuntimeError("No se permite subir el cierre de un mes abierto o futuro.")
+    return inicio, fin
 
 
 def mes_carpeta(fecha: _dt.date) -> str:
@@ -253,6 +541,10 @@ def debe_subir(path: Path) -> bool:
         return False
     if any(part.startswith("_tmp") for part in path.parts):
         return False
+    if path.name.startswith("validacion_remota_mensual_"):
+        return False
+    if path.name.startswith("estado_retencion_mensual_"):
+        return False
     return True
 
 
@@ -260,24 +552,117 @@ def listar_archivos(base: Path) -> list[Path]:
     return [p for p in sorted(base.rglob("*")) if debe_subir(p)]
 
 
+def cargar_reintento_fallidos(
+    *,
+    validacion_path: Path,
+    cierre_dir: Path,
+    archivos: list[Path],
+    periodo: str,
+    remote_base: str,
+) -> tuple[list[Path], dict[str, dict[str, Any]]]:
+    if not validacion_path.exists():
+        raise RuntimeError(
+            "No existe la validacion remota anterior necesaria para reintentar: "
+            f"{validacion_path}"
+        )
+    try:
+        validacion = json.loads(validacion_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(
+            f"No se pudo leer la validacion remota anterior: {validacion_path} | {exc}"
+        ) from exc
+
+    if str(validacion.get("periodo", "")) != periodo:
+        raise RuntimeError("La validacion remota anterior corresponde a otro periodo.")
+    if str(validacion.get("remote_base", "")).strip("/") != remote_base.strip("/"):
+        raise RuntimeError("La validacion remota anterior corresponde a otro destino.")
+    if int(validacion.get("total_archivos_esperados", -1)) != len(archivos):
+        raise RuntimeError(
+            "La cantidad actual de archivos no coincide con la validacion remota anterior."
+        )
+
+    locales_por_ruta = {
+        p.relative_to(cierre_dir).as_posix(): p
+        for p in archivos
+    }
+    resultados_anteriores = validacion.get("resultados", [])
+    if not isinstance(resultados_anteriores, list):
+        raise RuntimeError("La validacion remota anterior no contiene resultados validos.")
+
+    resultados_por_ruta: dict[str, dict[str, Any]] = {}
+    for resultado in resultados_anteriores:
+        if not isinstance(resultado, dict):
+            raise RuntimeError("La validacion remota anterior contiene un resultado invalido.")
+        rel_path = str(resultado.get("archivo", "")).strip()
+        if not rel_path or rel_path in resultados_por_ruta:
+            raise RuntimeError(
+                "La validacion remota anterior contiene rutas vacias o duplicadas."
+            )
+        resultados_por_ruta[rel_path] = resultado
+
+    if set(resultados_por_ruta) != set(locales_por_ruta):
+        raise RuntimeError(
+            "Las rutas actuales no coinciden con las registradas en la validacion anterior."
+        )
+
+    pendientes = [
+        locales_por_ruta[rel_path]
+        for rel_path, resultado in resultados_por_ruta.items()
+        if resultado.get("ok") is not True
+    ]
+    exitos_previos = {
+        rel_path: resultado
+        for rel_path, resultado in resultados_por_ruta.items()
+        if resultado.get("ok") is True
+    }
+    return pendientes, exitos_previos
+
+
 def validar_cierre_local_minimo(cierre_dir: Path, inicio: _dt.date, fin: _dt.date) -> None:
     periodo = periodo_nombre(inicio, fin)
+    manifest_path = cierre_dir / "04_Manifest_Mensual" / f"manifest_mensual_{periodo}.json"
+    validacion_path = cierre_dir / "05_Validaciones" / f"validacion_local_mensual_{periodo}.json"
+    zip_path = cierre_dir / "07_Paquete_Mensual" / f"cierre_mensual_{periodo}.zip"
+    paquete_path = cierre_dir / "07_Paquete_Mensual" / f"validacion_paquete_mensual_{periodo}.json"
     obligatorios = [
         cierre_dir / "01_Excel_Mensual" / f"facturas_mensual_{periodo}.xlsx",
-        cierre_dir / "04_Manifest_Mensual" / f"manifest_mensual_{periodo}.json",
+        manifest_path,
         cierre_dir / "04_Manifest_Mensual" / f"resumen_mensual_{periodo}.txt",
-        cierre_dir / "05_Validaciones" / f"validacion_local_mensual_{periodo}.json",
+        validacion_path,
+        zip_path,
+        paquete_path,
     ]
     faltantes = [str(p) for p in obligatorios if not p.exists()]
     if faltantes:
         raise RuntimeError("El cierre mensual local no esta completo. Faltan: " + "; ".join(faltantes))
-    validacion_path = cierre_dir / "05_Validaciones" / f"validacion_local_mensual_{periodo}.json"
     try:
         validacion = json.loads(validacion_path.read_text(encoding="utf-8"))
     except Exception as exc:
         raise RuntimeError(f"No se pudo leer validacion local: {validacion_path} | {exc}")
     if not validacion.get("ok"):
         raise RuntimeError(f"La validacion local del cierre mensual no esta OK: {validacion_path}")
+    paquete = json.loads(paquete_path.read_text(encoding="utf-8"))
+    if not paquete.get("ok"):
+        raise RuntimeError(f"La validacion del ZIP mensual no esta OK: {paquete_path}")
+    if int(paquete.get("bytes", -1)) != zip_path.stat().st_size:
+        raise RuntimeError("El tamano del ZIP no coincide con su validacion local.")
+    if paquete.get("sha256") != sha256_file(zip_path):
+        raise RuntimeError("El SHA256 del ZIP no coincide con su validacion local.")
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        corrupto = zf.testzip()
+    if corrupto:
+        raise RuntimeError(f"El ZIP mensual esta corrupto en: {corrupto}")
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for item in manifest.get("archivos", []):
+        rel_path = str(item.get("ruta_relativa", ""))
+        archivo = cierre_dir / rel_path
+        if not rel_path or not archivo.exists() or not archivo.is_file():
+            raise RuntimeError(f"Archivo del manifest no existe: {rel_path}")
+        if archivo.stat().st_size != int(item.get("bytes", -1)):
+            raise RuntimeError(f"Tamano distinto al manifest: {rel_path}")
+        if sha256_file(archivo) != item.get("sha256"):
+            raise RuntimeError(f"SHA256 distinto al manifest: {rel_path}")
 
 
 def remote_base_para_cierre(cierre_dir: Path) -> str:
@@ -291,7 +676,15 @@ def remote_base_para_cierre(cierre_dir: Path) -> str:
     return f"{root_folder}/{rel_cierre}".strip("/")
 
 
-def escribir_validacion_remota(cierre_dir: Path, inicio: _dt.date, fin: _dt.date, drive: dict[str, Any], remote_base: str, resultados: list[dict[str, Any]]) -> Path:
+def escribir_validacion_remota(
+    cierre_dir: Path,
+    inicio: _dt.date,
+    fin: _dt.date,
+    drive: dict[str, Any],
+    remote_base: str,
+    resultados: list[dict[str, Any]],
+    total_esperados: int,
+) -> Path:
     validaciones_dir = cierre_dir / "05_Validaciones"
     validaciones_dir.mkdir(parents=True, exist_ok=True)
     periodo = periodo_nombre(inicio, fin)
@@ -302,31 +695,74 @@ def escribir_validacion_remota(cierre_dir: Path, inicio: _dt.date, fin: _dt.date
         "periodo": periodo,
         "fecha_inicio": inicio.isoformat(),
         "fecha_fin": fin.isoformat(),
-        "generado_en": _dt.datetime.now().isoformat(timespec="seconds"),
+        "generado_en": _dt.datetime.now(ZONA_HORARIA).isoformat(timespec="seconds"),
         "cierre_local": str(cierre_dir),
         "drive": {"id": drive.get("id"), "name": drive.get("name"), "webUrl": drive.get("webUrl"), "driveType": drive.get("driveType")},
         "remote_base": remote_base,
-        "total_archivos_verificados": len(resultados),
-        "ok": all(x.get("ok") for x in resultados),
+        "total_archivos_esperados": total_esperados,
+        "total_resultados": len(resultados),
+        "total_archivos_verificados": sum(1 for x in resultados if x.get("ok")),
+        "total_archivos_fallidos": sum(1 for x in resultados if not x.get("ok")),
+        "ok": (
+            len(resultados) == total_esperados
+            and total_esperados > 0
+            and all(x.get("ok") for x in resultados)
+        ),
         "resultados": resultados,
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
 
 
+def crear_estado_retencion_temporal(
+    inicio: _dt.date, fin: _dt.date, remote_base: str
+) -> tuple[Path, dict[str, Any]]:
+    ahora = _dt.datetime.now(ZONA_HORARIA)
+    periodo = periodo_nombre(inicio, fin)
+    payload = {
+        "tipo": "estado_retencion_local_cierre_mensual",
+        "version": VERSION_UPLOAD,
+        "periodo": periodo,
+        "validacion_remota_publicada_y_verificada": True,
+        "validado_en": ahora.isoformat(timespec="seconds"),
+        "retencion_local_dias": RETENCION_LOCAL_DIAS,
+        "eliminacion_local_permitida_desde": (
+            ahora + _dt.timedelta(days=RETENCION_LOCAL_DIAS)
+        ).isoformat(timespec="seconds"),
+        "remote_base": remote_base,
+        "ok": True,
+    }
+    TMP_VERIFY_DIR.mkdir(parents=True, exist_ok=True)
+    path = TMP_VERIFY_DIR / f"estado_retencion_mensual_{periodo}.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path, payload
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Sube cierre mensual V1 al repositorio remoto unico de backups.")
-    parser.add_argument("--fecha", default="", help="Fecha dentro del mes, formato YYYY-MM-DD. Default: hoy.")
-    parser.add_argument("--inicio", default="", help="Inicio de rango, formato YYYY-MM-DD. Opcional.")
-    parser.add_argument("--fin", default="", help="Fin de rango, formato YYYY-MM-DD. Opcional.")
+    parser = argparse.ArgumentParser(description="Sube cierre mensual V2 al repositorio remoto unico de backups.")
+    parser.add_argument("--fecha", default="", help="Fecha dentro del mes cerrado. Default: mes anterior.")
+    parser.add_argument("--inicio", default="", help="Primer dia del mes, formato YYYY-MM-DD.")
+    parser.add_argument("--fin", default="", help="Ultimo dia del mismo mes, formato YYYY-MM-DD.")
     parser.add_argument("--dry-run", action="store_true", help="Muestra archivos/ruta sin subir.")
+    parser.add_argument(
+        "--reintentar-fallidos",
+        action="store_true",
+        help=(
+            "Lee la validacion remota anterior, conserva los resultados correctos "
+            "y procesa unicamente los archivos fallidos."
+        ),
+    )
     args = parser.parse_args()
 
-    inicio, fin = rango_desde_args(args)
+    try:
+        inicio, fin = rango_desde_args(args)
+    except Exception as exc:
+        print(f"Periodo mensual no valido: {exc}")
+        return 2
     periodo = periodo_nombre(inicio, fin)
 
     print("=" * 100)
-    print("SUBIDA CIERRE MENSUAL V1 A REPOSITORIO DE BACKUPS - FACTURAS JOYCO")
+    print("SUBIDA CIERRE MENSUAL V2 A REPOSITORIO DE BACKUPS - FACTURAS JOYCO")
     print("=" * 100)
     print(f"Version: {VERSION_UPLOAD}")
     print(f"Root: {ROOT}")
@@ -348,12 +784,40 @@ def main() -> int:
         print(f"No se pudo calcular ruta remota: {exc}")
         return 1
 
-    archivos = listar_archivos(cierre_dir)
+    todos_los_archivos = listar_archivos(cierre_dir)
+    if not todos_los_archivos:
+        print("No hay archivos validos para subir.")
+        return 1
     print(f"Cierre local: {cierre_dir}")
     print(f"Ruta remota base: {remote_base}")
-    print(f"Archivos detectados: {len(archivos)}")
-    for p in archivos:
+    print(f"Archivos detectados: {len(todos_los_archivos)}")
+    for p in todos_los_archivos:
         print(f"   - {p.relative_to(cierre_dir).as_posix()} ({p.stat().st_size} bytes)")
+
+    validacion_anterior = (
+        cierre_dir
+        / "05_Validaciones"
+        / f"validacion_remota_mensual_{periodo}.json"
+    )
+    archivos = todos_los_archivos
+    resultados_por_ruta: dict[str, dict[str, Any]] = {}
+    if args.reintentar_fallidos:
+        try:
+            archivos, resultados_por_ruta = cargar_reintento_fallidos(
+                validacion_path=validacion_anterior,
+                cierre_dir=cierre_dir,
+                archivos=todos_los_archivos,
+                periodo=periodo,
+                remote_base=remote_base,
+            )
+        except Exception as exc:
+            print(f"No se puede reintentar de forma segura: {exc}")
+            return 1
+        print("Modo: reintentar unicamente archivos fallidos.")
+        print(f"Resultados correctos conservados: {len(resultados_por_ruta)}")
+        print(f"Archivos pendientes de reintento: {len(archivos)}")
+        for p in archivos:
+            print(f"   * {p.relative_to(cierre_dir).as_posix()}")
 
     if args.dry_run:
         print("-" * 100)
@@ -362,21 +826,20 @@ def main() -> int:
         print("=" * 100)
         return 0
 
-    drive_id = env_first("BACKUP_DRIVE_ID", "ONEDRIVE_BACKUP_DRIVE_ID", "SP_BACKUP2_DRIVE_ID")
-    if not drive_id:
-        print("Falta BACKUP_DRIVE_ID/ONEDRIVE_BACKUP_DRIVE_ID/SP_BACKUP2_DRIVE_ID en .env")
-        return 1
-
     try:
-        drive = validar_drive(drive_id)
+        drive_id, drive = resolver_drive_backup()
+        print(f"Repositorio destino: {drive.get('name')} | {drive.get('webUrl')}")
         ensure_folder_recursive(drive_id, remote_base)
         print("Carpeta remota base verificada/creada.")
     except Exception as exc:
         print(f"Error preparando repositorio remoto de backups: {exc}")
         return 1
 
-    resultados: list[dict[str, Any]] = []
     ok_todos = True
+    estado_local = (
+        cierre_dir / "05_Validaciones" / f"estado_retencion_mensual_{periodo}.json"
+    )
+    estado_local.unlink(missing_ok=True)
     try:
         if TMP_VERIFY_DIR.exists():
             shutil.rmtree(TMP_VERIFY_DIR, ignore_errors=True)
@@ -388,49 +851,113 @@ def main() -> int:
         rel_path = local.relative_to(cierre_dir).as_posix()
         remote_path = f"{remote_base}/{rel_path}".strip("/")
         try:
+            remote_dir = "/".join(remote_path.split("/")[:-1])
+            ensure_folder_recursive(drive_id, remote_dir)
             print("Subiendo:")
             print(f"   Local:  {local}")
             print(f"   Remoto: {remote_path}")
-            item = graph_put_content(drive_id, remote_path, local)
-            ultimo_error = None
-            for intento in range(1, 5):
-                try:
-                    resultado = verificar_archivo_subido(local, item, rel_path)
-                    resultados.append(resultado)
-                    ultimo_error = None
-                    break
-                except Exception as exc:
-                    ultimo_error = exc
-                    print(f"Verificacion intento {intento}/4 fallo para {rel_path}: {exc}")
-                    if intento < 4:
-                        time.sleep(2 * intento)
-            if ultimo_error is not None:
-                raise ultimo_error
+            ok, resultado = subir_y_verificar_con_reintentos(
+                drive_id=drive_id,
+                remote_path=remote_path,
+                local=local,
+                rel_path=rel_path,
+            )
+            resultado["remote_path"] = remote_path
+            resultados_por_ruta[rel_path] = resultado
+            if not ok:
+                ok_todos = False
         except Exception as exc:
             ok_todos = False
             print(f"ERROR subiendo/verificando {rel_path}: {type(exc).__name__}: {exc}")
+            resultados_por_ruta[rel_path] = {
+                "archivo": rel_path,
+                "remote_path": remote_path,
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
 
-    validacion_remota = escribir_validacion_remota(cierre_dir, inicio, fin, drive, remote_base, resultados)
+    rutas_esperadas = [
+        p.relative_to(cierre_dir).as_posix()
+        for p in todos_los_archivos
+    ]
+    resultados = [
+        resultados_por_ruta[rel_path]
+        for rel_path in rutas_esperadas
+        if rel_path in resultados_por_ruta
+    ]
+    if len(resultados) != len(todos_los_archivos):
+        ok_todos = False
+        print(
+            "ERROR: no se obtuvo un resultado para cada archivo del cierre "
+            f"({len(resultados)}/{len(todos_los_archivos)})."
+        )
+
+    validacion_remota = escribir_validacion_remota(
+        cierre_dir,
+        inicio,
+        fin,
+        drive,
+        remote_base,
+        resultados,
+        len(todos_los_archivos),
+    )
+    payload_validacion = json.loads(validacion_remota.read_text(encoding="utf-8"))
+    ok_todos = ok_todos and bool(payload_validacion.get("ok"))
     rel_val = validacion_remota.relative_to(cierre_dir).as_posix()
     remote_val = f"{remote_base}/{rel_val}".strip("/")
+    validacion_publicada = False
     try:
         print("Subiendo validacion remota final:")
         print(f"   Local:  {validacion_remota}")
         print(f"   Remoto: {remote_val}")
-        item = graph_put_content(drive_id, remote_val, validacion_remota)
-        verificar_archivo_subido(validacion_remota, item, rel_val)
+        validacion_publicada, _resultado_validacion = subir_y_verificar_con_reintentos(
+            drive_id=drive_id,
+            remote_path=remote_val,
+            local=validacion_remota,
+            rel_path=rel_val,
+        )
+        if not validacion_publicada:
+            ok_todos = False
     except Exception as exc:
         ok_todos = False
         print(f"ERROR subiendo/verificando validacion remota final: {type(exc).__name__}: {exc}")
 
+    if ok_todos and validacion_publicada:
+        try:
+            estado_tmp, estado_payload = crear_estado_retencion_temporal(
+                inicio, fin, remote_base
+            )
+            rel_estado = f"05_Validaciones/{estado_tmp.name}"
+            remote_estado = f"{remote_base}/{rel_estado}".strip("/")
+            ok_estado, _resultado_estado = subir_y_verificar_con_reintentos(
+                drive_id=drive_id,
+                remote_path=remote_estado,
+                local=estado_tmp,
+                rel_path=rel_estado,
+            )
+            if not ok_estado:
+                raise RuntimeError("No se pudo verificar el estado remoto de retencion.")
+            estado_local.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(estado_tmp, estado_local)
+            print(
+                "Retencion local habilitada hasta: "
+                f"{estado_payload['eliminacion_local_permitida_desde']}"
+            )
+        except Exception as exc:
+            ok_todos = False
+            estado_local.unlink(missing_ok=True)
+            print(f"ERROR registrando retencion mensual: {type(exc).__name__}: {exc}")
+
+    shutil.rmtree(TMP_VERIFY_DIR, ignore_errors=True)
     print("-" * 100)
     print(f"Validacion remota local: {validacion_remota}")
     if ok_todos:
-        print("Subida de cierre mensual V1 terminada correctamente en el repositorio unico de backups.")
+        print("Subida de cierre mensual V2 terminada correctamente en el repositorio unico de backups.")
         print("Verificacion aplicada archivo por archivo despues de descargar desde Graph.")
+        print(f"Retencion local: {RETENCION_LOCAL_DIAS} dias desde la validacion remota.")
         print("=" * 100)
         return 0
-    print("Subida de cierre mensual V1 termino con errores.")
+    print("Subida de cierre mensual V2 termino con errores.")
     print("No borres ni archives localmente hasta revisar el error.")
     print("=" * 100)
     return 1

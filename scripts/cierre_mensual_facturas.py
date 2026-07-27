@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 JOYCO - Facturas Procesador
-Cierre mensual local seguro V1
+Cierre mensual local seguro V2
 
 Politica:
 - El cierre mensual NO se construye desde cierres semanales ni diarios.
@@ -9,6 +9,9 @@ Politica:
 - Los cierres semanales, si existen, se copian solo como soporte/evidencia, no como fuente de calculo.
 - No sube a OneDrive/SharePoint. La subida se hace con scripts/subir_cierre_mensual_sharepoint.py.
 - No incluye .env real ni secretos.
+- Solo permite meses calendario ya terminados.
+- Genera en staging y publica atomicamente, sin destruir un cierre valido ante fallos.
+- Produce un ZIP mensual completo con SHA256 y prueba de integridad.
 
 Estructura generada:
 data/cierres_diarios/YYYY/YYYY-MM_Mes/Mensual/
@@ -19,6 +22,8 @@ data/cierres_diarios/YYYY/YYYY-MM_Mes/Mensual/
     04_Manifest_Mensual/resumen_mensual_YYYY-MM.txt
     05_Validaciones/validacion_local_mensual_YYYY-MM.json
     06_Logs_Mes/...
+    07_Paquete_Mensual/cierre_mensual_YYYY-MM.zip
+    07_Paquete_Mensual/validacion_paquete_mensual_YYYY-MM.json
 """
 
 from __future__ import annotations
@@ -34,12 +39,17 @@ import re
 import shutil
 import socket
 import sys
+import time
+import unicodedata
+import zipfile
 from pathlib import Path
 from typing import Any, Optional, Sequence
+from zoneinfo import ZoneInfo
 
 try:
     from openpyxl import Workbook, load_workbook
     from openpyxl.worksheet.table import Table, TableStyleInfo
+    from openpyxl.utils import get_column_letter
 except Exception as exc:  # pragma: no cover
     raise RuntimeError("Este script requiere openpyxl instalado.") from exc
 
@@ -50,12 +60,19 @@ try:
 except Exception:
     pass
 
-VERSION_CIERRE = "2026-07-09-CIERRE-MENSUAL-V1-FUENTE-EXCEL-AUDITORIAS"
+VERSION_CIERRE = "2026-07-21-CIERRE-MENSUAL-V2-SEGURO-ATOMICO-ZIP"
 
 DATA_DIR = ROOT / "data"
 AUDIT_DIR = DATA_DIR / "audit"
 LOGS_DIR = ROOT / "logs"
 DATA_LOGS_DIR = DATA_DIR / "logs"
+
+# En local, los logs pueden permanecer dentro del repositorio. En el VPS se
+# guardan fuera del codigo para separar aplicacion y operacion.
+VPS_LOG_ROOT = Path(
+    os.getenv("FACTURAS_LOG_ROOT", "/var/log/joyco/facturas-procesador")
+)
+
 CIERRES_DIR = DATA_DIR / "cierres_diarios"
 LOCKS_DIR = DATA_DIR / "locks"
 
@@ -72,21 +89,57 @@ MESES_ES = {
 }
 
 PALABRAS_SENSIBLES = (
-    "SECRET", "PASSWORD", "PASS", "TOKEN", "KEY", "CLIENT_SECRET", "TENANT_ID", "CLIENT_ID",
-    "CONTRASENA", "CONTRASEÑA", "PWD", "AUTH", "PRIVATE",
+    "SECRET", "PASSWORD", "PASS", "TOKEN", "KEY", "CLIENT_SECRET",
+    "CONTRASENA", "CONTRASEÑA", "PWD", "AUTH", "PRIVATE", "CERT",
 )
+NOMBRES_EXCLUIDOS = {
+    ".env", ".env.local", ".env.production", "token_cache.json", "msal_cache.bin",
+}
+
+COLUMNAS_FECHA_PROCESO_CANDIDATAS = [
+    "fecha_procesamiento", "fecha procesamiento", "fecha proceso",
+    "procesado_en", "procesado en", "fecha_registro", "fecha registro",
+    "fecha de registro", "fecha_carga", "fecha carga", "creado_en", "created_at",
+]
+COLS_NUMERO = [
+    "número de factura", "numero de factura", "numerofactura",
+    "numero factura", "factura", "numero",
+]
+COLS_RADICADO = ["radicado"]
+COLS_CUFE = ["cufe", "cude", "cufe/cude", "uuid"]
+COLS_ARCHIVO = ["archivo", "archivo origen", "nombre archivo", "pdf", "xml"]
+COLS_ARCHIVO_AUDIT_FALLBACK = [
+    "pdf_name", "pdf name", "archivo_pdf", "archivo pdf", "nombre_pdf",
+    "nombre pdf", "attachment_name", "attachment name",
+]
+COLS_ASUNTO_AUDIT = [
+    "subject", "subj", "asunto", "email_subject", "email subject",
+    "mail_subject", "mail subject",
+]
+PATRON_RADICADO_ASUNTO = re.compile(
+    r"(?i)\bradicado(?:\s*(?:n[.°ºo]*|no\.?))?\s*[-:#]?\s*(\d{4,})\b"
+)
+
 EXT_LOGS = {".log", ".txt", ".csv", ".json"}
 EXCEL_SHEET_NAME = "Facturas"
 EXCEL_TABLE_NAME = "TblFacturasMensual"
+ZONA_HORARIA = ZoneInfo("America/Bogota")
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Genera cierre mensual local seguro V1.")
-    parser.add_argument("--fecha", default=_dt.date.today().isoformat(), help="Fecha dentro del mes, formato YYYY-MM-DD.")
-    parser.add_argument("--inicio", default="", help="Inicio de rango manual, formato YYYY-MM-DD.")
-    parser.add_argument("--fin", default="", help="Fin de rango manual, formato YYYY-MM-DD.")
+    parser = argparse.ArgumentParser(description="Genera cierre mensual local seguro V2.")
+    parser.add_argument(
+        "--fecha", default="",
+        help="Fecha dentro del mes cerrado, formato YYYY-MM-DD. Default: mes anterior.",
+    )
+    parser.add_argument("--inicio", default="", help="Primer dia del mes, formato YYYY-MM-DD.")
+    parser.add_argument("--fin", default="", help="Ultimo dia del mismo mes, formato YYYY-MM-DD.")
     parser.add_argument("--dry-run", action="store_true", help="Calcula y muestra resumen sin generar archivos.")
     parser.add_argument("--permitir-vacio", action="store_true", help="Permite generar cierre aunque no haya filas mensuales.")
+    parser.add_argument(
+        "--reemplazar", action="store_true",
+        help="Reemplaza atomicamente un cierre existente; restaura el anterior si algo falla.",
+    )
     return parser.parse_args()
 
 
@@ -110,6 +163,29 @@ def rango_mes(fecha: _dt.date) -> tuple[_dt.date, _dt.date]:
     return inicio, ultimo_dia_mes(fecha)
 
 
+def hoy_bogota() -> _dt.date:
+    return _dt.datetime.now(ZONA_HORARIA).date()
+
+
+def fecha_mes_anterior() -> _dt.date:
+    return hoy_bogota().replace(day=1) - _dt.timedelta(days=1)
+
+
+def validar_mes_cerrado(inicio: _dt.date, fin: _dt.date) -> None:
+    if inicio.day != 1 or fin != ultimo_dia_mes(inicio):
+        raise RuntimeError(
+            "El cierre mensual exige un mes calendario completo: primer dia a ultimo dia."
+        )
+    if (inicio.year, inicio.month) != (fin.year, fin.month):
+        raise RuntimeError("El inicio y el fin deben pertenecer al mismo mes.")
+    primer_dia_mes_actual = hoy_bogota().replace(day=1)
+    if fin >= primer_dia_mes_actual:
+        raise RuntimeError(
+            f"No se permite cerrar un mes abierto o futuro. Mes actual en Bogota: "
+            f"{primer_dia_mes_actual:%Y-%m}."
+        )
+
+
 def rango_desde_args(args: argparse.Namespace) -> tuple[_dt.date, _dt.date]:
     if args.inicio or args.fin:
         if not args.inicio or not args.fin:
@@ -118,8 +194,11 @@ def rango_desde_args(args: argparse.Namespace) -> tuple[_dt.date, _dt.date]:
         fin = validar_fecha(args.fin)
         if fin < inicio:
             raise RuntimeError("El --fin no puede ser menor que --inicio.")
-        return inicio, fin
-    return rango_mes(validar_fecha(args.fecha))
+    else:
+        fecha = validar_fecha(args.fecha) if args.fecha else fecha_mes_anterior()
+        inicio, fin = rango_mes(fecha)
+    validar_mes_cerrado(inicio, fin)
+    return inicio, fin
 
 
 def fechas_en_rango(inicio: _dt.date, fin: _dt.date) -> list[_dt.date]:
@@ -172,29 +251,76 @@ def rel(path: Path) -> str:
         return str(path).replace("\\", "/")
 
 
-def normalizar_texto(value: Any) -> str:
+def norm(value: Any) -> str:
+    s = "" if value is None else str(value)
+    s = s.strip().replace("\xa0", " ")
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return re.sub(r"\s+", " ", s).lower()
+
+
+def norm_key(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", norm(value))
+
+
+def clean_value(value: Any) -> str:
     if value is None:
         return ""
+    if isinstance(value, (_dt.datetime, _dt.date)):
+        return value.isoformat()
+    return str(value).strip()
+
+
+def find_col(headers: Sequence[Any], candidates: Sequence[str]) -> Optional[int]:
+    candidate_norms = {norm(c) for c in candidates}
+    candidate_keys = {norm_key(c) for c in candidates}
+    for idx, header in enumerate(headers):
+        if norm(header) in candidate_norms or norm_key(header) in candidate_keys:
+            return idx
+    return None
+
+
+def fecha_valor_en_rango(value: Any, inicio: _dt.date, fin: _dt.date) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, _dt.datetime):
+        return inicio <= value.date() <= fin
+    if isinstance(value, _dt.date):
+        return inicio <= value <= fin
     s = str(value).strip()
-    s = re.sub(r"\s+", " ", s)
-    return s.upper()
-
-
-def token_valido(s: str) -> bool:
-    s = normalizar_texto(s)
     if not s:
         return False
-    if len(s) < 4:
-        return False
-    if s in {"TRUE", "FALSE", "OK", "SI", "NO", "N/A", "NA", "NONE", "NULL"}:
-        return False
-    if re.fullmatch(r"\d{1,3}", s):
-        return False
-    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
-        return False
-    if not any(ch.isdigit() for ch in s) and len(s) < 12:
-        return False
-    return True
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+        try:
+            return inicio <= _dt.datetime.strptime(s[:10], fmt).date() <= fin
+        except Exception:
+            pass
+    return any(d.isoformat() in s for d in fechas_en_rango(inicio, fin))
+
+
+def extraer_primer_valor_no_vacio(
+    row: dict[str, Any], candidates: Sequence[str]
+) -> str:
+    by_norm = {norm(k): v for k, v in row.items()}
+    by_key = {norm_key(k): v for k, v in row.items()}
+    for candidate in candidates:
+        values: list[Any] = []
+        if norm(candidate) in by_norm:
+            values.append(by_norm[norm(candidate)])
+        if norm_key(candidate) in by_key:
+            values.append(by_key[norm_key(candidate)])
+        for value in values:
+            cleaned = clean_value(value)
+            if cleaned:
+                return cleaned
+    return ""
+
+
+def extraer_radicado_desde_asunto(asunto: str) -> str:
+    if not asunto:
+        return ""
+    match = PATRON_RADICADO_ASUNTO.search(str(asunto))
+    return match.group(1) if match else ""
 
 
 def crear_lock() -> tuple[bool, str]:
@@ -307,11 +433,33 @@ def log_corresponde_rango(path: Path, inicio: _dt.date, fin: _dt.date) -> bool:
         return False
 
 
+def bases_logs_disponibles() -> list[tuple[str, Path]]:
+    candidatos = [
+        ("app_logs", LOGS_DIR),
+        ("data_logs", DATA_LOGS_DIR),
+        ("runtime", VPS_LOG_ROOT / "runtime"),
+        ("runs", VPS_LOG_ROOT / "runs"),
+        ("cron", VPS_LOG_ROOT / "cron"),
+    ]
+    vistos: set[str] = set()
+    bases: list[tuple[str, Path]] = []
+    for etiqueta, base in candidatos:
+        if not base.exists() or not base.is_dir():
+            continue
+        try:
+            key = str(base.resolve()).casefold()
+        except Exception:
+            key = str(base).casefold()
+        if key in vistos:
+            continue
+        vistos.add(key)
+        bases.append((etiqueta, base))
+    return bases
+
+
 def recolectar_logs(inicio: _dt.date, fin: _dt.date) -> list[Path]:
     rutas: list[Path] = []
-    for base in (LOGS_DIR, DATA_LOGS_DIR):
-        if not base.exists():
-            continue
+    for _etiqueta, base in bases_logs_disponibles():
         for p in base.rglob("*"):
             if not p.is_file():
                 continue
@@ -329,41 +477,87 @@ def recolectar_logs(inicio: _dt.date, fin: _dt.date) -> list[Path]:
         if key not in vistos:
             vistos.add(key)
             out.append(p)
-    return sorted(out)
+    return sorted(out, key=lambda p: str(p).casefold())
 
 
-def extraer_candidatos_auditoria(audit_files: list[Path]) -> set[str]:
-    candidatos: set[str] = set()
-    columnas_clave = (
-        "cufe", "cude", "uuid", "numero", "factura", "prefijo", "radicado",
-        "archivo", "file", "nombre", "invoice", "documento",
-    )
-    for path in audit_files:
-        rows = read_csv_rows(path)
-        for row in rows:
-            for k, v in row.items():
-                nk = normalizar_texto(k)
-                if not any(c.upper() in nk for c in columnas_clave):
-                    continue
-                nv = normalizar_texto(v)
-                if token_valido(nv):
-                    candidatos.add(nv)
+def extraer_candidatos_desde_audits(
+    audit_files: list[Path],
+) -> dict[str, set[str]]:
+    """Extrae identificadores fuertes, incluidos los registros MINIMA."""
+    candidatos: dict[str, set[str]] = {
+        "cufe": set(),
+        "numero": set(),
+        "radicado": set(),
+        "archivo": set(),
+        "numero_radicado": set(),
+        "numero_archivo": set(),
+        "radicado_archivo": set(),
+    }
+    for audit in audit_files:
+        for row in read_csv_rows(audit):
+            cufe = extraer_primer_valor_no_vacio(row, COLS_CUFE)
+            numero = extraer_primer_valor_no_vacio(row, COLS_NUMERO)
+            radicado = extraer_primer_valor_no_vacio(row, COLS_RADICADO)
+            archivo = extraer_primer_valor_no_vacio(row, COLS_ARCHIVO)
+            if not archivo:
+                archivo = extraer_primer_valor_no_vacio(
+                    row, COLS_ARCHIVO_AUDIT_FALLBACK
+                )
+            if not radicado:
+                asunto = extraer_primer_valor_no_vacio(row, COLS_ASUNTO_AUDIT)
+                radicado = extraer_radicado_desde_asunto(asunto)
+
+            cufe_key = norm_key(cufe)
+            numero_key = norm_key(numero)
+            radicado_key = norm_key(radicado)
+            archivo_key = norm_key(archivo)
+            if cufe_key:
+                candidatos["cufe"].add(cufe_key)
+            if numero_key:
+                candidatos["numero"].add(numero_key)
+            if radicado_key:
+                candidatos["radicado"].add(radicado_key)
+            if archivo_key:
+                candidatos["archivo"].add(archivo_key)
+            if numero_key and radicado_key:
+                candidatos["numero_radicado"].add(f"{numero_key}|{radicado_key}")
+            if numero_key and archivo_key:
+                candidatos["numero_archivo"].add(f"{numero_key}|{archivo_key}")
+            if radicado_key and archivo_key:
+                candidatos["radicado_archivo"].add(f"{radicado_key}|{archivo_key}")
     return candidatos
 
 
-def fila_match_candidatos(row: Sequence[Any], candidatos: set[str]) -> bool:
-    if not candidatos:
-        return False
-    valores = {normalizar_texto(v) for v in row if token_valido(normalizar_texto(v))}
-    if valores.intersection(candidatos):
+def fila_match_candidatos(
+    row_values: Sequence[Any],
+    headers: Sequence[Any],
+    candidatos: dict[str, set[str]],
+) -> bool:
+    idx_cufe = find_col(headers, COLS_CUFE)
+    idx_numero = find_col(headers, COLS_NUMERO)
+    idx_radicado = find_col(headers, COLS_RADICADO)
+    idx_archivo = find_col(headers, COLS_ARCHIVO)
+
+    def valor(idx: Optional[int]) -> str:
+        return norm_key(row_values[idx]) if idx is not None and idx < len(row_values) else ""
+
+    cufe = valor(idx_cufe)
+    numero = valor(idx_numero)
+    radicado = valor(idx_radicado)
+    archivo = valor(idx_archivo)
+
+    if cufe and cufe in candidatos["cufe"]:
         return True
-    # Match parcial conservador para nombres de archivo/radicados embebidos.
-    for v in valores:
-        if len(v) < 6:
-            continue
-        for c in candidatos:
-            if len(c) >= 8 and (c in v or v in c):
-                return True
+    if numero and radicado and f"{numero}|{radicado}" in candidatos["numero_radicado"]:
+        return True
+    if numero and archivo and f"{numero}|{archivo}" in candidatos["numero_archivo"]:
+        return True
+    if radicado and archivo and f"{radicado}|{archivo}" in candidatos["radicado_archivo"]:
+        return True
+    if numero and radicado and numero in candidatos["numero"] and radicado in candidatos["radicado"]:
+        return True
+    if numero and archivo and numero in candidatos["numero"] and archivo in candidatos["archivo"]:
+        return True
     return False
 
 
@@ -372,18 +566,8 @@ def obtener_filas_mensuales_desde_excel(
     fin: _dt.date,
     audit_files: list[Path],
 ) -> tuple[list[Any], list[list[Any]], dict[str, Any]]:
-    meta: dict[str, Any] = {
-        "metodo_seleccion": None,
-        "archivo_excel": rel(FACTURAS_PATH),
-        "auditorias_usadas": [rel(p) for p in audit_files],
-        "candidatos": 0,
-        "advertencias": [],
-    }
     if not FACTURAS_PATH.exists():
         raise RuntimeError(f"No existe Excel operativo: {FACTURAS_PATH}")
-
-    candidatos = extraer_candidatos_auditoria(audit_files)
-    meta["candidatos"] = len(candidatos)
 
     print(f"Leyendo Excel operativo: {FACTURAS_PATH}")
     wb = load_workbook(FACTURAS_PATH, read_only=True, data_only=True)
@@ -391,24 +575,63 @@ def obtener_filas_mensuales_desde_excel(
         ws = wb[EXCEL_SHEET_NAME] if EXCEL_SHEET_NAME in wb.sheetnames else wb[wb.sheetnames[0]]
         print(f"Hoja usada: {ws.title} | max_row={ws.max_row} | max_column={ws.max_column}")
         rows_iter = ws.iter_rows(values_only=True)
-        headers = list(next(rows_iter, []))
-        rows_match: list[list[Any]] = []
+        headers = list(next(rows_iter, []) or [])
+        if not headers:
+            raise RuntimeError("El Excel operativo no tiene encabezados.")
+        rows_all: list[list[Any]] = []
         total = 0
         for row_tuple in rows_iter:
             total += 1
-            row = list(row_tuple)
-            if not any(v is not None and str(v).strip() for v in row):
-                continue
-            if fila_match_candidatos(row, candidatos):
-                rows_match.append(row)
+            row = list(row_tuple or [])
+            if len(row) < len(headers):
+                row.extend([None] * (len(headers) - len(row)))
+            row = row[:len(headers)]
+            if any(v not in (None, "") for v in row):
+                rows_all.append(row)
             if total % 1000 == 0:
-                print(f"   ... cruce auditoria mensual: {total} | matches={len(rows_match)}")
-        print(f"Lectura Excel terminada: filas leidas={total} | matches={len(rows_match)}")
-        if not candidatos:
+                print(f"   ... filas leidas: {total} | con datos={len(rows_all)}")
+        print(f"Lectura Excel terminada: filas leidas={total} | con datos={len(rows_all)}")
+
+        meta: dict[str, Any] = {
+            "excel_operativo": rel(FACTURAS_PATH),
+            "hoja_usada": ws.title,
+            "filas_operativas_total": len(rows_all),
+            "metodo_seleccion": "",
+            "advertencias": [],
+        }
+
+        idx_fecha = find_col(headers, COLUMNAS_FECHA_PROCESO_CANDIDATAS)
+        if idx_fecha is not None:
+            filas_fecha = [
+                row for row in rows_all
+                if idx_fecha < len(row) and fecha_valor_en_rango(row[idx_fecha], inicio, fin)
+            ]
+            meta["metodo_seleccion"] = "columna_fecha_procesamiento_rango_mensual"
+            meta["columna_fecha_procesamiento"] = headers[idx_fecha]
+            return headers, filas_fecha, meta
+
+        candidatos = extraer_candidatos_desde_audits(audit_files)
+        total_candidates = sum(len(values) for values in candidatos.values())
+        meta["audit_files_usados"] = [rel(p) for p in audit_files]
+        meta["candidatos_extraidos"] = {
+            key: len(values) for key, values in candidatos.items()
+        }
+        if total_candidates <= 0:
             meta["metodo_seleccion"] = "sin_candidatos_auditoria_mes"
-            meta["advertencias"].append("No se encontraron candidatos suficientes en auditorias del mes.")
-        else:
-            meta["metodo_seleccion"] = "auditorias_mes_vs_excel_operativo"
+            meta["advertencias"].append(
+                "No se encontro columna de fecha de procesamiento ni candidatos "
+                "suficientes en auditorias del mes."
+            )
+            return headers, [], meta
+
+        print(f"Cruzando Excel contra auditorias del mes. Candidatos={total_candidates}")
+        rows_match: list[list[Any]] = []
+        for idx, row in enumerate(rows_all, start=1):
+            if fila_match_candidatos(row, headers, candidatos):
+                rows_match.append(row)
+            if idx % 1000 == 0:
+                print(f"   ... cruce mensual: {idx}/{len(rows_all)} | matches={len(rows_match)}")
+        meta["metodo_seleccion"] = "auditorias_mes_vs_excel_operativo"
         return headers, rows_match, meta
     finally:
         wb.close()
@@ -440,6 +663,7 @@ def crear_excel_mensual(destino: Path, headers: list[Any], rows: list[list[Any]]
         style = TableStyleInfo(name="TableStyleMedium2", showFirstColumn=False, showLastColumn=False, showRowStripes=True, showColumnStripes=False)
         table.tableStyleInfo = style
         ws.add_table(table)
+    ws.freeze_panes = "A2"
     ajustar_ancho_columnas(ws)
     wb.save(destino)
     wb.close()
@@ -453,9 +677,19 @@ def crear_excel_mensual(destino: Path, headers: list[Any], rows: list[list[Any]]
 
 
 def copiar_archivo(origen: Path, destino: Path, categoria: str) -> Optional[dict[str, Any]]:
-    if not origen.exists() or not origen.is_file():
+    if not origen.exists() or not origen.is_file() or origen.name in NOMBRES_EXCLUIDOS:
         return None
     destino.parent.mkdir(parents=True, exist_ok=True)
+    if destino.exists():
+        contador = 2
+        while True:
+            candidato = destino.with_name(
+                f"{destino.stem}_{contador}{destino.suffix}"
+            )
+            if not candidato.exists():
+                destino = candidato
+                break
+            contador += 1
     shutil.copy2(origen, destino)
     return info_archivo(destino, origen=origen, categoria=categoria)
 
@@ -471,24 +705,51 @@ def copiar_auditorias(audit_files: list[Path], destino_dir: Path) -> list[dict[s
 
 def copiar_logs(log_files: list[Path], destino_dir: Path) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
+    bases = bases_logs_disponibles()
     for p in log_files:
-        info = copiar_archivo(p, destino_dir / p.name, "log_mes")
+        rel_log: Optional[Path] = None
+        for etiqueta, base in bases:
+            try:
+                rel_log = Path(etiqueta) / p.resolve().relative_to(base.resolve())
+                break
+            except Exception:
+                continue
+        if rel_log is None:
+            rel_log = Path("otros") / p.name
+        info = copiar_archivo(p, destino_dir / rel_log, "log_mes")
         if info:
             items.append(info)
     return items
 
 
-def buscar_cierres_semanales_soporte(inicio: _dt.date, fin: _dt.date, mes_dir: Path) -> list[Path]:
+def validacion_json_ok(path: Path) -> bool:
+    try:
+        return bool(json.loads(path.read_text(encoding="utf-8")).get("ok"))
+    except Exception:
+        return False
+
+
+def cierre_semanal_aprobado(cierre: Path) -> bool:
+    validaciones = cierre / "05_Validaciones"
+    locales = sorted(validaciones.glob("validacion_local_semanal_*.json"))
+    remotas = sorted(validaciones.glob("validacion_remota_semanal_*.json"))
+    return bool(locales and remotas) and all(
+        validacion_json_ok(p) for p in [locales[-1], remotas[-1]]
+    )
+
+
+def buscar_cierres_semanales_soporte(inicio: _dt.date, fin: _dt.date) -> list[Path]:
     out: list[Path] = []
     for si, sf in semanas_en_rango(inicio, fin):
+        mes_dir = CIERRES_DIR / si.strftime("%Y") / mes_carpeta(si)
         semana_dir = mes_dir / semana_nombre(si, sf)
         semanal_v2 = semana_dir / "Semanal"
-        if semanal_v2.exists() and semanal_v2.is_dir():
+        if semanal_v2.exists() and semanal_v2.is_dir() and cierre_semanal_aprobado(semanal_v2):
             out.append(semanal_v2)
             continue
         rango = f"{si.isoformat()}_a_{sf.isoformat()}"
         semanal_v1 = semana_dir / "02_Cierre_Semanal" / f"cierre_semanal_{rango}"
-        if semanal_v1.exists() and semanal_v1.is_dir():
+        if semanal_v1.exists() and semanal_v1.is_dir() and cierre_semanal_aprobado(semanal_v1):
             out.append(semanal_v1)
     return out
 
@@ -537,7 +798,9 @@ def crear_snapshot_env_redactado(destino_dir: Path, periodo: str) -> Optional[di
     return info_archivo(destino, origen=env_path, categoria="config_redactada")
 
 
-def validar_excel_generado(path: Path, expected_columns: int) -> dict[str, Any]:
+def validar_excel_generado(
+    path: Path, expected_columns: int, expected_rows: int
+) -> dict[str, Any]:
     out: dict[str, Any] = {"archivo": rel(path), "existe": path.exists(), "abre_ok": False, "hojas": [], "filas_datos": 0, "columnas": 0, "errores": []}
     if not path.exists():
         out["errores"].append("No existe Excel mensual.")
@@ -552,6 +815,12 @@ def validar_excel_generado(path: Path, expected_columns: int) -> dict[str, Any]:
             out["columnas"] = ws.max_column
             if expected_columns and ws.max_column != expected_columns:
                 out["errores"].append(f"Columnas esperadas={expected_columns}, encontradas={ws.max_column}.")
+            if out["filas_datos"] != expected_rows:
+                out["errores"].append(
+                    f"Filas esperadas={expected_rows}, encontradas={out['filas_datos']}."
+                )
+            out["bytes"] = path.stat().st_size
+            out["sha256"] = sha256_file(path)
         finally:
             wb.close()
     except Exception as exc:
@@ -570,8 +839,90 @@ def listar_archivos_para_manifest(base: Path, excluir: Optional[set[Path]] = Non
                 continue
         except Exception:
             pass
-        items.append(info_archivo(p, categoria="evidencia"))
+        items.append({
+            "categoria": "evidencia",
+            "ruta_relativa": p.relative_to(base).as_posix(),
+            "nombre": p.name,
+            "bytes": p.stat().st_size,
+            "sha256": sha256_file(p),
+        })
     return items
+
+
+def validar_archivos_manifest(base: Path, archivos: list[dict[str, Any]]) -> dict[str, Any]:
+    errores: list[str] = []
+    verificados = 0
+    for item in archivos:
+        ruta = base / str(item.get("ruta_relativa", ""))
+        if not ruta.exists() or not ruta.is_file():
+            errores.append(f"No existe: {item.get('ruta_relativa')}")
+            continue
+        bytes_real = ruta.stat().st_size
+        hash_real = sha256_file(ruta)
+        if bytes_real != int(item.get("bytes", -1)):
+            errores.append(f"Tamano distinto: {item.get('ruta_relativa')}")
+            continue
+        if hash_real != item.get("sha256"):
+            errores.append(f"SHA256 distinto: {item.get('ruta_relativa')}")
+            continue
+        verificados += 1
+    return {
+        "total_manifest": len(archivos),
+        "total_verificados": verificados,
+        "errores": errores,
+        "ok": not errores and verificados == len(archivos),
+    }
+
+
+def crear_zip_mensual(cierre_dir: Path, destino: Path, periodo: str) -> dict[str, Any]:
+    destino.parent.mkdir(parents=True, exist_ok=True)
+    archivos = [
+        p for p in sorted(cierre_dir.rglob("*"))
+        if p.is_file() and "07_Paquete_Mensual" not in p.parts
+    ]
+    with zipfile.ZipFile(
+        destino, mode="w", compression=zipfile.ZIP_DEFLATED, allowZip64=True
+    ) as zf:
+        for path in archivos:
+            zf.write(path, arcname=path.relative_to(cierre_dir).as_posix())
+    with zipfile.ZipFile(destino, mode="r") as zf:
+        archivo_corrupto = zf.testzip()
+        nombres = zf.namelist()
+    if archivo_corrupto:
+        raise RuntimeError(f"ZIP mensual corrupto en: {archivo_corrupto}")
+    if len(nombres) != len(archivos):
+        raise RuntimeError(
+            f"ZIP incompleto. Esperados={len(archivos)}, encontrados={len(nombres)}"
+        )
+    return {
+        "periodo": periodo,
+        "archivo": f"07_Paquete_Mensual/{destino.name}",
+        "bytes": destino.stat().st_size,
+        "sha256": sha256_file(destino),
+        "archivos_incluidos": len(nombres),
+        "testzip_ok": True,
+    }
+
+
+def publicar_atomico(staging_dir: Path, cierre_dir: Path, reemplazar: bool) -> None:
+    anterior: Optional[Path] = None
+    if cierre_dir.exists():
+        if not reemplazar:
+            raise RuntimeError(
+                f"Ya existe un cierre mensual en {cierre_dir}. "
+                "Usa --reemplazar solo despues de revisar el existente."
+            )
+        sello = _dt.datetime.now(ZONA_HORARIA).strftime("%Y%m%d_%H%M%S")
+        anterior = cierre_dir.with_name(f"Mensual.anterior_{sello}")
+        cierre_dir.rename(anterior)
+    try:
+        staging_dir.rename(cierre_dir)
+    except Exception:
+        if anterior and anterior.exists() and not cierre_dir.exists():
+            anterior.rename(cierre_dir)
+        raise
+    if anterior and anterior.exists():
+        shutil.rmtree(anterior)
 
 
 def generar_resumen_txt(path: Path, manifest: dict[str, Any]) -> None:
@@ -610,28 +961,22 @@ def generar_resumen_txt(path: Path, manifest: dict[str, Any]) -> None:
 
 def main() -> int:
     args = _parse_args()
-    inicio, fin = rango_desde_args(args)
+    try:
+        inicio, fin = rango_desde_args(args)
+    except Exception as exc:
+        print(f"Periodo mensual no valido: {exc}")
+        return 2
+
     anio = inicio.strftime("%Y")
     mes_nombre = mes_carpeta(inicio)
     periodo = periodo_nombre(inicio, fin)
 
     mes_dir = CIERRES_DIR / anio / mes_nombre
     cierre_dir = mes_dir / "Mensual"
-
-    excel_dir = cierre_dir / "01_Excel_Mensual"
-    auditoria_dir = cierre_dir / "02_Auditorias_Mes"
-    soporte_semanas_dir = cierre_dir / "03_Soporte_Semanas"
-    manifest_dir = cierre_dir / "04_Manifest_Mensual"
-    validaciones_dir = cierre_dir / "05_Validaciones"
-    logs_dir = cierre_dir / "06_Logs_Mes"
-
-    excel_path = excel_dir / f"facturas_mensual_{periodo}.xlsx"
-    manifest_path = manifest_dir / f"manifest_mensual_{periodo}.json"
-    resumen_path = manifest_dir / f"resumen_mensual_{periodo}.txt"
-    validacion_path = validaciones_dir / f"validacion_local_mensual_{periodo}.json"
+    staging_dir = mes_dir / f".Mensual.generando_{os.getpid()}"
 
     print("=" * 100)
-    print("CIERRE MENSUAL LOCAL SEGURO V1 - FACTURAS JOYCO")
+    print("CIERRE MENSUAL LOCAL SEGURO V2 - FACTURAS JOYCO")
     print("=" * 100)
     print(f"Version: {VERSION_CIERRE}")
     print(f"Root: {ROOT}")
@@ -640,17 +985,26 @@ def main() -> int:
     print(f"Mes carpeta: {mes_nombre}")
     print(f"Carpeta local destino: {cierre_dir}")
     print(f"Dry-run: {args.dry_run}")
+    print(f"Reemplazar cierre existente: {args.reemplazar}")
     print("-" * 100)
 
-    ok_lock, msg_lock = crear_lock()
-    if not ok_lock:
-        print(f"ERROR lock: {msg_lock}")
-        return 2
+    if not args.dry_run and cierre_dir.exists() and not args.reemplazar:
+        print(f"ERROR: ya existe el cierre mensual: {cierre_dir}")
+        print("No se modifica. Usa --reemplazar solo despues de revisarlo.")
+        return 4
+
+    lock_creado = False
+    if not args.dry_run:
+        ok_lock, msg_lock = crear_lock()
+        if not ok_lock:
+            print(f"ERROR lock: {msg_lock}")
+            return 2
+        lock_creado = True
 
     try:
         audit_files = recolectar_audits(inicio, fin)
         log_files = recolectar_logs(inicio, fin)
-        cierres_semanales = buscar_cierres_semanales_soporte(inicio, fin, mes_dir)
+        cierres_semanales = buscar_cierres_semanales_soporte(inicio, fin)
         headers, filas_mensuales, meta_seleccion = obtener_filas_mensuales_desde_excel(inicio, fin, audit_files)
 
         advertencias: list[str] = []
@@ -662,7 +1016,10 @@ def main() -> int:
         if not filas_mensuales:
             advertencias.append("El Excel mensual no tendra filas de datos para este periodo.")
         if not cierres_semanales:
-            advertencias.append("No se encontraron cierres semanales previos como soporte. El calculo mensual no depende de ellos.")
+            advertencias.append(
+                "No se encontraron cierres semanales con validacion local y remota OK. "
+                "El calculo mensual no depende de ellos."
+            )
 
         print(f"Auditorias detectadas: {len(audit_files)}")
         print(f"Logs detectados: {len(log_files)}")
@@ -679,48 +1036,52 @@ def main() -> int:
                     print(f"  - {adv}")
             return 0
 
-        if cierre_dir.exists():
-            print(f"Ya existe carpeta de cierre mensual. Se regenerara: {cierre_dir}")
-            shutil.rmtree(cierre_dir, ignore_errors=True)
+        if not args.permitir_vacio and len(filas_mensuales) == 0:
+            print("No se genero el cierre: el periodo no produjo filas mensuales.")
+            print("Si el mes realmente no tuvo facturas nuevas, usa --permitir-vacio.")
+            return 3
 
-        for d in (excel_dir, auditoria_dir, soporte_semanas_dir, manifest_dir, validaciones_dir, logs_dir):
+        if staging_dir.exists():
+            shutil.rmtree(staging_dir)
+
+        excel_dir = staging_dir / "01_Excel_Mensual"
+        auditoria_dir = staging_dir / "02_Auditorias_Mes"
+        soporte_semanas_dir = staging_dir / "03_Soporte_Semanas"
+        manifest_dir = staging_dir / "04_Manifest_Mensual"
+        validaciones_dir = staging_dir / "05_Validaciones"
+        logs_dir = staging_dir / "06_Logs_Mes"
+        paquete_dir = staging_dir / "07_Paquete_Mensual"
+
+        excel_path = excel_dir / f"facturas_mensual_{periodo}.xlsx"
+        manifest_path = manifest_dir / f"manifest_mensual_{periodo}.json"
+        resumen_path = manifest_dir / f"resumen_mensual_{periodo}.txt"
+        validacion_path = validaciones_dir / f"validacion_local_mensual_{periodo}.json"
+        zip_path = paquete_dir / f"cierre_mensual_{periodo}.zip"
+        validacion_paquete_path = paquete_dir / f"validacion_paquete_mensual_{periodo}.json"
+
+        for d in (
+            excel_dir, auditoria_dir, soporte_semanas_dir, manifest_dir,
+            validaciones_dir, logs_dir, paquete_dir,
+        ):
             d.mkdir(parents=True, exist_ok=True)
 
         excel_info = crear_excel_mensual(excel_path, list(headers), filas_mensuales)
+        excel_info["archivo"] = f"01_Excel_Mensual/{excel_path.name}"
         auditorias_info = copiar_auditorias(audit_files, auditoria_dir)
         logs_info = copiar_logs(log_files, logs_dir)
         soporte_semanas_info = copiar_soporte_semanas(cierres_semanales, soporte_semanas_dir)
         env_info = crear_snapshot_env_redactado(manifest_dir, periodo)
 
-        validacion_excel = validar_excel_generado(excel_path, expected_columns=len(headers))
-        validacion = {
-            "tipo": "validacion_local_cierre_mensual",
-            "version": VERSION_CIERRE,
-            "periodo": periodo,
-            "fecha_inicio": inicio.isoformat(),
-            "fecha_fin": fin.isoformat(),
-            "generado_en": _dt.datetime.now().isoformat(timespec="seconds"),
-            "excel": validacion_excel,
-            "auditorias_detectadas": len(audit_files),
-            "auditorias_copiadas": len(auditorias_info),
-            "logs_detectados": len(log_files),
-            "logs_copiados": len(logs_info),
-            "cierres_semanales_soporte_detectados": len(cierres_semanales),
-            "soportes_semanales_copiados": len(soporte_semanas_info),
-            "ok": bool(validacion_excel.get("abre_ok")) and not validacion_excel.get("errores"),
-            "advertencias": advertencias,
-        }
-        validacion_path.write_text(json.dumps(validacion, ensure_ascii=False, indent=2), encoding="utf-8")
-
+        generado_en = _dt.datetime.now(ZONA_HORARIA).isoformat(timespec="seconds")
         manifest = {
-            "tipo": "cierre_mensual_local_seguro_v1",
+            "tipo": "cierre_mensual_local_seguro_v2",
             "version": VERSION_CIERRE,
             "anio": anio,
             "mes_carpeta": mes_nombre,
             "periodo": periodo,
             "fecha_inicio": inicio.isoformat(),
             "fecha_fin": fin.isoformat(),
-            "generado_en": _dt.datetime.now().isoformat(timespec="seconds"),
+            "generado_en": generado_en,
             "root": str(ROOT),
             "host": socket.gethostname(),
             "platform": platform.platform(),
@@ -740,31 +1101,105 @@ def main() -> int:
                 "soporte_semanas": len(soporte_semanas_info),
                 "config_redactada": 1 if env_info else 0,
             },
-            "validacion_local": rel(validacion_path),
+            "validacion_local": f"05_Validaciones/{validacion_path.name}",
+            "paquete_zip": f"07_Paquete_Mensual/{zip_path.name}",
             "advertencias": advertencias,
-            "nota": "Cierre mensual V1: fuente oficial Excel principal + auditorias reales del mes.",
+            "nota": "Cierre mensual V2: fuente oficial Excel principal + auditorias reales del mes.",
         }
 
-        archivos_pre = listar_archivos_para_manifest(cierre_dir, excluir={manifest_path})
-        manifest["archivos"] = archivos_pre
-        manifest["total_archivos"] = len(archivos_pre)
-        manifest["total_bytes"] = sum(int(x.get("bytes", 0) or 0) for x in archivos_pre)
+        archivos_base = listar_archivos_para_manifest(
+            staging_dir,
+            excluir={manifest_path, resumen_path, validacion_path, zip_path, validacion_paquete_path},
+        )
+        manifest["archivos"] = archivos_base
+        manifest["total_archivos"] = len(archivos_base) + 1  # incluye el resumen
+        manifest["total_bytes"] = sum(int(x.get("bytes", 0) or 0) for x in archivos_base)
         generar_resumen_txt(resumen_path, manifest)
 
-        archivos = listar_archivos_para_manifest(cierre_dir, excluir={manifest_path})
+        archivos = listar_archivos_para_manifest(
+            staging_dir,
+            excluir={manifest_path, validacion_path, zip_path, validacion_paquete_path},
+        )
         manifest["archivos"] = archivos
-        manifest["total_archivos"] = len(archivos) + 1
+        manifest["total_archivos"] = len(archivos)
         manifest["total_bytes"] = sum(int(x.get("bytes", 0) or 0) for x in archivos)
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        print(f"Excel mensual: {excel_path}")
+        validacion_excel = validar_excel_generado(
+            excel_path,
+            expected_columns=len(headers),
+            expected_rows=len(filas_mensuales),
+        )
+        integridad_manifest = validar_archivos_manifest(staging_dir, archivos)
+        copias_ok = (
+            len(audit_files) == len(auditorias_info)
+            and len(log_files) == len(logs_info)
+        )
+        nombres_sensibles = [
+            p.relative_to(staging_dir).as_posix()
+            for p in staging_dir.rglob("*")
+            if p.is_file() and p.name in NOMBRES_EXCLUIDOS
+        ]
+        validacion = {
+            "tipo": "validacion_local_cierre_mensual",
+            "version": VERSION_CIERRE,
+            "periodo": periodo,
+            "fecha_inicio": inicio.isoformat(),
+            "fecha_fin": fin.isoformat(),
+            "generado_en": generado_en,
+            "excel": validacion_excel,
+            "integridad_manifest": integridad_manifest,
+            "auditorias_detectadas": len(audit_files),
+            "auditorias_copiadas": len(auditorias_info),
+            "logs_detectados": len(log_files),
+            "logs_copiados": len(logs_info),
+            "cierres_semanales_aprobados_detectados": len(cierres_semanales),
+            "archivos_soporte_semanal_copiados": len(soporte_semanas_info),
+            "copias_completas": copias_ok,
+            "archivos_sensibles_detectados": nombres_sensibles,
+            "ok": (
+                bool(validacion_excel.get("abre_ok"))
+                and not validacion_excel.get("errores")
+                and bool(integridad_manifest.get("ok"))
+                and copias_ok
+                and not nombres_sensibles
+            ),
+            "advertencias": advertencias,
+        }
+        validacion_path.write_text(
+            json.dumps(validacion, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        if not validacion["ok"]:
+            raise RuntimeError("La validacion local mensual no termino en OK.")
+
+        zip_info = crear_zip_mensual(staging_dir, zip_path, periodo)
+        validacion_paquete = {
+            "tipo": "validacion_paquete_zip_cierre_mensual",
+            "version": VERSION_CIERRE,
+            "generado_en": _dt.datetime.now(ZONA_HORARIA).isoformat(timespec="seconds"),
+            **zip_info,
+            "ok": bool(zip_info.get("testzip_ok")),
+        }
+        validacion_paquete_path.write_text(
+            json.dumps(validacion_paquete, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        publicar_atomico(staging_dir, cierre_dir, args.reemplazar)
+
+        excel_final = cierre_dir / "01_Excel_Mensual" / excel_path.name
+        manifest_final = cierre_dir / "04_Manifest_Mensual" / manifest_path.name
+        resumen_final = cierre_dir / "04_Manifest_Mensual" / resumen_path.name
+        validacion_final = cierre_dir / "05_Validaciones" / validacion_path.name
+        zip_final = cierre_dir / "07_Paquete_Mensual" / zip_path.name
+        print(f"Excel mensual: {excel_final}")
         print(f"Filas Excel mensual: {excel_info['filas_datos']}")
         print(f"Auditorias copiadas: {len(auditorias_info)}")
         print(f"Logs copiados: {len(logs_info)}")
         print(f"Soportes semanales copiados: {len(soporte_semanas_info)}")
-        print(f"Manifest: {manifest_path}")
-        print(f"Resumen: {resumen_path}")
-        print(f"Validacion local: {validacion_path}")
+        print(f"Manifest: {manifest_final}")
+        print(f"Resumen: {resumen_final}")
+        print(f"Validacion local: {validacion_final}")
+        print(f"ZIP mensual: {zip_final}")
+        print(f"ZIP SHA256: {zip_info['sha256']}")
         print(f"Total archivos evidencia: {manifest['total_archivos']}")
         print(f"Total bytes evidencia: {manifest['total_bytes']}")
         if advertencias:
@@ -772,23 +1207,21 @@ def main() -> int:
             for adv in advertencias:
                 print(f"  - {adv}")
 
-        if not args.permitir_vacio and len(filas_mensuales) == 0:
-            print("Cierre generado sin filas mensuales. Codigo 3 para revision controlada.")
-            print("Si el periodo realmente no tuvo facturas nuevas, usa --permitir-vacio.")
-            return 3
-
         print("=" * 100)
-        print("Cierre mensual local V1 generado correctamente.")
+        print("Cierre mensual local V2 generado y publicado atomicamente.")
         print("Siguiente paso: subir/validar en OneDrive con scripts\\subir_cierre_mensual_sharepoint.py")
         print("=" * 100)
         return 0
 
     except Exception as exc:
-        print(f"ERROR generando cierre mensual local V1: {type(exc).__name__}: {exc}")
+        print(f"ERROR generando cierre mensual local V2: {type(exc).__name__}: {exc}")
         print("No subas ni archives nada hasta revisar el error.")
         return 1
     finally:
-        liberar_lock()
+        if staging_dir.exists():
+            shutil.rmtree(staging_dir, ignore_errors=True)
+        if lock_creado:
+            liberar_lock()
 
 
 if __name__ == "__main__":
