@@ -35,7 +35,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION_MAIN = "2026-06-09-HISTORICO-ASC-CONFIG-UNICA-SOLO-EXCEL-SP"
+VERSION_MAIN = "2026-07-27-HISTORICO-ASC-CONFIG-UNICA-SOLO-EXCEL-SP-RC-ERRORES"
 
 
 # ============================================================
@@ -494,11 +494,13 @@ def _run_desde_aprobadas_compatible(cfg: ConfigEjecucion) -> None:
 # MAIN INTEGRADO
 # ============================================================
 
-def main() -> None:
+def main() -> int:
     print(f"🔥 MAIN INTEGRADO ACTIVO: {VERSION_MAIN}")
 
     cfg = cargar_configuracion()
     imprimir_configuracion(cfg)
+
+    errores: list[str] = []
 
     # ============================================================
     # 1) FLUJO NORMAL COMPLETO DE APROBADAS
@@ -528,6 +530,11 @@ def main() -> None:
         try:
             _run_desde_aprobadas_compatible(cfg)
         except Exception as e:
+            mensaje = (
+                "Flujo de aprobadas: "
+                f"{type(e).__name__}: {e}"
+            )
+            errores.append(mensaje)
             print(f"❌ Error ejecutando flujo de aprobadas: {e}")
             traceback.print_exc()
     else:
@@ -556,13 +563,25 @@ def main() -> None:
                 aplicar_signo_nota_credito=cfg.nota_credito_valores_negativos,
             )
         except Exception as e:
+            mensaje = (
+                "Flujo de notas crédito Inbox: "
+                f"{type(e).__name__}: {e}"
+            )
+            errores.append(mensaje)
             print(f"❌ Error ejecutando flujo de notas crédito Inbox: {e}")
             traceback.print_exc()
     else:
         print("ℹ️ FACTURAS_RUN_NOTAS_CREDITO=0. Se omite flujo de notas crédito Inbox.")
 
+    if errores:
+        print("\n❌ MAIN INTEGRADO FINALIZADO CON ERRORES")
+        for error in errores:
+            print(f"   - {error}")
+        return 1
+
     print("\n✅ MAIN INTEGRADO FINALIZADO")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
