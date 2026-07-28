@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 from openpyxl import load_workbook
 
 
-VERSION_LANZADOR = "2026-07-27-VPS-02-VALIDACION-XLSX"
+VERSION_LANZADOR = "2026-07-27-VPS-03-LOCK-HUERFANO"
 
 BASE_DIR = Path("/opt/joyco/facturas-procesador")
 APP_DIR = BASE_DIR / "app"
@@ -457,6 +457,47 @@ def validar_excel_xlsx(
             workbook.close()
 
 
+def validar_lock_aprobadas() -> bool:
+    """
+    Comprueba el lock usando la misma implementación del controller.
+
+    Retorna True cuando existía un lock huérfano que fue recuperado.
+    Un lock asociado a un PID activo bloquea la ejecución.
+    """
+    from utils.single_instance_lock import SingleInstanceLock
+
+    lock_existia = LOCK_PATH.exists()
+
+    try:
+        ttl_seconds = int(valor("LOCK_TTL_SECONDS") or "3600")
+    except (TypeError, ValueError):
+        abortar(
+            "LOCK_TTL_SECONDS no contiene un entero válido."
+        )
+
+    lock = SingleInstanceLock(
+        str(LOCK_PATH),
+        ttl_seconds=ttl_seconds,
+    )
+
+    if not lock.acquire():
+        abortar(
+            "Existe un lock activo o no recuperable: "
+            f"{LOCK_PATH}. "
+            "No se iniciará otra instancia."
+        )
+
+    lock.release()
+
+    if LOCK_PATH.exists():
+        abortar(
+            "El lock de validación no pudo liberarse correctamente: "
+            f"{LOCK_PATH}"
+        )
+
+    return lock_existia
+
+
 def validar_rutas_config() -> None:
     if str(APP_DIR) not in sys.path:
         sys.path.insert(0, str(APP_DIR))
@@ -526,10 +567,7 @@ def validar_rutas_config() -> None:
             f"No existe STATE_DIR: {STATE_PATH}"
         )
 
-    if LOCK_PATH.exists():
-        abortar(
-            f"Existe un lock previo: {LOCK_PATH}"
-        )
+    lock_huerfano_recuperado = validar_lock_aprobadas()
 
     print()
     print("Rutas resueltas:")
@@ -543,7 +581,14 @@ def validar_rutas_config() -> None:
     print("OK: rutas del VPS validadas.")
     print("OK: archivos XLSX operativos íntegros y estructurados.")
     print("OK: cero filas de datos se acepta cuando existen encabezados válidos.")
-    print("OK: no existe un lock previo.")
+
+    if lock_huerfano_recuperado:
+        print(
+            "OK: se detectó y retiró un lock huérfano; "
+            "no existe una instancia activa."
+        )
+    else:
+        print("OK: no existe un lock activo.")
 
 
 def validar_todo() -> None:
