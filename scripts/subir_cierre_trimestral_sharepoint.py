@@ -19,6 +19,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -49,7 +50,7 @@ DATA_DIR = ROOT / "data"
 CIERRES_TRIMESTRALES_DIR = DATA_DIR / "cierres_trimestrales"
 TMP_VERIFY_DIR = DATA_DIR / "_tmp_verificacion_sharepoint_trimestral"
 
-VERSION_UPLOAD = "2026-07-30-UPLOAD-CIERRE-TRIMESTRAL-V3-EVIDENCIA-REMOTA"
+VERSION_UPLOAD = "2026-07-30-UPLOAD-CIERRE-TRIMESTRAL-V3.2-EVIDENCIA-REMOTA-LOGS-SEGUROS"
 GRAPH = "https://graph.microsoft.com/v1.0"
 CONFIRMACION_UPLOAD = "SUBIR_CIERRE_TRIMESTRAL"
 
@@ -92,17 +93,40 @@ def encode_drive_id(drive_id: str) -> str:
     return quote(str(drive_id), safe="!")
 
 
+def resumen_drive(drive_id: str) -> str:
+    """Devuelve una referencia útil sin exponer el identificador completo."""
+    drive_id = str(drive_id or "").strip()
+    if not drive_id:
+        return "(vacío)"
+    sufijo = drive_id[-6:] if len(drive_id) >= 6 else drive_id
+    return f"***{sufijo} (longitud={len(drive_id)})"
+
+
+def url_graph_segura(url: str) -> str:
+    """Enmascara identificadores de drive e item antes de escribir una URL en logs."""
+    valor = str(url or "")
+
+    def ocultar(match: re.Match[str]) -> str:
+        identificador = match.group(2)
+        sufijo = identificador[-6:] if len(identificador) >= 6 else identificador
+        return f"{match.group(1)}***{sufijo}"
+
+    valor = re.sub(r"(/drives/)([^/?]+)", ocultar, valor)
+    valor = re.sub(r"(/items/)([^/?]+)", ocultar, valor)
+    return valor
+
+
 def graph_get(url: str, *, ok=(200,), timeout=60):
     r = requests.get(url, headers=headers(), timeout=timeout, verify=ssl_verify())
     if r.status_code not in ok:
-        raise RuntimeError(f"GET {r.status_code} {url} -> {r.text[:500]}")
+        raise RuntimeError(f"GET {r.status_code} {url_graph_segura(url)} -> {r.text[:500]}")
     return r
 
 
 def graph_post(url: str, body: dict, *, ok=(200, 201), timeout=60):
     r = requests.post(url, headers=h_json(), json=body, timeout=timeout, verify=ssl_verify())
     if r.status_code not in ok:
-        raise RuntimeError(f"POST {r.status_code} {url} -> {r.text[:500]}")
+        raise RuntimeError(f"POST {r.status_code} {url_graph_segura(url)} -> {r.text[:500]}")
     return r
 
 
@@ -111,7 +135,7 @@ def graph_put_content(drive_id: str, remote_path: str, local_file: Path) -> dict
     data = local_file.read_bytes()
     r = requests.put(url, headers=headers(), data=data, timeout=300, verify=ssl_verify())
     if r.status_code not in (200, 201):
-        raise RuntimeError(f"PUT {r.status_code} {url} -> {r.text[:500]}")
+        raise RuntimeError(f"PUT {r.status_code} {url_graph_segura(url)} -> {r.text[:500]}")
     return r.json()
 
 
@@ -119,7 +143,7 @@ def graph_download_item_content(drive_id: str, item_id: str) -> bytes:
     url = f"{GRAPH}/drives/{encode_drive_id(drive_id)}/items/{quote(item_id, safe='')}/content"
     r = requests.get(url, headers=headers(), timeout=300, verify=ssl_verify(), allow_redirects=True)
     if r.status_code != 200:
-        raise RuntimeError(f"DOWNLOAD {r.status_code} {url} -> {r.text[:500]}")
+        raise RuntimeError(f"DOWNLOAD {r.status_code} {url_graph_segura(url)} -> {r.text[:500]}")
     return r.content
 
 
@@ -141,7 +165,7 @@ def obtener_item_por_path(drive_id: str, remote_path: str) -> Optional[dict]:
     if r.status_code == 404:
         return None
 
-    raise RuntimeError(f"GET {r.status_code} {url} -> {r.text[:500]}")
+    raise RuntimeError(f"GET {r.status_code} {url_graph_segura(url)} -> {r.text[:500]}")
 
 
 def existe_path(drive_id: str, remote_path: str) -> bool:
@@ -156,7 +180,7 @@ def existe_path(drive_id: str, remote_path: str) -> bool:
     if r.status_code == 404:
         return False
 
-    raise RuntimeError(f"GET {r.status_code} {url} -> {r.text[:500]}")
+    raise RuntimeError(f"GET {r.status_code} {url_graph_segura(url)} -> {r.text[:500]}")
 
 
 def crear_folder(drive_id: str, parent_path: str, folder_name: str) -> None:
@@ -176,7 +200,7 @@ def crear_folder(drive_id: str, parent_path: str, folder_name: str) -> None:
     if r.status_code in (200, 201, 409):
         return
 
-    raise RuntimeError(f"POST {r.status_code} {url} -> {r.text[:500]}")
+    raise RuntimeError(f"POST {r.status_code} {url_graph_segura(url)} -> {r.text[:500]}")
 
 
 def ensure_folder_recursive(drive_id: str, folder_path: str) -> None:
@@ -202,7 +226,7 @@ def validar_drive_id(drive_id: str):
     if r.status_code == 200:
         return r.json()
 
-    print(f"⚠️ Drive ID no válido o no accesible: {drive_id}")
+    print(f"⚠️ Drive ID no válido o no accesible: {resumen_drive(drive_id)}")
     print(f"   Respuesta Graph: {r.status_code} {r.text[:250]}")
     return None
 
@@ -220,7 +244,7 @@ def listar_drives_site(hostname: str, site_path: str):
 def resolver_drive_secundario() -> str:
     drive = validar_drive_id(SP_BACKUP2_DRIVE_ID)
     if drive:
-        print(f"✅ Drive secundario validado por ID: {drive.get('name')} | {drive.get('id')}")
+        print(f"✅ Drive secundario validado por ID: {drive.get('name')} | {resumen_drive(str(drive.get('id') or ''))}")
         return drive["id"]
 
     print("🔎 Buscando drive secundario desde hostname/site_path...")
@@ -231,7 +255,7 @@ def resolver_drive_secundario() -> str:
 
     print("📚 Drives encontrados en site secundario:")
     for d in drives:
-        print(f"   - {d.get('name')} | {d.get('id')}")
+        print(f"   - {d.get('name')} | {resumen_drive(str(d.get('id') or ''))}")
 
     preferidos = {"documentos", "documents", "shared documents"}
     elegido = None
@@ -244,7 +268,7 @@ def resolver_drive_secundario() -> str:
     if not elegido:
         elegido = drives[0]
 
-    print(f"✅ Drive secundario resuelto: {elegido.get('name')} | {elegido.get('id')}")
+    print(f"✅ Drive secundario resuelto: {elegido.get('name')} | {resumen_drive(str(elegido.get('id') or ''))}")
     print("💡 Si este ID funciona, actualiza SP_BACKUP2_DRIVE_ID en .env con este valor.")
     return elegido["id"]
 
@@ -585,9 +609,9 @@ def imprimir_diagnostico(cierre: dict, rutas: dict) -> None:
 
     print("-" * 100)
     print("✅ Configuración SharePoint detectada.")
-    print(f"SP_DRIVE_ID principal: {SP_DRIVE_ID or '(vacio)'}")
+    print(f"SP_DRIVE_ID principal: {resumen_drive(SP_DRIVE_ID)}")
     print(f"SP_FOLDER principal: {BASE_SP or '(vacio)'}")
-    print(f"SP_BACKUP2_DRIVE_ID secundario: {SP_BACKUP2_DRIVE_ID or '(vacio)'}")
+    print(f"SP_BACKUP2_DRIVE_ID secundario: {resumen_drive(SP_BACKUP2_DRIVE_ID)}")
     print(f"SP_BACKUP2_FOLDER secundario: {SP_BACKUP2_FOLDER or '(vacio)'}")
 
     print("-" * 100)
@@ -614,7 +638,7 @@ def validar_config_sp() -> None:
 def subir_archivos_destino(nombre_destino: str, drive_id: str, carpeta_sp: str, cierre: dict) -> bool:
     print("-" * 100)
     print(f"📁 Verificando/creando destino: {nombre_destino}")
-    print(f"   Drive ID: {drive_id}")
+    print(f"   Drive ID: {resumen_drive(drive_id)}")
     print(f"   SP_DIR:   {carpeta_sp}")
 
     try:
@@ -796,7 +820,7 @@ def ejecutar_upload_cierre(cierre: dict, rutas: dict) -> int:
             print("❌ SP_DRIVE_ID principal no es válido o no es accesible.")
             return 1
 
-        print(f"✅ Drive principal validado: {principal.get('name')} | {principal.get('id')}")
+        print(f"✅ Drive principal validado: {principal.get('name')} | {resumen_drive(str(principal.get('id') or ''))}")
 
         print("🔐 Validando/resolviendo drive secundario...")
         drive_secundario = resolver_drive_secundario()
