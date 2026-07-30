@@ -49,7 +49,7 @@ DATA_DIR = ROOT / "data"
 CIERRES_TRIMESTRALES_DIR = DATA_DIR / "cierres_trimestrales"
 TMP_VERIFY_DIR = DATA_DIR / "_tmp_verificacion_sharepoint_trimestral"
 
-VERSION_UPLOAD = "2026-06-18-UPLOAD-CIERRE-TRIMESTRAL-SP-V2-UPLOAD-CIERRE"
+VERSION_UPLOAD = "2026-07-30-UPLOAD-CIERRE-TRIMESTRAL-V3-EVIDENCIA-REMOTA"
 GRAPH = "https://graph.microsoft.com/v1.0"
 CONFIRMACION_UPLOAD = "SUBIR_CIERRE_TRIMESTRAL"
 
@@ -66,6 +66,7 @@ SP_BACKUP2_FOLDER = (os.getenv("SP_BACKUP2_FOLDER") or "").strip().strip("/")
 EXCLUIR_NOMBRES = {".env"}
 EXCLUIR_EXT = {".tmp", ".lock"}
 EXCEL_EXT = {".xlsx", ".xlsm"}
+PREFIJO_VALIDACION_REMOTA = "validacion_remota_cierre_trimestral_"
 
 
 def ssl_verify() -> bool:
@@ -120,6 +121,27 @@ def graph_download_item_content(drive_id: str, item_id: str) -> bytes:
     if r.status_code != 200:
         raise RuntimeError(f"DOWNLOAD {r.status_code} {url} -> {r.text[:500]}")
     return r.content
+
+
+def obtener_item_por_path(drive_id: str, remote_path: str) -> Optional[dict]:
+    """
+    Recupera metadatos de un archivo remoto por su ruta.
+
+    Se usa como contingencia cuando Microsoft Graph devuelve un error
+    transitorio durante el PUT, pero el archivo sí alcanzó a guardarse.
+    """
+    url = (
+        f"{GRAPH}/drives/{encode_drive_id(drive_id)}"
+        f"/root:/{encode_path(remote_path)}:"
+    )
+    r = requests.get(url, headers=headers(), timeout=60, verify=ssl_verify())
+
+    if r.status_code == 200:
+        return r.json()
+    if r.status_code == 404:
+        return None
+
+    raise RuntimeError(f"GET {r.status_code} {url} -> {r.text[:500]}")
 
 
 def existe_path(drive_id: str, remote_path: str) -> bool:
@@ -358,28 +380,96 @@ def verificar_archivo_subido(
     return True
 
 
-def subir_y_verificar_con_reintentos(nombre_destino: str, drive_id: str, remote_path: str, local: Path, rel: str) -> bool:
-    item = graph_put_content(drive_id, remote_path, local)
+def subir_y_verificar_con_reintentos(
+    nombre_destino: str,
+    drive_id: str,
+    remote_path: str,
+    local: Path,
+    rel: str,
+) -> bool:
+    """
+    Sube y verifica un archivo con tolerancia a respuestas transitorias.
 
-    intentos = 4
-    espera = 2
-    ultimo_error = None
+    Si Graph devuelve error durante el PUT, consulta la ruta remota antes
+    de repetir. Esto evita registrar como fallida una carga que sí terminó
+    correctamente en Microsoft 365, por ejemplo ante un HTTP 504.
+    """
+    item = None
+    ultimo_error_subida = None
+    espera_subida = 2
+    intentos_subida = 3
 
-    for intento in range(1, intentos + 1):
+    for intento in range(1, intentos_subida + 1):
         try:
-            if verificar_archivo_subido(local=local, rel=rel, drive_id=drive_id, item=item):
+            item = graph_put_content(drive_id, remote_path, local)
+            break
+        except Exception as exc:
+            ultimo_error_subida = exc
+            print(
+                f"⚠️ Subida intento {intento}/{intentos_subida} "
+                f"falló para {rel} en {nombre_destino}: {exc}"
+            )
+
+            try:
+                item_remoto = obtener_item_por_path(drive_id, remote_path)
+                if item_remoto:
+                    print(
+                        "✅ El archivo existe en el destino pese al error "
+                        "del PUT. Se verificará su contenido."
+                    )
+                    item = item_remoto
+                    break
+            except Exception as consulta_exc:
+                print(
+                    "⚠️ No fue posible comprobar todavía la ruta remota: "
+                    f"{consulta_exc}"
+                )
+
+            if intento < intentos_subida:
+                print(f"   Reintentando subida en {espera_subida}s...")
+                time.sleep(espera_subida)
+                espera_subida *= 2
+
+    if item is None:
+        print(
+            f"❌ Subida definitiva fallida para {rel} "
+            f"en {nombre_destino}: {ultimo_error_subida}"
+        )
+        return False
+
+    intentos_verificacion = 4
+    espera_verificacion = 2
+    ultimo_error_verificacion = None
+
+    for intento in range(1, intentos_verificacion + 1):
+        try:
+            if verificar_archivo_subido(
+                local=local,
+                rel=rel,
+                drive_id=drive_id,
+                item=item,
+            ):
                 return True
-        except Exception as e:
-            ultimo_error = e
-            print(f"⚠️ Verificación intento {intento}/{intentos} falló para {rel}: {e}")
+        except Exception as exc:
+            ultimo_error_verificacion = exc
+            print(
+                f"⚠️ Verificación intento {intento}/"
+                f"{intentos_verificacion} falló para {rel}: {exc}"
+            )
 
-        if intento < intentos:
-            print(f"   Reintentando verificación en {espera}s...")
-            time.sleep(espera)
-            espera *= 2
+        if intento < intentos_verificacion:
+            print(
+                f"   Reintentando verificación "
+                f"en {espera_verificacion}s..."
+            )
+            time.sleep(espera_verificacion)
+            espera_verificacion *= 2
 
-    if ultimo_error:
-        print(f"❌ Verificación definitiva fallida para {rel}: {ultimo_error}")
+    if ultimo_error_verificacion:
+        print(
+            f"❌ Verificación definitiva fallida para {rel}: "
+            f"{ultimo_error_verificacion}"
+        )
     else:
         print(f"❌ Verificación definitiva fallida para {rel}.")
 
@@ -392,6 +482,10 @@ def debe_subir(p: Path) -> bool:
     if p.name in EXCLUIR_NOMBRES:
         return False
     if p.suffix.lower() in EXCLUIR_EXT:
+        return False
+    if p.name.startswith(PREFIJO_VALIDACION_REMOTA):
+        # La evidencia final se genera y publica después de validar
+        # todos los archivos históricos, para evitar autorreferencias.
         return False
     return True
 
@@ -556,6 +650,142 @@ def subir_archivos_destino(nombre_destino: str, drive_id: str, carpeta_sp: str, 
     return ok_todos
 
 
+
+def construir_evidencia_archivos(cierre: dict) -> list[dict]:
+    evidencias = []
+
+    for local in cierre["archivos"]:
+        rel = local.relative_to(cierre["carpeta_periodo"]).as_posix()
+        evidencia = {
+            "ruta_relativa": rel,
+            "bytes": local.stat().st_size,
+            "sha256_archivo_local": sha256_file(local),
+        }
+
+        if local.suffix.lower() in EXCEL_EXT:
+            digest, resumen = digest_datos_excel(local)
+            evidencia["digest_datos_excel"] = digest
+            evidencia["resumen_datos_excel"] = resumen
+
+        evidencias.append(evidencia)
+
+    return evidencias
+
+
+def escribir_validacion_remota_cierre(
+    cierre: dict,
+    rutas: dict,
+    drive_secundario: str,
+    ok_principal: bool,
+    ok_secundaria: bool,
+) -> Path:
+    """
+    Registra el resultado de la validación de los archivos históricos.
+
+    La publicación de este JSON se realiza después y se verifica de forma
+    independiente en ambos destinos. La fase de finalización debe volver
+    a comprobar su existencia e integridad antes de limpiar el Excel activo.
+    """
+    carpeta_soportes = Path(cierre["carpeta_soportes"])
+    carpeta_soportes.mkdir(parents=True, exist_ok=True)
+
+    validacion_path = carpeta_soportes / (
+        f"{PREFIJO_VALIDACION_REMOTA}{cierre['periodo']}.json"
+    )
+
+    total = len(cierre["archivos"])
+    ok_global = bool(ok_principal and ok_secundaria)
+
+    datos = {
+        "tipo": "VALIDACION_REMOTA_CIERRE_TRIMESTRAL",
+        "version_script": VERSION_UPLOAD,
+        "generado_en": datetime.datetime.now().isoformat(
+            timespec="seconds"
+        ),
+        "ok": ok_global,
+        "estado": (
+            "ARCHIVOS_HISTORICOS_VALIDADOS_EN_AMBOS_DESTINOS"
+            if ok_global
+            else "VALIDACION_DE_ARCHIVOS_HISTORICOS_INCOMPLETA"
+        ),
+        "anio": cierre["anio"],
+        "periodo": cierre["periodo"],
+        "carpeta_local": str(cierre["carpeta_periodo"]),
+        "excel_cierre": str(cierre["excel_cierre"]),
+        "total_archivos_historicos": total,
+        "principal": {
+            "nombre": "PRINCIPAL_CONTABILIDAD",
+            "drive_id": SP_DRIVE_ID,
+            "remote_base": rutas["principal_cierre"],
+            "ok": bool(ok_principal),
+            "archivos_verificados": total if ok_principal else 0,
+        },
+        "secundaria": {
+            "nombre": "SECUNDARIA_CONTROL_INTERNO",
+            "drive_id": drive_secundario,
+            "remote_base": rutas["secundaria_cierre"],
+            "ok": bool(ok_secundaria),
+            "archivos_verificados": total if ok_secundaria else 0,
+        },
+        "archivos_historicos": construir_evidencia_archivos(cierre),
+        "nota": (
+            "Esta evidencia registra la validación archivo por archivo "
+            "del cierre histórico. No autoriza por sí sola la limpieza "
+            "del Excel activo. La fase de finalización debe comprobar "
+            "que este JSON existe y coincide en ambos destinos remotos."
+        ),
+    }
+
+    temporal = validacion_path.with_suffix(".json.tmp")
+    temporal.write_text(
+        json.dumps(datos, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporal.replace(validacion_path)
+
+    return validacion_path
+
+
+def publicar_y_verificar_evidencia(
+    *,
+    validacion_path: Path,
+    cierre: dict,
+    rutas: dict,
+    drive_secundario: str,
+) -> Tuple[bool, bool]:
+    validacion_rel = validacion_path.relative_to(
+        cierre["carpeta_periodo"]
+    ).as_posix()
+
+    remoto_principal = (
+        f"{rutas['principal_cierre']}/{validacion_rel}"
+    ).strip("/")
+
+    remoto_secundario = (
+        f"{rutas['secundaria_cierre']}/{validacion_rel}"
+    ).strip("/")
+
+    print("-" * 100)
+    print("📄 Publicando evidencia final en ambos destinos...")
+
+    ok_principal = subir_y_verificar_con_reintentos(
+        "PRINCIPAL_CONTABILIDAD",
+        SP_DRIVE_ID,
+        remoto_principal,
+        validacion_path,
+        validacion_rel,
+    )
+
+    ok_secundaria = subir_y_verificar_con_reintentos(
+        "SECUNDARIA_CONTROL_INTERNO",
+        drive_secundario,
+        remoto_secundario,
+        validacion_path,
+        validacion_rel,
+    )
+
+    return ok_principal, ok_secundaria
+
 def ejecutar_upload_cierre(cierre: dict, rutas: dict) -> int:
     validar_config_sp()
 
@@ -589,19 +819,71 @@ def ejecutar_upload_cierre(cierre: dict, rutas: dict) -> int:
         cierre,
     )
 
+    validacion_path = escribir_validacion_remota_cierre(
+        cierre=cierre,
+        rutas=rutas,
+        drive_secundario=drive_secundario,
+        ok_principal=ok_principal,
+        ok_secundaria=ok_secundaria,
+    )
+
     print("-" * 100)
+    print(f"📄 Evidencia local generada: {validacion_path}")
+
+    ok_evidencia_principal = False
+    ok_evidencia_secundaria = False
 
     if ok_principal and ok_secundaria:
-        print("✅ Subida de cierre trimestral a SharePoint terminada correctamente en ambas rutas.")
+        (
+            ok_evidencia_principal,
+            ok_evidencia_secundaria,
+        ) = publicar_y_verificar_evidencia(
+            validacion_path=validacion_path,
+            cierre=cierre,
+            rutas=rutas,
+            drive_secundario=drive_secundario,
+        )
+
+    ok_global = bool(
+        ok_principal
+        and ok_secundaria
+        and ok_evidencia_principal
+        and ok_evidencia_secundaria
+    )
+
+    print("-" * 100)
+
+    if ok_global:
+        print(
+            "✅ Subida del cierre trimestral terminada correctamente "
+            "en ambas rutas."
+        )
         print("✅ Verificación aplicada:")
-        print("   - JSON/TXT/otros: SHA256 exacto después de descargar desde SharePoint.")
-        print("   - Excel: comparación de datos internos hoja/celda después de descargar desde SharePoint.")
-        print("⚠️ No se reemplazó el Excel activo de SharePoint en esta versión.")
+        print(
+            "   - JSON/TXT/otros: SHA256 exacto después de descargar."
+        )
+        print(
+            "   - Excel: comparación de datos internos hoja/celda."
+        )
+        print(
+            "✅ Evidencia final publicada y verificada "
+            "en los dos destinos."
+        )
+        print(
+            "⚠️ No se reemplazó el Excel activo "
+            "ni se actualizó el estado trimestral."
+        )
         print("=" * 100)
         return 0
 
-    print("❌ Subida de cierre trimestral terminó con errores en una o más rutas.")
-    print("⚠️ No ejecutes reemplazo de Excel activo hasta revisar el error.")
+    print(
+        "❌ La subida, validación o publicación de la evidencia "
+        "terminó con errores."
+    )
+    print(
+        "⚠️ No ejecutes la fase de finalización "
+        "hasta revisar el error."
+    )
     print("=" * 100)
     return 1
 
