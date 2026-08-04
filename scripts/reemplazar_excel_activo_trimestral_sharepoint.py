@@ -47,6 +47,7 @@ import shutil
 import sys
 import tempfile
 import time
+from collections import Counter
 from contextlib import ExitStack
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Optional, Tuple
@@ -80,7 +81,7 @@ LOCKS_DIR = DATA_DIR / "state" / "locks"
 LOCK_FINALIZACION_PATH = LOCKS_DIR / "cierre_trimestral_finalizacion.lock"
 LOCK_APROBADAS_PATH = LOCKS_DIR / "aprobadas.lock"
 
-VERSION = "2026-08-03-FINALIZACION-CIERRE-TRIMESTRAL-V2.1-TABLAS-EVIDENCIA"
+VERSION = "2026-08-04-FINALIZACION-CIERRE-TRIMESTRAL-V2.2-COMPARACION-SEMANTICA"
 GRAPH = "https://graph.microsoft.com/v1.0"
 CONFIRMACION = "FINALIZAR_CIERRE_TRIMESTRAL"
 
@@ -348,6 +349,154 @@ def digest_datos_excel(path: Path) -> Tuple[str, dict]:
         wb.close()
 
     return h.hexdigest(), resumen
+
+
+CAMPOS_FECHA_NUMERICOS = {"Año", "Mes", "Día"}
+
+
+def normalizar_campo_semantico_excel(campo: str, valor: Any) -> tuple[str, str]:
+    """
+    Canoniza valores para comparar dos Excel activos sin perder control.
+
+    Reglas deliberadamente limitadas:
+    - Las celdas vacías son equivalentes aunque Excel cambie su tipo interno.
+    - Año, Mes y Día aceptan ceros a la izquierda ("08" == "8").
+    - Los demás campos conservan valor y tipo; VALOR no se flexibiliza.
+    """
+    if valor is None:
+        return ("VACIO", "")
+
+    if isinstance(valor, str):
+        if valor.strip() == "":
+            return ("VACIO", "")
+
+        if campo in CAMPOS_FECHA_NUMERICOS:
+            texto = valor.strip()
+            signo = texto[1:] if texto[:1] in {"+", "-"} else texto
+            if signo.isdigit():
+                return ("FECHA_ENTERA", str(int(texto)))
+
+        return ("str", valor)
+
+    if campo in CAMPOS_FECHA_NUMERICOS and not isinstance(valor, bool):
+        if isinstance(valor, int):
+            return ("FECHA_ENTERA", str(valor))
+        if isinstance(valor, float) and valor.is_integer():
+            return ("FECHA_ENTERA", str(int(valor)))
+
+    if isinstance(
+        valor,
+        (datetime.datetime, datetime.date, datetime.time),
+    ):
+        return (type(valor).__name__, valor.isoformat())
+
+    if isinstance(valor, float):
+        return ("float", repr(valor))
+
+    return (type(valor).__name__, str(valor))
+
+
+def inventario_semantico_facturas(path: Path) -> dict:
+    """
+    Construye un multiconjunto de las 19 columnas de Facturas.
+
+    El orden físico de las filas no afecta el resultado, pero sí se conservan
+    duplicados mediante Counter. Esto permite aceptar reordenamientos de Excel
+    sin ocultar cambios reales en registros o valores financieros.
+    """
+    wb = load_workbook(
+        path,
+        read_only=True,
+        data_only=False,
+        keep_links=False,
+    )
+
+    try:
+        if "Facturas" not in wb.sheetnames:
+            raise RuntimeError("El Excel no contiene la hoja Facturas.")
+
+        ws = wb["Facturas"]
+        primera_fila = next(
+            ws.iter_rows(
+                min_row=1,
+                max_row=1,
+                max_col=len(HEADERS_ESPERADOS),
+                values_only=True,
+            )
+        )
+        encabezados = tuple(primera_fila)
+
+        if list(encabezados) != HEADERS_ESPERADOS:
+            raise RuntimeError(
+                "Los encabezados del Excel no coinciden con la estructura "
+                "esperada para comparación semántica."
+            )
+
+        registros: Counter = Counter()
+
+        for fila in ws.iter_rows(
+            min_row=2,
+            max_col=len(encabezados),
+            values_only=True,
+        ):
+            canonica = tuple(
+                normalizar_campo_semantico_excel(campo, valor)
+                for campo, valor in zip(encabezados, fila)
+            )
+            registros[canonica] += 1
+
+        filas_serializadas = [
+            {
+                "registro": registro,
+                "cantidad": cantidad,
+            }
+            for registro, cantidad in sorted(registros.items())
+        ]
+        payload = {
+            "encabezados": encabezados,
+            "registros": filas_serializadas,
+        }
+        digest = hashlib.sha256(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+        return {
+            "encabezados": encabezados,
+            "registros": registros,
+            "filas_datos": sum(registros.values()),
+            "registros_unicos": len(registros),
+            "digest_semantico": digest,
+        }
+    finally:
+        wb.close()
+
+
+def comparar_excel_facturas_semantico(local: Path, remoto: Path) -> dict:
+    local_info = inventario_semantico_facturas(local)
+    remoto_info = inventario_semantico_facturas(remoto)
+
+    solo_local = local_info["registros"] - remoto_info["registros"]
+    solo_remoto = remoto_info["registros"] - local_info["registros"]
+
+    return {
+        "ok": (
+            local_info["encabezados"] == remoto_info["encabezados"]
+            and not solo_local
+            and not solo_remoto
+        ),
+        "filas_local": local_info["filas_datos"],
+        "filas_remoto": remoto_info["filas_datos"],
+        "registros_unicos_local": local_info["registros_unicos"],
+        "registros_unicos_remoto": remoto_info["registros_unicos"],
+        "registros_solo_local": sum(solo_local.values()),
+        "registros_solo_remoto": sum(solo_remoto.values()),
+        "digest_semantico_local": local_info["digest_semantico"],
+        "digest_semantico_remoto": remoto_info["digest_semantico"],
+    }
 
 
 def validar_excel_estructura(
@@ -1151,11 +1300,28 @@ def validar_excel_activo_remoto_con_local(contexto: dict) -> dict:
     )
     digest_local, resumen_local = digest_datos_excel(FACTURAS_PATH)
 
-    if digest_local != digest_remoto:
+    temporal_remoto = excel_desde_bytes(
+        remoto,
+        "joyco_activo_sharepoint_semantico_",
+    )
+    try:
+        comparacion = comparar_excel_facturas_semantico(
+            FACTURAS_PATH,
+            temporal_remoto,
+        )
+    finally:
+        temporal_remoto.unlink(missing_ok=True)
+
+    if not comparacion["ok"]:
         raise RuntimeError(
-            "El Excel activo de SharePoint no coincide con data/facturas.xlsx.\n"
-            f"Digest local:  {digest_local}\n"
-            f"Digest remoto: {digest_remoto}\n"
+            "El Excel activo de SharePoint no coincide semánticamente "
+            "con data/facturas.xlsx.\n"
+            f"Filas local: {comparacion['filas_local']}\n"
+            f"Filas remoto: {comparacion['filas_remoto']}\n"
+            "Registros únicamente en local: "
+            f"{comparacion['registros_solo_local']}\n"
+            "Registros únicamente en SharePoint: "
+            f"{comparacion['registros_solo_remoto']}\n"
             "No se reemplazará ninguno de los dos archivos."
         )
 
@@ -1165,6 +1331,9 @@ def validar_excel_activo_remoto_con_local(contexto: dict) -> dict:
         "bytes": len(remoto),
         "sha256_bytes_descargados": sha256_bytes(remoto),
         "digest_datos_excel": digest_remoto,
+        "digest_datos_excel_local": digest_local,
+        "digest_semantico": comparacion["digest_semantico_remoto"],
+        "comparacion_semantica": comparacion,
         "resumen_datos_excel": resumen_remoto,
         "info_excel": info_remoto,
         "contenido": remoto,
