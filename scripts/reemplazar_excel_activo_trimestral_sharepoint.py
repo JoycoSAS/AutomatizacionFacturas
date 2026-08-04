@@ -80,7 +80,7 @@ LOCKS_DIR = DATA_DIR / "state" / "locks"
 LOCK_FINALIZACION_PATH = LOCKS_DIR / "cierre_trimestral_finalizacion.lock"
 LOCK_APROBADAS_PATH = LOCKS_DIR / "aprobadas.lock"
 
-VERSION = "2026-07-30-FINALIZACION-CIERRE-TRIMESTRAL-V2-TRANSACCIONAL"
+VERSION = "2026-08-03-FINALIZACION-CIERRE-TRIMESTRAL-V2.1-TABLAS-EVIDENCIA"
 GRAPH = "https://graph.microsoft.com/v1.0"
 CONFIRMACION = "FINALIZAR_CIERRE_TRIMESTRAL"
 
@@ -350,7 +350,11 @@ def digest_datos_excel(path: Path) -> Tuple[str, dict]:
     return h.hexdigest(), resumen
 
 
-def validar_excel_estructura(path: Path, exigir_limpio: bool) -> dict:
+def validar_excel_estructura(
+    path: Path,
+    exigir_limpio: bool,
+    tabla_requerida: Optional[str] = "TblFacturas",
+) -> dict:
     if not path.exists():
         raise RuntimeError(f"No existe el Excel: {path}")
 
@@ -374,8 +378,8 @@ def validar_excel_estructura(path: Path, exigir_limpio: bool) -> dict:
             )
 
         tabla_ref = (
-            ws.tables["TblFacturas"].ref
-            if "TblFacturas" in ws.tables
+            ws.tables[tabla_requerida].ref
+            if tabla_requerida and tabla_requerida in ws.tables
             else None
         )
 
@@ -386,7 +390,13 @@ def validar_excel_estructura(path: Path, exigir_limpio: bool) -> dict:
             "filas_datos": max(int(ws.max_row or 0) - 1, 0),
             "columnas": int(ws.max_column or 0),
             "tablas": list(ws.tables.keys()),
-            "tbl_facturas_ref": tabla_ref,
+            "tabla_requerida": tabla_requerida,
+            "tabla_requerida_ref": tabla_ref,
+            "tbl_facturas_ref": (
+                ws.tables["TblFacturas"].ref
+                if "TblFacturas" in ws.tables
+                else None
+            ),
             "bytes": path.stat().st_size,
             "sha256": sha256_file(path),
         }
@@ -396,8 +406,10 @@ def validar_excel_estructura(path: Path, exigir_limpio: bool) -> dict:
                 f"Columnas inválidas: {info['columnas']}. Esperadas: 19."
             )
 
-        if tabla_ref is None:
-            raise RuntimeError("No existe la tabla requerida TblFacturas.")
+        if tabla_requerida and tabla_ref is None:
+            raise RuntimeError(
+                f"No existe la tabla requerida {tabla_requerida}."
+            )
 
         if exigir_limpio:
             if info["filas"] != 1:
@@ -424,10 +436,18 @@ def excel_desde_bytes(data: bytes, prefijo: str) -> Path:
     return path
 
 
-def validar_excel_bytes(data: bytes, exigir_limpio: bool) -> tuple[dict, str, dict]:
+def validar_excel_bytes(
+    data: bytes,
+    exigir_limpio: bool,
+    tabla_requerida: Optional[str] = "TblFacturas",
+) -> tuple[dict, str, dict]:
     temporal = excel_desde_bytes(data, "joyco_finalizacion_")
     try:
-        info = validar_excel_estructura(temporal, exigir_limpio)
+        info = validar_excel_estructura(
+            temporal,
+            exigir_limpio,
+            tabla_requerida=tabla_requerida,
+        )
         digest, resumen = digest_datos_excel(temporal)
         return info, digest, resumen
     finally:
@@ -638,6 +658,7 @@ def verificar_contra_local(
     drive_id: str,
     remote_path: str,
     exigir_excel_limpio: bool = False,
+    tabla_excel_requerida: Optional[str] = "TblFacturas",
 ) -> dict:
     item, remoto = descargar_path(drive_id, remote_path)
 
@@ -645,6 +666,7 @@ def verificar_contra_local(
         _, digest_remoto, resumen_remoto = validar_excel_bytes(
             remoto,
             exigir_excel_limpio,
+            tabla_requerida=tabla_excel_requerida,
         )
         digest_local, resumen_local = digest_datos_excel(local)
 
@@ -1076,11 +1098,19 @@ def verificar_evidencia_y_archivos_remotos(
                 "Archivo histórico",
             )
             remoto = f"{destino['remote_base']}/{rel}".strip("/")
+            es_excel_controlado = local in {
+                contexto["historico"],
+                contexto["candidato"],
+                contexto["respaldo_activo_preparacion"],
+            }
             verificacion = verificar_contra_local(
                 local=local,
                 drive_id=destino["drive_id"],
                 remote_path=remoto,
                 exigir_excel_limpio=(local == contexto["candidato"]),
+                tabla_excel_requerida=(
+                    "TblFacturas" if es_excel_controlado else None
+                ),
             )
             archivos_ok.append(
                 {
