@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 JOYCO - Facturas Procesador
-Subida remota de cierre semanal V1 a repositorio unico de backups.
+Subida remota de cierre semanal V2 a repositorio unico de backups.
 
 Politica:
 - El cierre semanal NO se sube al SharePoint principal de operacion.
@@ -15,8 +15,14 @@ Variables .env soportadas, en orden de prioridad:
 - BACKUP_DRIVE_ID u ONEDRIVE_BACKUP_DRIVE_ID o SP_BACKUP2_DRIVE_ID
 - BACKUP_ROOT_FOLDER u ONEDRIVE_BACKUP_FOLDER o SP_BACKUP2_FOLDER
 
+Estructura remota esperada:
+  BACKUP_ROOT_FOLDER/YYYY/TRIMESTRE_YYYY-MM-DD_A_YYYY-MM-DD/
+    YYYY-MM_MesNombre/SEMANA_YYYY-MM-DD_a_YYYY-MM-DD/Semanal/
+
 Compatibilidad:
 - El nombre conserva sharepoint aunque el destino real puede ser OneDrive/SharePoint.
+- No se usa automáticamente la jerarquía anterior para evitar nuevos respaldos
+  fuera del trimestre activo.
 """
 
 from __future__ import annotations
@@ -46,8 +52,9 @@ except Exception:
     pass
 
 from services.m365.token import get_access_token
+from trimestre_activo import cargar_trimestre_activo
 
-VERSION_UPLOAD = "2026-07-21-UPLOAD-CIERRE-SEMANAL-V1-REINTENTOS-GRAPH"
+VERSION_UPLOAD = "2026-08-04-UPLOAD-CIERRE-SEMANAL-V2-JERARQUIA-TRIMESTRAL"
 GRAPH = "https://graph.microsoft.com/v1.0"
 
 # Microsoft Graph puede responder temporalmente con 429 o 5xx incluso cuando
@@ -62,7 +69,7 @@ ESPERA_MAX_SUBIDA_SEGUNDOS = 60
 
 DATA_DIR = ROOT / "data"
 CIERRES_DIR = DATA_DIR / "cierres_diarios"
-TMP_VERIFY_DIR = DATA_DIR / "_tmp_verificacion_cierre_semanal_v1"
+TMP_VERIFY_DIR = DATA_DIR / "_tmp_verificacion_cierre_semanal_v2"
 
 EXCLUIR_NOMBRES = {".env", ".env.local", ".env.production"}
 EXCLUIR_EXT = {".tmp", ".lock"}
@@ -90,6 +97,14 @@ def env_first(*names: str, default: str = "") -> str:
         if value:
             return value
     return default
+
+
+def resumen_identificador(value: Any) -> str:
+    texto = str(value or "").strip()
+    if not texto:
+        return "(vacio)"
+    visible = texto[-6:] if len(texto) > 6 else texto
+    return f"***{visible} (longitud={len(texto)})"
 
 
 def ssl_verify() -> bool:
@@ -268,7 +283,10 @@ def validar_drive_id(drive_id: str) -> Optional[dict[str, Any]]:
     r = requests.get(url, headers=headers(), timeout=60, verify=ssl_verify())
     if r.status_code == 200:
         return r.json()
-    print(f"Drive ID no valido o no accesible: {drive_id}")
+    print(
+        "Drive ID no valido o no accesible: "
+        f"{resumen_identificador(drive_id)}"
+    )
     print(f"Respuesta Graph: {r.status_code} {r.text[:350]}")
     return None
 
@@ -286,7 +304,11 @@ def resolver_drive_backup() -> tuple[str, dict[str, Any]]:
     drive_id = env_first("BACKUP_DRIVE_ID", "ONEDRIVE_BACKUP_DRIVE_ID", "SP_BACKUP2_DRIVE_ID")
     drive = validar_drive_id(drive_id)
     if drive:
-        print(f"Drive backup validado: {drive.get('name')} | {drive.get('id')}")
+        print(
+            "Drive backup validado: "
+            f"{drive.get('name')} | "
+            f"{resumen_identificador(drive.get('id'))}"
+        )
         return drive["id"], drive
 
     hostname = env_first("BACKUP_HOSTNAME", "ONEDRIVE_BACKUP_HOSTNAME", "SP_BACKUP2_HOSTNAME")
@@ -298,7 +320,11 @@ def resolver_drive_backup() -> tuple[str, dict[str, Any]]:
             raise RuntimeError("No se encontraron drives para el repositorio remoto de backups.")
         print("Drives encontrados:")
         for d in drives:
-            print(f"   - {d.get('name')} | {d.get('id')} | {d.get('webUrl')}")
+            print(
+                f"   - {d.get('name')} | "
+                f"{resumen_identificador(d.get('id'))} | "
+                f"{d.get('webUrl')}"
+            )
         preferidos = {"documentos", "documents", "shared documents", "onedrive"}
         elegido = None
         for d in drives:
@@ -307,7 +333,11 @@ def resolver_drive_backup() -> tuple[str, dict[str, Any]]:
                 break
         if not elegido:
             elegido = drives[0]
-        print(f"Drive backup resuelto: {elegido.get('name')} | {elegido.get('id')}")
+        print(
+            "Drive backup resuelto: "
+            f"{elegido.get('name')} | "
+            f"{resumen_identificador(elegido.get('id'))}"
+        )
         return elegido["id"], elegido
 
     raise RuntimeError(
@@ -539,48 +569,100 @@ def rango_desde_args(args: argparse.Namespace) -> tuple[_dt.date, _dt.date]:
     return semana_lunes_domingo(parse_fecha(args.fecha))
 
 
-def buscar_cierre_semanal_local(inicio: _dt.date, fin: _dt.date) -> Path:
-    yyyy = inicio.strftime("%Y")
-    mes = mes_carpeta(inicio)
+def buscar_cierre_semanal_local(
+    inicio: _dt.date,
+    fin: _dt.date,
+    trimestre: dict[str, Any],
+) -> Path:
+    # La semana se organiza según la fecha en que termina. Por ejemplo,
+    # SEMANA_2026-07-27_a_2026-08-02 queda dentro de agosto y del trimestre
+    # activo que contiene el 2026-08-02.
+    mes = mes_carpeta(fin)
     semana = f"SEMANA_{inicio.isoformat()}_a_{fin.isoformat()}"
-    rango = f"{inicio.isoformat()}_a_{fin.isoformat()}"
+
     esperado = (
         CIERRES_DIR
-        / yyyy
+        / Path(trimestre["ruta_relativa"])
         / mes
         / semana
         / "Semanal"
     )
-    if esperado.exists():
+
+    if esperado.exists() and esperado.is_dir():
         return esperado
 
-    # Compatibilidad con estructura V1 anterior.
-    esperado_v1 = (
-        CIERRES_DIR
-        / yyyy
-        / mes
-        / semana
-        / "02_Cierre_Semanal"
-        / f"cierre_semanal_{rango}"
+    raise RuntimeError(
+        "No se encontro el cierre semanal en la jerarquia trimestral oficial. "
+        f"Ruta esperada: {esperado}. "
+        "No se usara automaticamente la estructura anterior para evitar "
+        "crear backups fuera del trimestre activo."
     )
-    if esperado_v1.exists():
-        return esperado_v1
-
-    candidatos = list(CIERRES_DIR.glob(f"**/SEMANA_{inicio.isoformat()}_a_{fin.isoformat()}/Semanal"))
-    candidatos += list(CIERRES_DIR.glob(f"**/cierre_semanal_{rango}"))
-    candidatos = [p for p in candidatos if p.exists() and p.is_dir()]
-    if not candidatos:
-        raise RuntimeError(f"No se encontro cierre semanal local para {rango} dentro de {CIERRES_DIR}.")
-    candidatos = sorted(candidatos, key=lambda p: p.stat().st_mtime, reverse=True)
-    return candidatos[0]
 
 
-def remote_base_para_cierre(cierre_dir: Path) -> str:
-    root_folder = env_first("BACKUP_ROOT_FOLDER", "ONEDRIVE_BACKUP_FOLDER", "SP_BACKUP2_FOLDER")
+def remote_base_para_cierre(
+    cierre_dir: Path,
+    inicio: _dt.date,
+    fin: _dt.date,
+    trimestre: dict[str, Any],
+) -> str:
+    root_folder = env_first(
+        "BACKUP_ROOT_FOLDER",
+        "ONEDRIVE_BACKUP_FOLDER",
+        "SP_BACKUP2_FOLDER",
+    )
+    if not root_folder:
+        raise RuntimeError(
+            "Falta BACKUP_ROOT_FOLDER/ONEDRIVE_BACKUP_FOLDER/"
+            "SP_BACKUP2_FOLDER en .env."
+        )
+
     try:
-        rel_cierre = cierre_dir.relative_to(CIERRES_DIR).as_posix()
-    except Exception:
-        rel_cierre = cierre_dir.name
+        rel_cierre = (
+            cierre_dir.resolve()
+            .relative_to(CIERRES_DIR.resolve())
+            .as_posix()
+        )
+    except ValueError as exc:
+        raise RuntimeError(
+            "La carpeta del cierre semanal esta fuera de CIERRES_DIR y no "
+            "puede convertirse en una ruta remota segura: "
+            f"{cierre_dir}"
+        ) from exc
+
+    semana_esperada = f"SEMANA_{inicio.isoformat()}_a_{fin.isoformat()}"
+    partes = Path(rel_cierre).parts
+
+    if cierre_dir.name != "Semanal":
+        raise RuntimeError(
+            "La carpeta seleccionada no corresponde a un cierre semanal: "
+            f"{cierre_dir}"
+        )
+
+    if len(partes) < 5:
+        raise RuntimeError(
+            "La ruta local del cierre semanal esta incompleta: "
+            f"{rel_cierre}"
+        )
+
+    if partes[0] != trimestre["anio"]:
+        raise RuntimeError(
+            "El año de la ruta local no coincide con el trimestre activo. "
+            f"Ruta={partes[0]} | Trimestre={trimestre['anio']}"
+        )
+
+    if partes[1] != trimestre["nombre_carpeta"]:
+        raise RuntimeError(
+            "La ruta local no pertenece al trimestre activo. "
+            f"Ruta={partes[1]} | "
+            f"Trimestre={trimestre['nombre_carpeta']}"
+        )
+
+    if partes[-2] != semana_esperada:
+        raise RuntimeError(
+            "La semana de la ruta local no coincide con el rango solicitado. "
+            f"Ruta={partes[-2]} | Esperada={semana_esperada}"
+        )
+
     return f"{root_folder}/{rel_cierre}".strip("/")
 
 
@@ -609,6 +691,7 @@ def escribir_validacion_remota(
     cierre_dir: Path,
     inicio: _dt.date,
     fin: _dt.date,
+    trimestre: dict[str, Any],
     drive: dict[str, Any],
     remote_base: str,
     resultados: list[dict[str, Any]],
@@ -621,6 +704,14 @@ def escribir_validacion_remota(
     payload = {
         "tipo": "validacion_remota_cierre_semanal",
         "version": VERSION_UPLOAD,
+        "trimestre": {
+            "periodo_activo": trimestre["periodo_activo"],
+            "nombre_carpeta": trimestre["nombre_carpeta"],
+            "fecha_inicio": trimestre["fecha_inicio"],
+            "fecha_fin": trimestre["fecha_fin"],
+            "ruta_relativa": trimestre["ruta_relativa"],
+            "state_path": trimestre["state_path"],
+        },
         "semana_inicio": inicio.isoformat(),
         "semana_fin": fin.isoformat(),
         "generado_en": _dt.datetime.now().isoformat(timespec="seconds"),
@@ -649,7 +740,7 @@ def limpiar_tmp() -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Sube cierre semanal V1 al repositorio remoto unico de backups.")
+    parser = argparse.ArgumentParser(description="Sube cierre semanal V2 al repositorio remoto unico de backups.")
     parser.add_argument("--fecha", default="", help="Fecha dentro de la semana, formato YYYY-MM-DD. Default: hoy.")
     parser.add_argument("--inicio", default="", help="Inicio de semana/rango, formato YYYY-MM-DD. Opcional.")
     parser.add_argument("--fin", default="", help="Fin de semana/rango, formato YYYY-MM-DD. Opcional.")
@@ -664,7 +755,7 @@ def main() -> int:
     rango = f"{inicio.isoformat()}_a_{fin.isoformat()}"
 
     print("=" * 100)
-    print("SUBIDA CIERRE SEMANAL V1 A REPOSITORIO DE BACKUPS - FACTURAS JOYCO")
+    print("SUBIDA CIERRE SEMANAL V2 A REPOSITORIO DE BACKUPS - FACTURAS JOYCO")
     print("=" * 100)
     print(f"Version: {VERSION_UPLOAD}")
     print(f"Root: {ROOT}")
@@ -673,19 +764,34 @@ def main() -> int:
     print("-" * 100)
 
     try:
-        cierre_dir = buscar_cierre_semanal_local(inicio, fin)
+        trimestre = cargar_trimestre_activo(ROOT, fin)
+        cierre_dir = buscar_cierre_semanal_local(
+            inicio,
+            fin,
+            trimestre,
+        )
         validar_cierre_local_minimo(cierre_dir, inicio, fin)
     except Exception as exc:
         print(f"Cierre semanal local no valido: {exc}")
         return 1
 
-    remote_base = remote_base_para_cierre(cierre_dir)
+    remote_base = remote_base_para_cierre(
+        cierre_dir,
+        inicio,
+        fin,
+        trimestre,
+    )
     archivos = listar_archivos_recursivos(cierre_dir)
     if not archivos:
         print("No hay archivos validos para subir.")
         return 1
 
     print(f"Cierre local: {cierre_dir}")
+    print(f"Trimestre activo: {trimestre['nombre_carpeta']}")
+    print(
+        "Rango trimestre: "
+        f"{trimestre['fecha_inicio']} a {trimestre['fecha_fin']}"
+    )
     print(f"Ruta remota base: {remote_base}")
     print(f"Archivos detectados: {len(archivos)}")
     for p in archivos:
@@ -738,6 +844,7 @@ def main() -> int:
         cierre_dir=cierre_dir,
         inicio=inicio,
         fin=fin,
+        trimestre=trimestre,
         drive=drive,
         remote_base=remote_base,
         resultados=resultados,
@@ -767,11 +874,11 @@ def main() -> int:
     print("-" * 100)
     print(f"Validacion remota local: {validacion_remota}")
     if ok_todos:
-        print("Subida de cierre semanal V1 terminada correctamente en el repositorio unico de backups.")
+        print("Subida de cierre semanal V2 terminada correctamente en el repositorio unico de backups.")
         print("Verificacion aplicada archivo por archivo despues de descargar desde Graph.")
         print("=" * 100)
         return 0
-    print("Subida de cierre semanal V1 termino con errores.")
+    print("Subida de cierre semanal V2 termino con errores.")
     print("No borres ni archives localmente hasta revisar el error.")
     print("=" * 100)
     return 1

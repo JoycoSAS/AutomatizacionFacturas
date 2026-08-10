@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 JOYCO - Facturas Procesador
-Subida remota de cierre diario V2 a repositorio único de backups.
+Subida remota de cierre diario V3 a repositorio único de backups.
 
 Política aplicada:
 - El cierre diario NO se sube al SharePoint principal de operación.
@@ -16,7 +16,8 @@ Variables .env soportadas, en orden de prioridad:
 - BACKUP_ROOT_FOLDER u ONEDRIVE_BACKUP_FOLDER o SP_BACKUP2_FOLDER
 
 Estructura remota esperada:
-  BACKUP_ROOT_FOLDER/YYYY/YYYY-MM_MesNombre/SEMANA_YYYY-MM-DD_a_YYYY-MM-DD/Diario_YYYY-MM-DD/
+  BACKUP_ROOT_FOLDER/YYYY/TRIMESTRE_YYYY-MM-DD_A_YYYY-MM-DD/
+    YYYY-MM_MesNombre/SEMANA_YYYY-MM-DD_a_YYYY-MM-DD/Diario_YYYY-MM-DD/
 
 Compatibilidad:
 - Se conserva el nombre del archivo para no romper wrappers existentes:
@@ -50,13 +51,14 @@ except Exception:
     pass
 
 from services.m365.token import get_access_token
+from trimestre_activo import cargar_trimestre_activo
 
-VERSION_UPLOAD = "2026-07-08-UPLOAD-CIERRE-DIARIO-V2-ESTRUCTURA-ANIO-MES-SEMANA"
+VERSION_UPLOAD = "2026-08-04-UPLOAD-CIERRE-DIARIO-V3-JERARQUIA-TRIMESTRAL"
 GRAPH = "https://graph.microsoft.com/v1.0"
 
 DATA_DIR = ROOT / "data"
 CIERRES_DIR = DATA_DIR / "cierres_diarios"
-TMP_VERIFY_DIR = DATA_DIR / "_tmp_verificacion_cierre_diario_v2"
+TMP_VERIFY_DIR = DATA_DIR / "_tmp_verificacion_cierre_diario_v3"
 
 EXCLUIR_NOMBRES = {".env", ".env.local", ".env.production"}
 EXCLUIR_EXT = {".tmp", ".lock"}
@@ -69,6 +71,14 @@ def env_first(*names: str, default: str = "") -> str:
         if value:
             return value
     return default
+
+
+def resumen_identificador(value: Any) -> str:
+    texto = str(value or "").strip()
+    if not texto:
+        return "(vacío)"
+    visible = texto[-6:] if len(texto) > 6 else texto
+    return f"***{visible} (longitud={len(texto)})"
 
 
 def ssl_verify() -> bool:
@@ -180,7 +190,7 @@ def validar_drive_id(drive_id: str) -> Optional[dict[str, Any]]:
     r = requests.get(url, headers=headers(), timeout=60, verify=ssl_verify())
     if r.status_code == 200:
         return r.json()
-    print(f"⚠️ Drive ID no válido o no accesible: {drive_id}")
+    print(f"⚠️ Drive ID no válido o no accesible: {resumen_identificador(drive_id)}")
     print(f"   Respuesta Graph: {r.status_code} {r.text[:350]}")
     return None
 
@@ -198,7 +208,10 @@ def resolver_drive_backup() -> tuple[str, dict[str, Any]]:
     drive_id = env_first("BACKUP_DRIVE_ID", "ONEDRIVE_BACKUP_DRIVE_ID", "SP_BACKUP2_DRIVE_ID")
     drive = validar_drive_id(drive_id)
     if drive:
-        print(f"✅ Drive backup validado: {drive.get('name')} | {drive.get('id')}")
+        print(
+            "✅ Drive backup validado: "
+            f"{drive.get('name')} | {resumen_identificador(drive.get('id'))}"
+        )
         return drive["id"], drive
 
     hostname = env_first("BACKUP_HOSTNAME", "ONEDRIVE_BACKUP_HOSTNAME", "SP_BACKUP2_HOSTNAME")
@@ -211,7 +224,10 @@ def resolver_drive_backup() -> tuple[str, dict[str, Any]]:
 
         print("📚 Drives encontrados:")
         for d in drives:
-            print(f"   - {d.get('name')} | {d.get('id')} | {d.get('webUrl')}")
+            print(
+                f"   - {d.get('name')} | "
+                f"{resumen_identificador(d.get('id'))} | {d.get('webUrl')}"
+            )
 
         preferidos = {"documentos", "documents", "shared documents", "onedrive"}
         elegido = None
@@ -222,7 +238,11 @@ def resolver_drive_backup() -> tuple[str, dict[str, Any]]:
         if not elegido:
             elegido = drives[0]
 
-        print(f"✅ Drive backup resuelto: {elegido.get('name')} | {elegido.get('id')}")
+        print(
+            "✅ Drive backup resuelto: "
+            f"{elegido.get('name')} | "
+            f"{resumen_identificador(elegido.get('id'))}"
+        )
         print("💡 Si este ID funciona, guárdalo en BACKUP_DRIVE_ID o SP_BACKUP2_DRIVE_ID.")
         return elegido["id"], elegido
 
@@ -472,63 +492,74 @@ def parse_fecha(value: Optional[str]) -> _dt.date:
     return _dt.date.today()
 
 
-def buscar_cierre_local(fecha: _dt.date) -> Path:
-    yyyy = fecha.strftime("%Y")
-    mes = fecha.strftime("%Y-%m")
+def buscar_cierre_local(
+    fecha: _dt.date,
+    trimestre: dict[str, Any],
+) -> Path:
     mes_nombre = nombre_mes_dir(fecha)
     fecha_s = fecha.isoformat()
-
     inicio, fin = semana_lunes_domingo(fecha)
     semana = f"SEMANA_{inicio.isoformat()}_a_{fin.isoformat()}"
 
-    # Estructura nueva oficial:
-    # data/cierres_diarios/YYYY/YYYY-MM_MesNombre/SEMANA_.../Diario_YYYY-MM-DD
-    esperado_nuevo = (
+    esperado = (
         CIERRES_DIR
-        / yyyy
+        / trimestre["anio"]
+        / trimestre["nombre_carpeta"]
         / mes_nombre
         / semana
         / f"Diario_{fecha_s}"
     )
-    if esperado_nuevo.exists():
-        return esperado_nuevo
 
-    # Compatibilidad con estructura anterior por si hay cierres ya generados.
-    esperado_anterior = (
-        CIERRES_DIR
-        / yyyy
-        / mes
-        / semana
-        / f"cierre_diario_{fecha_s}"
+    if esperado.exists() and esperado.is_dir():
+        return esperado
+
+    raise RuntimeError(
+        "No se encontró el cierre diario en la jerarquía trimestral oficial. "
+        f"Ruta esperada: {esperado}. "
+        "No se usará automáticamente la estructura anterior para evitar "
+        "crear backups fuera del trimestre activo."
     )
-    if esperado_anterior.exists():
-        return esperado_anterior
-
-    candidatos = list((CIERRES_DIR / yyyy / mes_nombre).glob(f"SEMANA_*_a_*/Diario_{fecha_s}"))
-    candidatos += list((CIERRES_DIR / yyyy / mes).glob(f"SEMANA_*_a_*/cierre_diario_{fecha_s}"))
-    candidatos += list(CIERRES_DIR.glob(f"**/cierre_diario_{fecha_s}"))
-    candidatos += [CIERRES_DIR / fecha_s]
-    candidatos = [p for p in candidatos if p.exists() and p.is_dir()]
-    if not candidatos:
-        raise RuntimeError(f"No se encontró cierre diario local para {fecha_s} dentro de {CIERRES_DIR}.")
-
-    candidatos = sorted(candidatos, key=lambda p: p.stat().st_mtime, reverse=True)
-    return candidatos[0]
 
 
 def remote_base_para_cierre(cierre_dir: Path, fecha: _dt.date) -> str:
-    root_folder = env_first("BACKUP_ROOT_FOLDER", "ONEDRIVE_BACKUP_FOLDER", "SP_BACKUP2_FOLDER")
-    yyyy = fecha.strftime("%Y")
-    mes_nombre = nombre_mes_dir(fecha)
-    inicio, fin = semana_lunes_domingo(fecha)
-    semana = f"SEMANA_{inicio.isoformat()}_a_{fin.isoformat()}"
-
-    # Estructura remota oficial:
-    # BACKUP_ROOT/YYYY/YYYY-MM_MesNombre/SEMANA_.../Diario_YYYY-MM-DD
-    rel_cierre = (
-        f"{yyyy}/{mes_nombre}/{semana}/"
-        f"Diario_{fecha.isoformat()}"
+    root_folder = env_first(
+        "BACKUP_ROOT_FOLDER",
+        "ONEDRIVE_BACKUP_FOLDER",
+        "SP_BACKUP2_FOLDER",
     )
+    if not root_folder:
+        raise RuntimeError(
+            "Falta BACKUP_ROOT_FOLDER/ONEDRIVE_BACKUP_FOLDER/"
+            "SP_BACKUP2_FOLDER en .env."
+        )
+
+    try:
+        rel_cierre = (
+            cierre_dir.resolve()
+            .relative_to(CIERRES_DIR.resolve())
+            .as_posix()
+        )
+    except ValueError as exc:
+        raise RuntimeError(
+            "La carpeta del cierre diario está fuera de CIERRES_DIR y no "
+            "puede convertirse en una ruta remota segura: "
+            f"{cierre_dir}"
+        ) from exc
+
+    esperado_nombre = f"Diario_{fecha.isoformat()}"
+    if cierre_dir.name != esperado_nombre:
+        raise RuntimeError(
+            "La carpeta del cierre diario no coincide con la fecha solicitada. "
+            f"Esperado={esperado_nombre} | Encontrado={cierre_dir.name}"
+        )
+
+    partes = Path(rel_cierre).parts
+    if len(partes) < 5 or not partes[1].startswith("TRIMESTRE_"):
+        raise RuntimeError(
+            "La ruta local no contiene la jerarquía trimestral oficial: "
+            f"{rel_cierre}"
+        )
+
     return f"{root_folder}/{rel_cierre}".strip("/")
 
 
@@ -558,6 +589,7 @@ def escribir_validacion_remota(
     *,
     cierre_dir: Path,
     fecha: _dt.date,
+    trimestre: dict[str, Any],
     drive: dict[str, Any],
     remote_base: str,
     resultados: list[dict[str, Any]],
@@ -572,6 +604,7 @@ def escribir_validacion_remota(
         "tipo": "validacion_remota_cierre_diario",
         "version": VERSION_UPLOAD,
         "fecha": fecha_s,
+        "trimestre": trimestre,
         "generado_en": _dt.datetime.now().isoformat(timespec="seconds"),
         "cierre_local": str(cierre_dir),
         "drive": {
@@ -598,7 +631,7 @@ def limpiar_tmp() -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Sube cierre diario V2 al repositorio remoto único de backups.")
+    parser = argparse.ArgumentParser(description="Sube cierre diario V3 al repositorio remoto único de backups.")
     parser.add_argument("--fecha", default="", help="Fecha del cierre en formato YYYY-MM-DD. Default: hoy.")
     parser.add_argument("--dry-run", action="store_true", help="Solo muestra qué subiría, sin llamar Graph.")
     args = parser.parse_args()
@@ -607,7 +640,7 @@ def main() -> int:
     fecha_s = fecha.isoformat()
 
     print("=" * 100)
-    print("SUBIDA CIERRE DIARIO V2 A REPOSITORIO DE BACKUPS - FACTURAS JOYCO")
+    print("SUBIDA CIERRE DIARIO V3 A REPOSITORIO DE BACKUPS - FACTURAS JOYCO")
     print("=" * 100)
     print(f"Versión: {VERSION_UPLOAD}")
     print(f"Root: {ROOT}")
@@ -616,7 +649,8 @@ def main() -> int:
     print("-" * 100)
 
     try:
-        cierre_dir = buscar_cierre_local(fecha)
+        trimestre = cargar_trimestre_activo(ROOT, fecha)
+        cierre_dir = buscar_cierre_local(fecha, trimestre)
         validar_cierre_local_minimo(cierre_dir, fecha)
     except Exception as exc:
         print(f"❌ Cierre local no válido: {exc}")
@@ -629,6 +663,11 @@ def main() -> int:
         return 1
 
     print(f"📁 Cierre local: {cierre_dir}")
+    print(f"📆 Trimestre activo: {trimestre['nombre_carpeta']}")
+    print(
+        "📆 Rango trimestre: "
+        f"{trimestre['fecha_inicio']} a {trimestre['fecha_fin']}"
+    )
     print(f"☁️ Ruta remota base: {remote_base}")
     print(f"📦 Archivos detectados: {len(archivos)}")
     for p in archivos:
@@ -688,6 +727,7 @@ def main() -> int:
     validacion_remota = escribir_validacion_remota(
         cierre_dir=cierre_dir,
         fecha=fecha,
+        trimestre=trimestre,
         drive=drive,
         remote_base=remote_base,
         resultados=resultados,
@@ -719,12 +759,12 @@ def main() -> int:
     print("-" * 100)
     print(f"📄 Validación remota local: {validacion_remota}")
     if ok_todos:
-        print("✅ Subida de cierre diario V2 terminada correctamente en el repositorio único de backups.")
+        print("✅ Subida de cierre diario V3 terminada correctamente en el repositorio único de backups.")
         print("✅ Verificación aplicada archivo por archivo después de descargar desde Graph.")
         print("=" * 100)
         return 0
 
-    print("❌ Subida de cierre diario V2 terminó con errores.")
+    print("❌ Subida de cierre diario V3 terminó con errores.")
     print("⚠️ No borres ni archives localmente hasta revisar el error.")
     print("=" * 100)
     return 1

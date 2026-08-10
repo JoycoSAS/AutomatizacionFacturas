@@ -1,24 +1,24 @@
 # -*- coding: utf-8 -*-
 """
 JOYCO - Facturas Procesador
-Cierre semanal local seguro V1
+Cierre semanal local seguro V3
 
 Politica:
 - El cierre semanal NO se construye desde los Excel diarios.
 - Genera un Excel semanal cruzando el Excel operativo principal contra las auditorias de la semana.
-- Los cierres diarios, si existen, se copian solo como soporte/evidencia, no como fuente de calculo.
+- Los cierres diarios permanecen como carpetas hermanas de Semanal y no se copian dentro del cierre semanal.
 - Incluye logs de producción local y VPS correspondientes al rango semanal.
 - No sube a OneDrive/SharePoint. La subida se hace con scripts/subir_cierre_semanal_sharepoint.py.
 - No incluye .env real ni secretos.
 
 Estructura generada:
-  data/cierres_diarios/YYYY/YYYY-MM_Mes/SEMANA_YYYY-MM-DD_a_YYYY-MM-DD/Semanal/
-    01_Excel_Semanal/facturas_semanal_YYYY-MM-DD_a_YYYY-MM-DD.xlsx
-    02_Auditorias_Semana/audit_*.csv
-    03_Soporte_Diarios/Diario_YYYY-MM-DD/...
-    04_Manifest_Semanal/manifest_semanal_YYYY-MM-DD_a_YYYY-MM-DD.json
-    04_Manifest_Semanal/resumen_semanal_YYYY-MM-DD_a_YYYY-MM-DD.txt
-    05_Validaciones/validacion_local_semanal_YYYY-MM-DD_a_YYYY-MM-DD.json
+  data/cierres_diarios/YYYY/TRIMESTRE_YYYY-MM-DD_A_YYYY-MM-DD/
+    YYYY-MM_Mes/SEMANA_YYYY-MM-DD_a_YYYY-MM-DD/Semanal/
+      01_Excel_Semanal/facturas_semanal_YYYY-MM-DD_a_YYYY-MM-DD.xlsx
+      02_Auditorias_Semana/audit_*.csv
+      04_Manifest_Semanal/manifest_semanal_YYYY-MM-DD_a_YYYY-MM-DD.json
+      04_Manifest_Semanal/resumen_semanal_YYYY-MM-DD_a_YYYY-MM-DD.txt
+      05_Validaciones/validacion_local_semanal_YYYY-MM-DD_a_YYYY-MM-DD.json
 """
 
 from __future__ import annotations
@@ -52,7 +52,9 @@ try:
 except Exception:
     pass
 
-VERSION_CIERRE = "2026-07-15-CIERRE-SEMANAL-V1-MINIMOS-LOGS-VPS"
+from trimestre_activo import cargar_trimestre_activo
+
+VERSION_CIERRE = "2026-08-05-CIERRE-SEMANAL-V3-SIN-DUPLICAR-DIARIOS"
 
 DATA_DIR = ROOT / "data"
 AUDIT_DIR = DATA_DIR / "audit"
@@ -170,7 +172,7 @@ EXCEL_TABLE_NAME = "TblFacturasSemanal"
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Genera cierre semanal local seguro V1.")
+    parser = argparse.ArgumentParser(description="Genera cierre semanal local seguro V3.")
     parser.add_argument(
         "--fecha",
         default=_dt.date.today().isoformat(),
@@ -844,73 +846,6 @@ def copiar_logs(
 
 
 
-def buscar_cierres_diarios_soporte(inicio: _dt.date, fin: _dt.date, semana_dir: Path) -> list[Path]:
-    """
-    Busca cierres diarios de la semana como soporte/evidencia.
-
-    Estructura V2 oficial:
-    SEMANA_.../Diario_YYYY-MM-DD/
-
-    Mantiene compatibilidad con estructura V1 antigua:
-    SEMANA_.../01_Cierres_Diarios/cierre_diario_YYYY-MM-DD/
-    """
-    out = []
-    for d in fechas_en_rango(inicio, fin):
-        fecha_s = d.isoformat()
-
-        cierre_v2 = semana_dir / f"Diario_{fecha_s}"
-        if cierre_v2.exists() and cierre_v2.is_dir():
-            out.append(cierre_v2)
-            continue
-
-        cierre_v1 = semana_dir / "01_Cierres_Diarios" / f"cierre_diario_{fecha_s}"
-        if cierre_v1.exists() and cierre_v1.is_dir():
-            out.append(cierre_v1)
-
-    return out
-
-
-def copiar_soporte_diarios(cierres_diarios: list[Path], destino_dir: Path) -> list[dict[str, Any]]:
-    """
-    Copia evidencia clave de cierres diarios como soporte.
-    No usa estos archivos para calcular el Excel semanal.
-
-    Nota:
-    Se copia en estructura plana para evitar rutas demasiado largas en Windows.
-    """
-    items: list[dict[str, Any]] = []
-    destino_dir.mkdir(parents=True, exist_ok=True)
-
-    for cierre in cierres_diarios:
-        fecha = cierre.name.replace("cierre_diario_", "").replace("Diario_", "").strip()
-        destino_base = destino_dir / cierre.name
-        destino_base.mkdir(parents=True, exist_ok=True)
-
-        candidatos = [
-            cierre / "04_Manifest" / f"manifest_diario_{fecha}.json",
-            cierre / "04_Manifest" / f"resumen_diario_{fecha}.txt",
-            cierre / "05_Validaciones" / f"validacion_local_{fecha}.json",
-            cierre / "05_Validaciones" / f"validacion_remota_{fecha}.json",
-        ]
-
-        for origen in candidatos:
-            if not origen.exists() or not origen.is_file():
-                continue
-
-            destino = destino_base / origen.name
-
-            try:
-                info = copiar_archivo(origen, destino, categoria="soporte_diario")
-                if info:
-                    items.append(info)
-            except Exception as exc:
-                print(f"ADVERTENCIA: no se pudo copiar soporte diario {origen}: {type(exc).__name__}: {exc}")
-                continue
-
-    return items
-
-
-
 def crear_snapshot_env_redactado(destino_dir: Path, *args, **kwargs) -> Optional[dict[str, Any]]:
     """
     Crea snapshot redactado del .env para soporte técnico semanal.
@@ -982,7 +917,7 @@ def validar_excel_generado(path: Path, expected_columns: int) -> dict[str, Any]:
 
 def generar_resumen_txt(path: Path, manifest: dict[str, Any]) -> None:
     lines = [
-        "CIERRE SEMANAL LOCAL SEGURO V1 - FACTURAS JOYCO",
+        "CIERRE SEMANAL LOCAL SEGURO V3 - FACTURAS JOYCO",
         "=" * 90,
         f"Version: {manifest['version']}",
         f"Rango semana: {manifest['semana_inicio']} a {manifest['semana_fin']}",
@@ -996,14 +931,13 @@ def generar_resumen_txt(path: Path, manifest: dict[str, Any]) -> None:
         f"- Metodo seleccion: {manifest['seleccion_filas'].get('metodo_seleccion')}",
         f"- Auditorias copiadas: {manifest['conteos']['auditorias']}",
         f"- Logs copiados: {manifest['conteos']['logs']}",
-        f"- Soportes diarios copiados: {manifest['conteos']['soporte_diarios']}",
         f"- Total archivos evidencia: {manifest['total_archivos']}",
         f"- Total bytes evidencia: {manifest['total_bytes']}",
         "",
         "Regla aplicada:",
         "- Este cierre semanal se calcula desde data/facturas.xlsx + auditorias de la semana.",
         "- No consolida desde Excel diarios para evitar arrastrar errores de cierres previos.",
-        "- Los cierres diarios se copian solo como soporte/evidencia, si existen.",
+        "- Los cierres diarios permanecen en sus carpetas hermanas y no se duplican dentro de Semanal.",
         "- No se incluye .env real ni secretos.",
         "- No se sube nada desde este script; la subida remota se hace en el paso de OneDrive.",
         "",
@@ -1036,17 +970,27 @@ def listar_archivos_para_manifest(base: Path, excluir: Optional[set[Path]] = Non
 def main() -> int:
     args = _parse_args()
     inicio, fin = rango_desde_args(args)
-    anio = inicio.strftime("%Y")
-    mes_nombre = mes_carpeta(inicio)
+
+    # La semana se organiza según la fecha en que termina. Esto conserva la
+    # estructura aprobada para semanas que cruzan de mes o de trimestre; por
+    # ejemplo, SEMANA_2026-07-27_a_2026-08-02 queda dentro de agosto y del
+    # trimestre activo que contiene el 2026-08-02.
+    trimestre = cargar_trimestre_activo(ROOT, fin)
+    anio = trimestre["anio"]
+    mes_nombre = mes_carpeta(fin)
     semana = semana_nombre(inicio, fin)
     rango = f"{inicio.isoformat()}_a_{fin.isoformat()}"
 
-    semana_dir = CIERRES_DIR / anio / mes_nombre / semana
+    semana_dir = (
+        CIERRES_DIR
+        / Path(trimestre["ruta_relativa"])
+        / mes_nombre
+        / semana
+    )
     cierre_dir = semana_dir / "Semanal"
 
     excel_dir = cierre_dir / "01_Excel_Semanal"
     auditoria_dir = cierre_dir / "02_Auditorias_Semana"
-    soporte_diarios_dir = cierre_dir / "03_Soporte_Diarios"
     manifest_dir = cierre_dir / "04_Manifest_Semanal"
     validaciones_dir = cierre_dir / "05_Validaciones"
     logs_dir = cierre_dir / "06_Logs_Semana"
@@ -1057,10 +1001,15 @@ def main() -> int:
     validacion_path = validaciones_dir / f"validacion_local_semanal_{rango}.json"
 
     print("=" * 100)
-    print("CIERRE SEMANAL LOCAL SEGURO V1 - FACTURAS JOYCO")
+    print("CIERRE SEMANAL LOCAL SEGURO V3 - FACTURAS JOYCO")
     print("=" * 100)
     print(f"Version: {VERSION_CIERRE}")
     print(f"Root: {ROOT}")
+    print(f"Trimestre activo: {trimestre['nombre_carpeta']}")
+    print(
+        "Rango trimestre: "
+        f"{trimestre['fecha_inicio']} a {trimestre['fecha_fin']}"
+    )
     print(f"Semana: {inicio.isoformat()} a {fin.isoformat()}")
     print(f"Mes carpeta: {mes_nombre}")
     print(f"Carpeta local destino: {cierre_dir}")
@@ -1076,7 +1025,6 @@ def main() -> int:
     try:
         audit_files = recolectar_audits(inicio, fin)
         log_files = recolectar_logs(inicio, fin)
-        cierres_diarios = buscar_cierres_diarios_soporte(inicio, fin, semana_dir)
         headers, filas_semanales, meta_seleccion = obtener_filas_semanales_desde_excel(inicio, fin, audit_files)
 
         advertencias: list[str] = []
@@ -1087,12 +1035,9 @@ def main() -> int:
             advertencias.append("No se encontraron logs especificos de la semana.")
         if not filas_semanales:
             advertencias.append("El Excel semanal no tendra filas de datos para esta semana.")
-        if not cierres_diarios:
-            advertencias.append("No se encontraron cierres diarios previos como soporte. El calculo semanal no depende de ellos.")
 
         print(f"Auditorias detectadas: {len(audit_files)}")
         print(f"Logs detectados: {len(log_files)}")
-        print(f"Cierres diarios soporte detectados: {len(cierres_diarios)}")
         print(f"Metodo seleccion filas: {meta_seleccion.get('metodo_seleccion')}")
         print(f"Filas semanales detectadas: {len(filas_semanales)}")
 
@@ -1109,19 +1054,25 @@ def main() -> int:
             print(f"Ya existe carpeta de cierre semanal. Se regenerara: {cierre_dir}")
             shutil.rmtree(cierre_dir, ignore_errors=True)
 
-        for d in (excel_dir, auditoria_dir, soporte_diarios_dir, manifest_dir, validaciones_dir, logs_dir):
+        for d in (excel_dir, auditoria_dir, manifest_dir, validaciones_dir, logs_dir):
             d.mkdir(parents=True, exist_ok=True)
 
         excel_info = crear_excel_semanal(excel_path, list(headers), filas_semanales)
         auditorias_info = copiar_auditorias(audit_files, auditoria_dir)
         logs_info = copiar_logs(log_files, logs_dir)
-        soporte_diarios_info = copiar_soporte_diarios(cierres_diarios, soporte_diarios_dir)
         env_info = crear_snapshot_env_redactado(manifest_dir, inicio.isoformat(), fin.isoformat())
 
         validacion_excel = validar_excel_generado(excel_path, expected_columns=len(headers))
         validacion = {
             "tipo": "validacion_local_cierre_semanal",
             "version": VERSION_CIERRE,
+            "trimestre": {
+                "periodo_activo": trimestre["periodo_activo"],
+                "nombre_carpeta": trimestre["nombre_carpeta"],
+                "fecha_inicio": trimestre["fecha_inicio"],
+                "fecha_fin": trimestre["fecha_fin"],
+                "state_path": trimestre["state_path"],
+            },
             "semana_inicio": inicio.isoformat(),
             "semana_fin": fin.isoformat(),
             "generado_en": _dt.datetime.now().isoformat(timespec="seconds"),
@@ -1130,16 +1081,22 @@ def main() -> int:
             "auditorias_copiadas": len(auditorias_info),
             "logs_detectados": len(log_files),
             "logs_copiados": len(logs_info),
-            "cierres_diarios_soporte_detectados": len(cierres_diarios),
-            "soportes_diarios_copiados": len(soporte_diarios_info),
             "ok": bool(validacion_excel.get("abre_ok")) and not validacion_excel.get("errores"),
             "advertencias": advertencias,
         }
         validacion_path.write_text(json.dumps(validacion, ensure_ascii=False, indent=2), encoding="utf-8")
 
         manifest = {
-            "tipo": "cierre_semanal_local_seguro_v1",
+            "tipo": "cierre_semanal_local_seguro_v3",
             "version": VERSION_CIERRE,
+            "trimestre": {
+                "periodo_activo": trimestre["periodo_activo"],
+                "nombre_carpeta": trimestre["nombre_carpeta"],
+                "fecha_inicio": trimestre["fecha_inicio"],
+                "fecha_fin": trimestre["fecha_fin"],
+                "ruta_relativa": trimestre["ruta_relativa"],
+                "state_path": trimestre["state_path"],
+            },
             "anio": anio,
             "mes_carpeta": mes_nombre,
             "semana_inicio": inicio.isoformat(),
@@ -1156,18 +1113,17 @@ def main() -> int:
             "fuente_datos": {
                 "principal": rel(FACTURAS_PATH),
                 "auditorias_semana": [rel(p) for p in audit_files],
-                "nota": "Los cierres diarios son soporte/evidencia, no fuente de calculo.",
+                "nota": "Los cierres diarios son carpetas hermanas independientes y no se copian dentro de Semanal.",
             },
             "conteos": {
                 "filas_semanales": len(filas_semanales),
                 "auditorias": len(auditorias_info),
                 "logs": len(logs_info),
-                "soporte_diarios": len(soporte_diarios_info),
                 "config_redactada": 1 if env_info else 0,
             },
             "validacion_local": rel(validacion_path),
             "advertencias": advertencias,
-            "nota": "Cierre semanal V1: fuente oficial Excel principal + auditorias de la semana.",
+            "nota": "Cierre semanal V3: fuente oficial Excel principal + auditorias de la semana, sin duplicar evidencias diarias.",
         }
 
         archivos_pre = listar_archivos_para_manifest(cierre_dir, excluir={manifest_path})
@@ -1186,7 +1142,6 @@ def main() -> int:
         print(f"Filas Excel semanal: {excel_info['filas_datos']}")
         print(f"Auditorias copiadas: {len(auditorias_info)}")
         print(f"Logs copiados: {len(logs_info)}")
-        print(f"Soportes diarios copiados: {len(soporte_diarios_info)}")
         print(f"Manifest: {manifest_path}")
         print(f"Resumen: {resumen_path}")
         print(f"Validacion local: {validacion_path}")
@@ -1204,13 +1159,13 @@ def main() -> int:
             return 3
 
         print("=" * 100)
-        print("Cierre semanal local V1 generado correctamente.")
+        print("Cierre semanal local V3 generado correctamente.")
         print("Siguiente paso: subir/validar en OneDrive con scripts\\subir_cierre_semanal_sharepoint.py")
         print("=" * 100)
         return 0
 
     except Exception as exc:
-        print(f"ERROR generando cierre semanal local V1: {type(exc).__name__}: {exc}")
+        print(f"ERROR generando cierre semanal local V3: {type(exc).__name__}: {exc}")
         print("No subas ni archives nada hasta revisar el error.")
         return 1
     finally:

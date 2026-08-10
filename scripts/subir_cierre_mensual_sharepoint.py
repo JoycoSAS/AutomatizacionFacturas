@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 JOYCO - Facturas Procesador
-Subida remota de cierre mensual V2 a repositorio unico de backups.
+Subida remota de cierre mensual V4 a repositorio unico de backups.
 
 Politica:
 - El cierre mensual NO se sube al SharePoint principal de operacion.
@@ -10,10 +10,18 @@ Politica:
   BACKUP_ROOT_FOLDER / ONEDRIVE_BACKUP_FOLDER / SP_BACKUP2_FOLDER
 - La verificacion remota descarga cada archivo subido y compara:
   - Excel: datos internos hoja/celda.
-  - Los demas archivos, incluido ZIP: SHA256 exacto.
+  - Los demas archivos: SHA256 exacto.
 - Reintenta errores temporales de Graph sobre la misma ruta remota.
 - Permite reanudar una ejecucion incompleta y procesar solo los archivos fallidos.
 - Registra los 20 dias de retencion local solo despues de validar toda la subida.
+- Conserva obligatoriamente la jerarquia Trimestre/Mes/Mensual.
+- Excluye estructuras obsoletas que duplicaban semanas o empaquetaban el cierre en ZIP.
+- Bloquea rutas antiguas o cierres que no pertenezcan por completo al
+  trimestre operativo activo.
+
+Estructura remota esperada:
+  BACKUP_ROOT_FOLDER/YYYY/TRIMESTRE_YYYY-MM-DD_A_YYYY-MM-DD/
+    YYYY-MM_MesNombre/Mensual/
 """
 
 from __future__ import annotations
@@ -26,7 +34,6 @@ import os
 import shutil
 import sys
 import time
-import zipfile
 from pathlib import Path
 from typing import Any, Optional, Tuple
 from urllib.parse import quote
@@ -51,8 +58,9 @@ except Exception:
     pass
 
 from services.m365.token import get_access_token
+from trimestre_activo import cargar_trimestre_activo
 
-VERSION_UPLOAD = "2026-07-22-UPLOAD-CIERRE-MENSUAL-V2-REANUDAR-FALLIDOS"
+VERSION_UPLOAD = "2026-08-05-UPLOAD-CIERRE-MENSUAL-V4-SIN-DUPLICAR-SEMANAS-NI-ZIP"
 GRAPH = "https://graph.microsoft.com/v1.0"
 
 HTTP_REINTENTABLES_SUBIDA = {408, 429, 500, 502, 503, 504}
@@ -64,16 +72,25 @@ ZONA_HORARIA = ZoneInfo("America/Bogota")
 
 DATA_DIR = ROOT / "data"
 CIERRES_DIR = DATA_DIR / "cierres_diarios"
-TMP_VERIFY_DIR = DATA_DIR / "_tmp_verificacion_cierre_mensual_v2"
+TMP_VERIFY_DIR = DATA_DIR / "_tmp_verificacion_cierre_mensual_v3"
 
 EXCLUIR_NOMBRES = {".env", ".env.local", ".env.production"}
 EXCLUIR_EXT = {".tmp", ".lock"}
 EXCEL_EXT = {".xlsx", ".xlsm"}
+DIRECTORIOS_OBSOLETOS = {"03_Soporte_Semanas", "07_Paquete_Mensual"}
 
 MESES_ES = {
     1: "Enero", 2: "Febrero", 3: "Marzo", 4: "Abril", 5: "Mayo", 6: "Junio",
     7: "Julio", 8: "Agosto", 9: "Septiembre", 10: "Octubre", 11: "Noviembre", 12: "Diciembre",
 }
+
+
+def resumen_identificador(value: Any) -> str:
+    texto = str(value or "").strip()
+    if not texto:
+        return "(vacio)"
+    visible = texto[-6:] if len(texto) > 6 else texto
+    return f"***{visible} (longitud={len(texto)})"
 
 
 def ssl_verify() -> bool:
@@ -204,7 +221,10 @@ def validar_drive_id(drive_id: str) -> Optional[dict[str, Any]]:
     r = requests.get(url, headers=headers(), timeout=60, verify=ssl_verify())
     if r.status_code == 200:
         return r.json()
-    print(f"Drive ID no valido o no accesible: {drive_id}")
+    print(
+        "Drive ID no valido o no accesible: "
+        f"{resumen_identificador(drive_id)}"
+    )
     print(f"Respuesta Graph: {r.status_code} {r.text[:350]}")
     return None
 
@@ -223,7 +243,11 @@ def resolver_drive_backup() -> tuple[str, dict[str, Any]]:
     )
     drive = validar_drive_id(drive_id)
     if drive:
-        print(f"Drive backup validado: {drive.get('name')} | {drive.get('id')}")
+        print(
+            "Drive backup validado: "
+            f"{drive.get('name')} | "
+            f"{resumen_identificador(drive.get('id'))}"
+        )
         return str(drive["id"]), drive
 
     hostname = env_first(
@@ -241,7 +265,11 @@ def resolver_drive_backup() -> tuple[str, dict[str, Any]]:
             (d for d in drives if str(d.get("name", "")).strip().lower() in preferidos),
             drives[0],
         )
-        print(f"Drive backup resuelto: {elegido.get('name')} | {elegido.get('id')}")
+        print(
+            "Drive backup resuelto: "
+            f"{elegido.get('name')} | "
+            f"{resumen_identificador(elegido.get('id'))}"
+        )
         return str(elegido["id"]), elegido
     raise RuntimeError(
         "No hay drive de backups configurado. Define BACKUP_DRIVE_ID, "
@@ -518,18 +546,28 @@ def periodo_nombre(inicio: _dt.date, fin: _dt.date) -> str:
     return f"{inicio.isoformat()}_a_{fin.isoformat()}"
 
 
-def buscar_cierre_mensual_local(inicio: _dt.date, fin: _dt.date) -> Path:
-    yyyy = inicio.strftime("%Y")
+def buscar_cierre_mensual_local(
+    inicio: _dt.date,
+    fin: _dt.date,
+    trimestre: dict[str, Any],
+) -> Path:
     mes = mes_carpeta(inicio)
-    esperado = CIERRES_DIR / yyyy / mes / "Mensual"
-    if esperado.exists():
+    esperado = (
+        CIERRES_DIR
+        / Path(trimestre["ruta_relativa"])
+        / mes
+        / "Mensual"
+    )
+
+    if esperado.exists() and esperado.is_dir():
         return esperado
-    candidatos = list(CIERRES_DIR.glob(f"**/{mes}/Mensual"))
-    candidatos = [p for p in candidatos if p.exists() and p.is_dir()]
-    if not candidatos:
-        raise RuntimeError(f"No se encontro cierre mensual local para {periodo_nombre(inicio, fin)} dentro de {CIERRES_DIR}.")
-    candidatos = sorted(candidatos, key=lambda p: p.stat().st_mtime, reverse=True)
-    return candidatos[0]
+
+    raise RuntimeError(
+        "No se encontro el cierre mensual en la jerarquia trimestral oficial. "
+        f"Periodo={periodo_nombre(inicio, fin)} | Ruta esperada={esperado}. "
+        "No se usara automaticamente la estructura anterior para evitar "
+        "crear backups fuera del trimestre activo."
+    )
 
 
 def debe_subir(path: Path) -> bool:
@@ -540,6 +578,8 @@ def debe_subir(path: Path) -> bool:
     if path.suffix.lower() in EXCLUIR_EXT:
         return False
     if any(part.startswith("_tmp") for part in path.parts):
+        return False
+    if any(part in DIRECTORIOS_OBSOLETOS for part in path.parts):
         return False
     if path.name.startswith("validacion_remota_mensual_"):
         return False
@@ -559,6 +599,7 @@ def cargar_reintento_fallidos(
     archivos: list[Path],
     periodo: str,
     remote_base: str,
+    trimestre: dict[str, Any],
 ) -> tuple[list[Path], dict[str, dict[str, Any]]]:
     if not validacion_path.exists():
         raise RuntimeError(
@@ -576,6 +617,19 @@ def cargar_reintento_fallidos(
         raise RuntimeError("La validacion remota anterior corresponde a otro periodo.")
     if str(validacion.get("remote_base", "")).strip("/") != remote_base.strip("/"):
         raise RuntimeError("La validacion remota anterior corresponde a otro destino.")
+
+    trimestre_anterior = validacion.get("trimestre")
+    if not isinstance(trimestre_anterior, dict):
+        raise RuntimeError(
+            "La validacion remota anterior no registra el trimestre operativo."
+        )
+    if (
+        str(trimestre_anterior.get("nombre_carpeta", "")).strip()
+        != trimestre["nombre_carpeta"]
+    ):
+        raise RuntimeError(
+            "La validacion remota anterior corresponde a otro trimestre."
+        )
     if int(validacion.get("total_archivos_esperados", -1)) != len(archivos):
         raise RuntimeError(
             "La cantidad actual de archivos no coincide con la validacion remota anterior."
@@ -618,61 +672,155 @@ def cargar_reintento_fallidos(
     return pendientes, exitos_previos
 
 
-def validar_cierre_local_minimo(cierre_dir: Path, inicio: _dt.date, fin: _dt.date) -> None:
+def validar_cierre_local_minimo(
+    cierre_dir: Path,
+    inicio: _dt.date,
+    fin: _dt.date,
+    trimestre: dict[str, Any],
+) -> None:
     periodo = periodo_nombre(inicio, fin)
-    manifest_path = cierre_dir / "04_Manifest_Mensual" / f"manifest_mensual_{periodo}.json"
-    validacion_path = cierre_dir / "05_Validaciones" / f"validacion_local_mensual_{periodo}.json"
-    zip_path = cierre_dir / "07_Paquete_Mensual" / f"cierre_mensual_{periodo}.zip"
-    paquete_path = cierre_dir / "07_Paquete_Mensual" / f"validacion_paquete_mensual_{periodo}.json"
+    manifest_path = (
+        cierre_dir
+        / "04_Manifest_Mensual"
+        / f"manifest_mensual_{periodo}.json"
+    )
+    validacion_path = (
+        cierre_dir
+        / "05_Validaciones"
+        / f"validacion_local_mensual_{periodo}.json"
+    )
     obligatorios = [
-        cierre_dir / "01_Excel_Mensual" / f"facturas_mensual_{periodo}.xlsx",
+        cierre_dir
+        / "01_Excel_Mensual"
+        / f"facturas_mensual_{periodo}.xlsx",
         manifest_path,
-        cierre_dir / "04_Manifest_Mensual" / f"resumen_mensual_{periodo}.txt",
+        cierre_dir
+        / "04_Manifest_Mensual"
+        / f"resumen_mensual_{periodo}.txt",
         validacion_path,
-        zip_path,
-        paquete_path,
     ]
     faltantes = [str(p) for p in obligatorios if not p.exists()]
     if faltantes:
-        raise RuntimeError("El cierre mensual local no esta completo. Faltan: " + "; ".join(faltantes))
-    try:
-        validacion = json.loads(validacion_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise RuntimeError(f"No se pudo leer validacion local: {validacion_path} | {exc}")
-    if not validacion.get("ok"):
-        raise RuntimeError(f"La validacion local del cierre mensual no esta OK: {validacion_path}")
-    paquete = json.loads(paquete_path.read_text(encoding="utf-8"))
-    if not paquete.get("ok"):
-        raise RuntimeError(f"La validacion del ZIP mensual no esta OK: {paquete_path}")
-    if int(paquete.get("bytes", -1)) != zip_path.stat().st_size:
-        raise RuntimeError("El tamano del ZIP no coincide con su validacion local.")
-    if paquete.get("sha256") != sha256_file(zip_path):
-        raise RuntimeError("El SHA256 del ZIP no coincide con su validacion local.")
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        corrupto = zf.testzip()
-    if corrupto:
-        raise RuntimeError(f"El ZIP mensual esta corrupto en: {corrupto}")
+        raise RuntimeError(
+            "El cierre mensual local no esta completo. Faltan: "
+            + "; ".join(faltantes)
+        )
 
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    try:
+        validacion = json.loads(
+            validacion_path.read_text(encoding="utf-8")
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"No se pudo leer validacion local: {validacion_path} | {exc}"
+        ) from exc
+
+    if not validacion.get("ok"):
+        raise RuntimeError(
+            "La validacion local del cierre mensual no esta OK: "
+            f"{validacion_path}"
+        )
+
+    trimestre_validacion = validacion.get("trimestre")
+    if not isinstance(trimestre_validacion, dict):
+        raise RuntimeError(
+            "La validacion local mensual no registra el trimestre operativo."
+        )
+    if (
+        str(trimestre_validacion.get("nombre_carpeta", "")).strip()
+        != trimestre["nombre_carpeta"]
+    ):
+        raise RuntimeError(
+            "La validacion local mensual corresponde a otro trimestre."
+        )
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(
+            f"No se pudo leer manifest mensual: {manifest_path} | {exc}"
+        ) from exc
+
+    trimestre_manifest = manifest.get("trimestre")
+    if not isinstance(trimestre_manifest, dict):
+        raise RuntimeError(
+            "El manifest mensual no registra el trimestre operativo."
+        )
+    if (
+        str(trimestre_manifest.get("nombre_carpeta", "")).strip()
+        != trimestre["nombre_carpeta"]
+    ):
+        raise RuntimeError(
+            "El manifest mensual corresponde a otro trimestre."
+        )
+
     for item in manifest.get("archivos", []):
         rel_path = str(item.get("ruta_relativa", ""))
         archivo = cierre_dir / rel_path
         if not rel_path or not archivo.exists() or not archivo.is_file():
-            raise RuntimeError(f"Archivo del manifest no existe: {rel_path}")
+            raise RuntimeError(
+                f"Archivo del manifest no existe: {rel_path}"
+            )
         if archivo.stat().st_size != int(item.get("bytes", -1)):
-            raise RuntimeError(f"Tamano distinto al manifest: {rel_path}")
+            raise RuntimeError(
+                f"Tamano distinto al manifest: {rel_path}"
+            )
         if sha256_file(archivo) != item.get("sha256"):
-            raise RuntimeError(f"SHA256 distinto al manifest: {rel_path}")
+            raise RuntimeError(
+                f"SHA256 distinto al manifest: {rel_path}"
+            )
 
 
-def remote_base_para_cierre(cierre_dir: Path) -> str:
-    root_folder = env_first("BACKUP_ROOT_FOLDER", "ONEDRIVE_BACKUP_FOLDER", "SP_BACKUP2_FOLDER")
+def remote_base_para_cierre(
+    cierre_dir: Path,
+    inicio: _dt.date,
+    fin: _dt.date,
+    trimestre: dict[str, Any],
+) -> str:
+    root_folder = env_first(
+        "BACKUP_ROOT_FOLDER",
+        "ONEDRIVE_BACKUP_FOLDER",
+        "SP_BACKUP2_FOLDER",
+    )
     if not root_folder:
-        raise RuntimeError("Falta BACKUP_ROOT_FOLDER/ONEDRIVE_BACKUP_FOLDER/SP_BACKUP2_FOLDER en .env")
+        raise RuntimeError(
+            "Falta BACKUP_ROOT_FOLDER/ONEDRIVE_BACKUP_FOLDER/"
+            "SP_BACKUP2_FOLDER en .env."
+        )
+
+    esperado = (
+        CIERRES_DIR
+        / Path(trimestre["ruta_relativa"])
+        / mes_carpeta(inicio)
+        / "Mensual"
+    )
+
     try:
-        rel_cierre = cierre_dir.resolve().relative_to(CIERRES_DIR.resolve()).as_posix()
-    except Exception:
-        rel_cierre = cierre_dir.name
+        cierre_resuelto = cierre_dir.resolve()
+        esperado_resuelto = esperado.resolve()
+        rel_cierre = cierre_resuelto.relative_to(
+            CIERRES_DIR.resolve()
+        ).as_posix()
+    except ValueError as exc:
+        raise RuntimeError(
+            "La carpeta del cierre mensual esta fuera de CIERRES_DIR y no "
+            f"puede convertirse en una ruta remota segura: {cierre_dir}"
+        ) from exc
+
+    if cierre_resuelto != esperado_resuelto:
+        raise RuntimeError(
+            "La carpeta mensual no coincide con la jerarquia trimestral "
+            f"oficial. Detectada={cierre_dir} | Esperada={esperado}"
+        )
+
+    if not (
+        trimestre["fecha_inicio"] <= inicio.isoformat()
+        and fin.isoformat() <= trimestre["fecha_fin"]
+    ):
+        raise RuntimeError(
+            "El mes solicitado no pertenece completamente al trimestre activo."
+        )
+
     return f"{root_folder}/{rel_cierre}".strip("/")
 
 
@@ -680,6 +828,7 @@ def escribir_validacion_remota(
     cierre_dir: Path,
     inicio: _dt.date,
     fin: _dt.date,
+    trimestre: dict[str, Any],
     drive: dict[str, Any],
     remote_base: str,
     resultados: list[dict[str, Any]],
@@ -688,21 +837,43 @@ def escribir_validacion_remota(
     validaciones_dir = cierre_dir / "05_Validaciones"
     validaciones_dir.mkdir(parents=True, exist_ok=True)
     periodo = periodo_nombre(inicio, fin)
-    path = validaciones_dir / f"validacion_remota_mensual_{periodo}.json"
+    path = (
+        validaciones_dir
+        / f"validacion_remota_mensual_{periodo}.json"
+    )
     payload = {
         "tipo": "validacion_remota_cierre_mensual",
         "version": VERSION_UPLOAD,
+        "trimestre": {
+            "periodo_activo": trimestre["periodo_activo"],
+            "nombre_carpeta": trimestre["nombre_carpeta"],
+            "fecha_inicio": trimestre["fecha_inicio"],
+            "fecha_fin": trimestre["fecha_fin"],
+            "ruta_relativa": trimestre["ruta_relativa"],
+            "state_path": trimestre["state_path"],
+        },
         "periodo": periodo,
         "fecha_inicio": inicio.isoformat(),
         "fecha_fin": fin.isoformat(),
-        "generado_en": _dt.datetime.now(ZONA_HORARIA).isoformat(timespec="seconds"),
+        "generado_en": _dt.datetime.now(
+            ZONA_HORARIA
+        ).isoformat(timespec="seconds"),
         "cierre_local": str(cierre_dir),
-        "drive": {"id": drive.get("id"), "name": drive.get("name"), "webUrl": drive.get("webUrl"), "driveType": drive.get("driveType")},
+        "drive": {
+            "id": drive.get("id"),
+            "name": drive.get("name"),
+            "webUrl": drive.get("webUrl"),
+            "driveType": drive.get("driveType"),
+        },
         "remote_base": remote_base,
         "total_archivos_esperados": total_esperados,
         "total_resultados": len(resultados),
-        "total_archivos_verificados": sum(1 for x in resultados if x.get("ok")),
-        "total_archivos_fallidos": sum(1 for x in resultados if not x.get("ok")),
+        "total_archivos_verificados": sum(
+            1 for x in resultados if x.get("ok")
+        ),
+        "total_archivos_fallidos": sum(
+            1 for x in resultados if not x.get("ok")
+        ),
         "ok": (
             len(resultados) == total_esperados
             and total_esperados > 0
@@ -710,18 +881,31 @@ def escribir_validacion_remota(
         ),
         "resultados": resultados,
     }
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     return path
 
 
 def crear_estado_retencion_temporal(
-    inicio: _dt.date, fin: _dt.date, remote_base: str
+    inicio: _dt.date,
+    fin: _dt.date,
+    remote_base: str,
+    trimestre: dict[str, Any],
 ) -> tuple[Path, dict[str, Any]]:
     ahora = _dt.datetime.now(ZONA_HORARIA)
     periodo = periodo_nombre(inicio, fin)
     payload = {
         "tipo": "estado_retencion_local_cierre_mensual",
         "version": VERSION_UPLOAD,
+        "trimestre": {
+            "periodo_activo": trimestre["periodo_activo"],
+            "nombre_carpeta": trimestre["nombre_carpeta"],
+            "fecha_inicio": trimestre["fecha_inicio"],
+            "fecha_fin": trimestre["fecha_fin"],
+            "ruta_relativa": trimestre["ruta_relativa"],
+        },
         "periodo": periodo,
         "validacion_remota_publicada_y_verificada": True,
         "validado_en": ahora.isoformat(timespec="seconds"),
@@ -733,13 +917,19 @@ def crear_estado_retencion_temporal(
         "ok": True,
     }
     TMP_VERIFY_DIR.mkdir(parents=True, exist_ok=True)
-    path = TMP_VERIFY_DIR / f"estado_retencion_mensual_{periodo}.json"
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    path = (
+        TMP_VERIFY_DIR
+        / f"estado_retencion_mensual_{periodo}.json"
+    )
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     return path, payload
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Sube cierre mensual V2 al repositorio remoto unico de backups.")
+    parser = argparse.ArgumentParser(description="Sube cierre mensual V4 al repositorio remoto unico de backups.")
     parser.add_argument("--fecha", default="", help="Fecha dentro del mes cerrado. Default: mes anterior.")
     parser.add_argument("--inicio", default="", help="Primer dia del mes, formato YYYY-MM-DD.")
     parser.add_argument("--fin", default="", help="Ultimo dia del mismo mes, formato YYYY-MM-DD.")
@@ -761,25 +951,63 @@ def main() -> int:
         return 2
     periodo = periodo_nombre(inicio, fin)
 
+    try:
+        trimestre_inicio = cargar_trimestre_activo(ROOT, inicio)
+        trimestre_fin = cargar_trimestre_activo(ROOT, fin)
+    except Exception as exc:
+        print(f"Trimestre operativo no valido para el mes: {exc}")
+        return 2
+
+    if (
+        trimestre_inicio["nombre_carpeta"]
+        != trimestre_fin["nombre_carpeta"]
+    ):
+        print(
+            "Trimestre operativo no valido para el mes: el inicio y el fin "
+            "quedaron en trimestres distintos."
+        )
+        return 2
+
+    trimestre = trimestre_inicio
+
     print("=" * 100)
-    print("SUBIDA CIERRE MENSUAL V2 A REPOSITORIO DE BACKUPS - FACTURAS JOYCO")
+    print("SUBIDA CIERRE MENSUAL V4 A REPOSITORIO DE BACKUPS - FACTURAS JOYCO")
     print("=" * 100)
     print(f"Version: {VERSION_UPLOAD}")
     print(f"Root: {ROOT}")
     print(f"Periodo: {periodo}")
     print(f"Rango: {inicio.isoformat()} a {fin.isoformat()}")
+    print(f"Trimestre activo: {trimestre['nombre_carpeta']}")
+    print(
+        "Rango trimestre: "
+        f"{trimestre['fecha_inicio']} a {trimestre['fecha_fin']}"
+    )
     print(f"Dry-run: {args.dry_run}")
     print("-" * 100)
 
     try:
-        cierre_dir = buscar_cierre_mensual_local(inicio, fin)
-        validar_cierre_local_minimo(cierre_dir, inicio, fin)
+        cierre_dir = buscar_cierre_mensual_local(
+            inicio,
+            fin,
+            trimestre,
+        )
+        validar_cierre_local_minimo(
+            cierre_dir,
+            inicio,
+            fin,
+            trimestre,
+        )
     except Exception as exc:
         print(f"Cierre mensual local no valido: {exc}")
         return 1
 
     try:
-        remote_base = remote_base_para_cierre(cierre_dir)
+        remote_base = remote_base_para_cierre(
+            cierre_dir,
+            inicio,
+            fin,
+            trimestre,
+        )
     except Exception as exc:
         print(f"No se pudo calcular ruta remota: {exc}")
         return 1
@@ -809,6 +1037,7 @@ def main() -> int:
                 archivos=todos_los_archivos,
                 periodo=periodo,
                 remote_base=remote_base,
+                trimestre=trimestre,
             )
         except Exception as exc:
             print(f"No se puede reintentar de forma segura: {exc}")
@@ -896,6 +1125,7 @@ def main() -> int:
         cierre_dir,
         inicio,
         fin,
+        trimestre,
         drive,
         remote_base,
         resultados,
@@ -925,7 +1155,10 @@ def main() -> int:
     if ok_todos and validacion_publicada:
         try:
             estado_tmp, estado_payload = crear_estado_retencion_temporal(
-                inicio, fin, remote_base
+                inicio,
+                fin,
+                remote_base,
+                trimestre,
             )
             rel_estado = f"05_Validaciones/{estado_tmp.name}"
             remote_estado = f"{remote_base}/{rel_estado}".strip("/")
@@ -952,12 +1185,12 @@ def main() -> int:
     print("-" * 100)
     print(f"Validacion remota local: {validacion_remota}")
     if ok_todos:
-        print("Subida de cierre mensual V2 terminada correctamente en el repositorio unico de backups.")
+        print("Subida de cierre mensual V4 terminada correctamente en el repositorio unico de backups.")
         print("Verificacion aplicada archivo por archivo despues de descargar desde Graph.")
         print(f"Retencion local: {RETENCION_LOCAL_DIAS} dias desde la validacion remota.")
         print("=" * 100)
         return 0
-    print("Subida de cierre mensual V2 termino con errores.")
+    print("Subida de cierre mensual V4 termino con errores.")
     print("No borres ni archives localmente hasta revisar el error.")
     print("=" * 100)
     return 1

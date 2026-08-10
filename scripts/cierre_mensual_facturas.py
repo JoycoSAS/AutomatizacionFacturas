@@ -1,29 +1,30 @@
 # -*- coding: utf-8 -*-
 """
 JOYCO - Facturas Procesador
-Cierre mensual local seguro V2
+Cierre mensual local seguro V4 sin duplicar cierres semanales ni paquetes ZIP.
 
-Politica:
+Política:
 - El cierre mensual NO se construye desde cierres semanales ni diarios.
-- Genera un Excel mensual cruzando el Excel operativo principal contra las auditorias reales del mes.
-- Los cierres semanales, si existen, se copian solo como soporte/evidencia, no como fuente de calculo.
+- Genera un Excel mensual cruzando el Excel operativo principal contra las auditorías reales del mes.
+- NO copia manifiestos, validaciones ni archivos de los cierres semanales.
+- NO genera un ZIP del cierre mensual, porque duplicaría la misma evidencia.
+- Las carpetas Semanal y Diario permanecen independientes dentro del mes.
 - No sube a OneDrive/SharePoint. La subida se hace con scripts/subir_cierre_mensual_sharepoint.py.
 - No incluye .env real ni secretos.
 - Solo permite meses calendario ya terminados.
-- Genera en staging y publica atomicamente, sin destruir un cierre valido ante fallos.
-- Produce un ZIP mensual completo con SHA256 y prueba de integridad.
+- Genera en staging y publica atómicamente, sin destruir un cierre válido ante fallos.
+- Consulta el trimestre operativo activo para mantener una sola jerarquía.
+- Bloquea el cierre si el mes no pertenece completamente al trimestre activo.
 
 Estructura generada:
-data/cierres_diarios/YYYY/YYYY-MM_Mes/Mensual/
-    01_Excel_Mensual/facturas_mensual_YYYY-MM.xlsx
-    02_Auditorias_Mes/audit_*.csv
-    03_Soporte_Semanas/SEMANA_YYYY-MM-DD_a_YYYY-MM-DD/...
-    04_Manifest_Mensual/manifest_mensual_YYYY-MM.json
-    04_Manifest_Mensual/resumen_mensual_YYYY-MM.txt
-    05_Validaciones/validacion_local_mensual_YYYY-MM.json
-    06_Logs_Mes/...
-    07_Paquete_Mensual/cierre_mensual_YYYY-MM.zip
-    07_Paquete_Mensual/validacion_paquete_mensual_YYYY-MM.json
+data/cierres_diarios/YYYY/TRIMESTRE_YYYY-MM-DD_A_YYYY-MM-DD/
+    YYYY-MM_Mes/Mensual/
+        01_Excel_Mensual/facturas_mensual_YYYY-MM.xlsx
+        02_Auditorias_Mes/audit_*.csv
+        04_Manifest_Mensual/manifest_mensual_YYYY-MM.json
+        04_Manifest_Mensual/resumen_mensual_YYYY-MM.txt
+        05_Validaciones/validacion_local_mensual_YYYY-MM.json
+        06_Logs_Mes/...
 """
 
 from __future__ import annotations
@@ -41,7 +42,6 @@ import socket
 import sys
 import time
 import unicodedata
-import zipfile
 from pathlib import Path
 from typing import Any, Optional, Sequence
 from zoneinfo import ZoneInfo
@@ -60,7 +60,9 @@ try:
 except Exception:
     pass
 
-VERSION_CIERRE = "2026-07-21-CIERRE-MENSUAL-V2-SEGURO-ATOMICO-ZIP"
+from trimestre_activo import cargar_trimestre_activo
+
+VERSION_CIERRE = "2026-08-05-CIERRE-MENSUAL-V4-SIN-DUPLICAR-SEMANAS-NI-ZIP"
 
 DATA_DIR = ROOT / "data"
 AUDIT_DIR = DATA_DIR / "audit"
@@ -127,7 +129,7 @@ ZONA_HORARIA = ZoneInfo("America/Bogota")
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Genera cierre mensual local seguro V2.")
+    parser = argparse.ArgumentParser(description="Genera cierre mensual local seguro V4 sin duplicados.")
     parser.add_argument(
         "--fecha", default="",
         help="Fecha dentro del mes cerrado, formato YYYY-MM-DD. Default: mes anterior.",
@@ -219,29 +221,6 @@ def periodo_nombre(inicio: _dt.date, fin: _dt.date) -> str:
         return inicio.strftime("%Y-%m")
     return f"{inicio.isoformat()}_a_{fin.isoformat()}"
 
-
-def semana_lunes_domingo(fecha: _dt.date) -> tuple[_dt.date, _dt.date]:
-    inicio = fecha - _dt.timedelta(days=fecha.weekday())
-    fin = inicio + _dt.timedelta(days=6)
-    return inicio, fin
-
-
-def semana_nombre(inicio: _dt.date, fin: _dt.date) -> str:
-    return f"SEMANA_{inicio.isoformat()}_a_{fin.isoformat()}"
-
-
-def semanas_en_rango(inicio: _dt.date, fin: _dt.date) -> list[tuple[_dt.date, _dt.date]]:
-    semanas: list[tuple[_dt.date, _dt.date]] = []
-    d = inicio
-    vistos = set()
-    while d <= fin:
-        si, sf = semana_lunes_domingo(d)
-        key = (si, sf)
-        if key not in vistos:
-            vistos.add(key)
-            semanas.append(key)
-        d += _dt.timedelta(days=1)
-    return semanas
 
 
 def rel(path: Path) -> str:
@@ -722,59 +701,6 @@ def copiar_logs(log_files: list[Path], destino_dir: Path) -> list[dict[str, Any]
     return items
 
 
-def validacion_json_ok(path: Path) -> bool:
-    try:
-        return bool(json.loads(path.read_text(encoding="utf-8")).get("ok"))
-    except Exception:
-        return False
-
-
-def cierre_semanal_aprobado(cierre: Path) -> bool:
-    validaciones = cierre / "05_Validaciones"
-    locales = sorted(validaciones.glob("validacion_local_semanal_*.json"))
-    remotas = sorted(validaciones.glob("validacion_remota_semanal_*.json"))
-    return bool(locales and remotas) and all(
-        validacion_json_ok(p) for p in [locales[-1], remotas[-1]]
-    )
-
-
-def buscar_cierres_semanales_soporte(inicio: _dt.date, fin: _dt.date) -> list[Path]:
-    out: list[Path] = []
-    for si, sf in semanas_en_rango(inicio, fin):
-        mes_dir = CIERRES_DIR / si.strftime("%Y") / mes_carpeta(si)
-        semana_dir = mes_dir / semana_nombre(si, sf)
-        semanal_v2 = semana_dir / "Semanal"
-        if semanal_v2.exists() and semanal_v2.is_dir() and cierre_semanal_aprobado(semanal_v2):
-            out.append(semanal_v2)
-            continue
-        rango = f"{si.isoformat()}_a_{sf.isoformat()}"
-        semanal_v1 = semana_dir / "02_Cierre_Semanal" / f"cierre_semanal_{rango}"
-        if semanal_v1.exists() and semanal_v1.is_dir() and cierre_semanal_aprobado(semanal_v1):
-            out.append(semanal_v1)
-    return out
-
-
-def copiar_soporte_semanas(cierres_semanales: list[Path], destino_dir: Path) -> list[dict[str, Any]]:
-    items: list[dict[str, Any]] = []
-    destino_dir.mkdir(parents=True, exist_ok=True)
-    for cierre in cierres_semanales:
-        semana_folder = cierre.parent.name if cierre.name == "Semanal" else cierre.name.replace("cierre_semanal_", "SEMANA_")
-        destino_base = destino_dir / semana_folder
-        destino_base.mkdir(parents=True, exist_ok=True)
-        candidatos = []
-        candidatos.extend((cierre / "04_Manifest_Semanal").glob("manifest_semanal_*.json"))
-        candidatos.extend((cierre / "04_Manifest_Semanal").glob("resumen_semanal_*.txt"))
-        candidatos.extend((cierre / "05_Validaciones").glob("validacion_local_semanal_*.json"))
-        candidatos.extend((cierre / "05_Validaciones").glob("validacion_remota_semanal_*.json"))
-        for origen in candidatos:
-            try:
-                info = copiar_archivo(origen, destino_base / origen.name, "soporte_semana")
-                if info:
-                    items.append(info)
-            except Exception as exc:
-                print(f"ADVERTENCIA: no se pudo copiar soporte semanal {origen}: {type(exc).__name__}: {exc}")
-    return items
-
 
 def redactar_env_line(line: str) -> str:
     if not line or line.strip().startswith("#") or "=" not in line:
@@ -874,35 +800,6 @@ def validar_archivos_manifest(base: Path, archivos: list[dict[str, Any]]) -> dic
     }
 
 
-def crear_zip_mensual(cierre_dir: Path, destino: Path, periodo: str) -> dict[str, Any]:
-    destino.parent.mkdir(parents=True, exist_ok=True)
-    archivos = [
-        p for p in sorted(cierre_dir.rglob("*"))
-        if p.is_file() and "07_Paquete_Mensual" not in p.parts
-    ]
-    with zipfile.ZipFile(
-        destino, mode="w", compression=zipfile.ZIP_DEFLATED, allowZip64=True
-    ) as zf:
-        for path in archivos:
-            zf.write(path, arcname=path.relative_to(cierre_dir).as_posix())
-    with zipfile.ZipFile(destino, mode="r") as zf:
-        archivo_corrupto = zf.testzip()
-        nombres = zf.namelist()
-    if archivo_corrupto:
-        raise RuntimeError(f"ZIP mensual corrupto en: {archivo_corrupto}")
-    if len(nombres) != len(archivos):
-        raise RuntimeError(
-            f"ZIP incompleto. Esperados={len(archivos)}, encontrados={len(nombres)}"
-        )
-    return {
-        "periodo": periodo,
-        "archivo": f"07_Paquete_Mensual/{destino.name}",
-        "bytes": destino.stat().st_size,
-        "sha256": sha256_file(destino),
-        "archivos_incluidos": len(nombres),
-        "testzip_ok": True,
-    }
-
 
 def publicar_atomico(staging_dir: Path, cierre_dir: Path, reemplazar: bool) -> None:
     anterior: Optional[Path] = None
@@ -927,11 +824,17 @@ def publicar_atomico(staging_dir: Path, cierre_dir: Path, reemplazar: bool) -> N
 
 def generar_resumen_txt(path: Path, manifest: dict[str, Any]) -> None:
     lines = [
-        "CIERRE MENSUAL LOCAL SEGURO V1 - FACTURAS JOYCO",
+        "CIERRE MENSUAL LOCAL SEGURO V4 - FACTURAS JOYCO",
         "=" * 90,
         f"Version: {manifest['version']}",
         f"Periodo: {manifest['periodo']}",
         f"Rango: {manifest['fecha_inicio']} a {manifest['fecha_fin']}",
+        (
+            "Trimestre: "
+            f"{manifest['trimestre']['nombre_carpeta']} "
+            f"({manifest['trimestre']['fecha_inicio']} a "
+            f"{manifest['trimestre']['fecha_fin']})"
+        ),
         f"Generado: {manifest['generado_en']}",
         f"Root: {manifest['root']}",
         f"Carpeta cierre: {manifest['carpeta_cierre']}",
@@ -942,14 +845,13 @@ def generar_resumen_txt(path: Path, manifest: dict[str, Any]) -> None:
         f"- Metodo seleccion: {manifest['seleccion_filas'].get('metodo_seleccion')}",
         f"- Auditorias copiadas: {manifest['conteos']['auditorias']}",
         f"- Logs copiados: {manifest['conteos']['logs']}",
-        f"- Soportes semanales copiados: {manifest['conteos']['soporte_semanas']}",
         f"- Total archivos evidencia: {manifest['total_archivos']}",
         f"- Total bytes evidencia: {manifest['total_bytes']}",
         "",
         "Regla aplicada:",
         "- Este cierre mensual se calcula desde data/facturas.xlsx + auditorias reales del mes.",
         "- No consolida desde cierres semanales ni diarios para evitar arrastrar errores previos.",
-        "- Los cierres semanales se copian solo como soporte/evidencia, si existen.",
+        "- Los cierres semanales y diarios permanecen en sus carpetas independientes; no se copian dentro de Mensual.",
         "- No se incluye .env real ni secretos.",
         "=" * 90,
     ]
@@ -967,21 +869,48 @@ def main() -> int:
         print(f"Periodo mensual no valido: {exc}")
         return 2
 
+    try:
+        trimestre_inicio = cargar_trimestre_activo(ROOT, inicio)
+        trimestre_fin = cargar_trimestre_activo(ROOT, fin)
+    except Exception as exc:
+        print(f"Trimestre operativo no valido para el mes: {exc}")
+        return 2
+
+    if (
+        trimestre_inicio["nombre_carpeta"]
+        != trimestre_fin["nombre_carpeta"]
+    ):
+        print(
+            "Trimestre operativo no valido para el mes: el inicio y el fin "
+            "quedaron en trimestres distintos."
+        )
+        return 2
+
+    trimestre = trimestre_inicio
     anio = inicio.strftime("%Y")
     mes_nombre = mes_carpeta(inicio)
     periodo = periodo_nombre(inicio, fin)
 
-    mes_dir = CIERRES_DIR / anio / mes_nombre
+    mes_dir = (
+        CIERRES_DIR
+        / Path(trimestre["ruta_relativa"])
+        / mes_nombre
+    )
     cierre_dir = mes_dir / "Mensual"
     staging_dir = mes_dir / f".Mensual.generando_{os.getpid()}"
 
     print("=" * 100)
-    print("CIERRE MENSUAL LOCAL SEGURO V2 - FACTURAS JOYCO")
+    print("CIERRE MENSUAL LOCAL SEGURO V4 - FACTURAS JOYCO")
     print("=" * 100)
     print(f"Version: {VERSION_CIERRE}")
     print(f"Root: {ROOT}")
     print(f"Periodo: {periodo}")
     print(f"Rango: {inicio.isoformat()} a {fin.isoformat()}")
+    print(f"Trimestre activo: {trimestre['nombre_carpeta']}")
+    print(
+        "Rango trimestre: "
+        f"{trimestre['fecha_inicio']} a {trimestre['fecha_fin']}"
+    )
     print(f"Mes carpeta: {mes_nombre}")
     print(f"Carpeta local destino: {cierre_dir}")
     print(f"Dry-run: {args.dry_run}")
@@ -1004,7 +933,6 @@ def main() -> int:
     try:
         audit_files = recolectar_audits(inicio, fin)
         log_files = recolectar_logs(inicio, fin)
-        cierres_semanales = buscar_cierres_semanales_soporte(inicio, fin)
         headers, filas_mensuales, meta_seleccion = obtener_filas_mensuales_desde_excel(inicio, fin, audit_files)
 
         advertencias: list[str] = []
@@ -1015,15 +943,9 @@ def main() -> int:
             advertencias.append("No se encontraron logs especificos del mes.")
         if not filas_mensuales:
             advertencias.append("El Excel mensual no tendra filas de datos para este periodo.")
-        if not cierres_semanales:
-            advertencias.append(
-                "No se encontraron cierres semanales con validacion local y remota OK. "
-                "El calculo mensual no depende de ellos."
-            )
 
         print(f"Auditorias detectadas: {len(audit_files)}")
         print(f"Logs detectados: {len(log_files)}")
-        print(f"Cierres semanales soporte detectados: {len(cierres_semanales)}")
         print(f"Metodo seleccion filas: {meta_seleccion.get('metodo_seleccion')}")
         print(f"Filas mensuales detectadas: {len(filas_mensuales)}")
 
@@ -1046,22 +968,21 @@ def main() -> int:
 
         excel_dir = staging_dir / "01_Excel_Mensual"
         auditoria_dir = staging_dir / "02_Auditorias_Mes"
-        soporte_semanas_dir = staging_dir / "03_Soporte_Semanas"
         manifest_dir = staging_dir / "04_Manifest_Mensual"
         validaciones_dir = staging_dir / "05_Validaciones"
         logs_dir = staging_dir / "06_Logs_Mes"
-        paquete_dir = staging_dir / "07_Paquete_Mensual"
 
         excel_path = excel_dir / f"facturas_mensual_{periodo}.xlsx"
         manifest_path = manifest_dir / f"manifest_mensual_{periodo}.json"
         resumen_path = manifest_dir / f"resumen_mensual_{periodo}.txt"
         validacion_path = validaciones_dir / f"validacion_local_mensual_{periodo}.json"
-        zip_path = paquete_dir / f"cierre_mensual_{periodo}.zip"
-        validacion_paquete_path = paquete_dir / f"validacion_paquete_mensual_{periodo}.json"
 
         for d in (
-            excel_dir, auditoria_dir, soporte_semanas_dir, manifest_dir,
-            validaciones_dir, logs_dir, paquete_dir,
+            excel_dir,
+            auditoria_dir,
+            manifest_dir,
+            validaciones_dir,
+            logs_dir,
         ):
             d.mkdir(parents=True, exist_ok=True)
 
@@ -1069,13 +990,20 @@ def main() -> int:
         excel_info["archivo"] = f"01_Excel_Mensual/{excel_path.name}"
         auditorias_info = copiar_auditorias(audit_files, auditoria_dir)
         logs_info = copiar_logs(log_files, logs_dir)
-        soporte_semanas_info = copiar_soporte_semanas(cierres_semanales, soporte_semanas_dir)
         env_info = crear_snapshot_env_redactado(manifest_dir, periodo)
 
         generado_en = _dt.datetime.now(ZONA_HORARIA).isoformat(timespec="seconds")
         manifest = {
-            "tipo": "cierre_mensual_local_seguro_v2",
+            "tipo": "cierre_mensual_local_seguro_v4",
             "version": VERSION_CIERRE,
+            "trimestre": {
+                "periodo_activo": trimestre["periodo_activo"],
+                "nombre_carpeta": trimestre["nombre_carpeta"],
+                "fecha_inicio": trimestre["fecha_inicio"],
+                "fecha_fin": trimestre["fecha_fin"],
+                "ruta_relativa": trimestre["ruta_relativa"],
+                "state_path": trimestre["state_path"],
+            },
             "anio": anio,
             "mes_carpeta": mes_nombre,
             "periodo": periodo,
@@ -1092,24 +1020,22 @@ def main() -> int:
             "fuente_datos": {
                 "principal": rel(FACTURAS_PATH),
                 "auditorias": [rel(p) for p in audit_files],
-                "nota": "Los cierres semanales/diarios son soporte/evidencia, no fuente de calculo.",
+                "nota": "Los cierres semanales y diarios se validan en sus propias carpetas y no se duplican dentro del cierre mensual.",
             },
             "conteos": {
                 "filas_mensuales": len(filas_mensuales),
                 "auditorias": len(auditorias_info),
                 "logs": len(logs_info),
-                "soporte_semanas": len(soporte_semanas_info),
                 "config_redactada": 1 if env_info else 0,
             },
             "validacion_local": f"05_Validaciones/{validacion_path.name}",
-            "paquete_zip": f"07_Paquete_Mensual/{zip_path.name}",
             "advertencias": advertencias,
-            "nota": "Cierre mensual V2: fuente oficial Excel principal + auditorias reales del mes.",
+            "nota": "Cierre mensual V4: evidencia propia del mes, sin copiar semanas, diarios ni generar paquetes ZIP.",
         }
 
         archivos_base = listar_archivos_para_manifest(
             staging_dir,
-            excluir={manifest_path, resumen_path, validacion_path, zip_path, validacion_paquete_path},
+            excluir={manifest_path, resumen_path, validacion_path},
         )
         manifest["archivos"] = archivos_base
         manifest["total_archivos"] = len(archivos_base) + 1  # incluye el resumen
@@ -1118,7 +1044,7 @@ def main() -> int:
 
         archivos = listar_archivos_para_manifest(
             staging_dir,
-            excluir={manifest_path, validacion_path, zip_path, validacion_paquete_path},
+            excluir={manifest_path, validacion_path},
         )
         manifest["archivos"] = archivos
         manifest["total_archivos"] = len(archivos)
@@ -1143,6 +1069,14 @@ def main() -> int:
         validacion = {
             "tipo": "validacion_local_cierre_mensual",
             "version": VERSION_CIERRE,
+            "trimestre": {
+                "periodo_activo": trimestre["periodo_activo"],
+                "nombre_carpeta": trimestre["nombre_carpeta"],
+                "fecha_inicio": trimestre["fecha_inicio"],
+                "fecha_fin": trimestre["fecha_fin"],
+                "ruta_relativa": trimestre["ruta_relativa"],
+                "state_path": trimestre["state_path"],
+            },
             "periodo": periodo,
             "fecha_inicio": inicio.isoformat(),
             "fecha_fin": fin.isoformat(),
@@ -1153,8 +1087,6 @@ def main() -> int:
             "auditorias_copiadas": len(auditorias_info),
             "logs_detectados": len(log_files),
             "logs_copiados": len(logs_info),
-            "cierres_semanales_aprobados_detectados": len(cierres_semanales),
-            "archivos_soporte_semanal_copiados": len(soporte_semanas_info),
             "copias_completas": copias_ok,
             "archivos_sensibles_detectados": nombres_sensibles,
             "ok": (
@@ -1172,34 +1104,19 @@ def main() -> int:
         if not validacion["ok"]:
             raise RuntimeError("La validacion local mensual no termino en OK.")
 
-        zip_info = crear_zip_mensual(staging_dir, zip_path, periodo)
-        validacion_paquete = {
-            "tipo": "validacion_paquete_zip_cierre_mensual",
-            "version": VERSION_CIERRE,
-            "generado_en": _dt.datetime.now(ZONA_HORARIA).isoformat(timespec="seconds"),
-            **zip_info,
-            "ok": bool(zip_info.get("testzip_ok")),
-        }
-        validacion_paquete_path.write_text(
-            json.dumps(validacion_paquete, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
         publicar_atomico(staging_dir, cierre_dir, args.reemplazar)
 
         excel_final = cierre_dir / "01_Excel_Mensual" / excel_path.name
         manifest_final = cierre_dir / "04_Manifest_Mensual" / manifest_path.name
         resumen_final = cierre_dir / "04_Manifest_Mensual" / resumen_path.name
         validacion_final = cierre_dir / "05_Validaciones" / validacion_path.name
-        zip_final = cierre_dir / "07_Paquete_Mensual" / zip_path.name
         print(f"Excel mensual: {excel_final}")
         print(f"Filas Excel mensual: {excel_info['filas_datos']}")
         print(f"Auditorias copiadas: {len(auditorias_info)}")
         print(f"Logs copiados: {len(logs_info)}")
-        print(f"Soportes semanales copiados: {len(soporte_semanas_info)}")
         print(f"Manifest: {manifest_final}")
         print(f"Resumen: {resumen_final}")
         print(f"Validacion local: {validacion_final}")
-        print(f"ZIP mensual: {zip_final}")
-        print(f"ZIP SHA256: {zip_info['sha256']}")
         print(f"Total archivos evidencia: {manifest['total_archivos']}")
         print(f"Total bytes evidencia: {manifest['total_bytes']}")
         if advertencias:
@@ -1208,13 +1125,13 @@ def main() -> int:
                 print(f"  - {adv}")
 
         print("=" * 100)
-        print("Cierre mensual local V2 generado y publicado atomicamente.")
+        print("Cierre mensual local V4 generado y publicado atomicamente.")
         print("Siguiente paso: subir/validar en OneDrive con scripts\\subir_cierre_mensual_sharepoint.py")
         print("=" * 100)
         return 0
 
     except Exception as exc:
-        print(f"ERROR generando cierre mensual local V2: {type(exc).__name__}: {exc}")
+        print(f"ERROR generando cierre mensual local V4: {type(exc).__name__}: {exc}")
         print("No subas ni archives nada hasta revisar el error.")
         return 1
     finally:

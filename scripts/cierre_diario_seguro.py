@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 JOYCO - Facturas Procesador
-Cierre diario local seguro V2
+Cierre diario local seguro V3
 
-Política V2:
+Política V3:
 - El cierre diario NO copia el histórico completo de facturas.xlsx.
 - Genera un Excel diario con las facturas registradas/procesadas en la fecha del cierre.
 - Incluye auditorías del día, logs de producción local/VPS, manifest, resumen y validación local.
@@ -11,7 +11,8 @@ Política V2:
 - No incluye .env real ni secretos.
 
 Estructura generada:
-  data/cierres_diarios/YYYY/YYYY-MM_MesNombre/SEMANA_YYYY-MM-DD_a_YYYY-MM-DD/Diario_YYYY-MM-DD/
+  data/cierres_diarios/YYYY/TRIMESTRE_YYYY-MM-DD_A_YYYY-MM-DD/
+    YYYY-MM_MesNombre/SEMANA_YYYY-MM-DD_a_YYYY-MM-DD/Diario_YYYY-MM-DD/
     01_Excel_Diario/facturas_diario_YYYY-MM-DD.xlsx
     02_Auditoria/audit_*.csv
     03_Logs/logs_produccion_YYYY-MM-DD/
@@ -51,7 +52,9 @@ try:
 except Exception:
     pass
 
-VERSION_CIERRE = "2026-07-15-CIERRE-DIARIO-SEGURO-V2-MINIMOS-LOGS-VPS"
+from trimestre_activo import cargar_trimestre_activo
+
+VERSION_CIERRE = "2026-08-04-CIERRE-DIARIO-SEGURO-V3-JERARQUIA-TRIMESTRAL"
 
 DATA_DIR = ROOT / "data"
 AUDIT_DIR = DATA_DIR / "audit"
@@ -155,7 +158,7 @@ EXCEL_TABLE_NAME = "TblFacturasDiario"
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Genera cierre diario local seguro V2.")
+    parser = argparse.ArgumentParser(description="Genera cierre diario local seguro V3.")
     parser.add_argument(
         "--fecha",
         default=_dt.datetime.now().strftime("%Y-%m-%d"),
@@ -897,10 +900,12 @@ def validar_excel_generado(path: Path, expected_columns: int) -> dict[str, Any]:
 
 def generar_resumen_txt(path: Path, manifest: dict[str, Any]) -> None:
     lines = [
-        "CIERRE DIARIO LOCAL SEGURO V2 - FACTURAS JOYCO",
+        "CIERRE DIARIO LOCAL SEGURO V3 - FACTURAS JOYCO",
         "=" * 90,
         f"Versión: {manifest['version']}",
         f"Fecha cierre: {manifest['fecha']}",
+        f"Trimestre: {manifest['trimestre']['nombre_carpeta']}",
+        f"Rango trimestre: {manifest['trimestre']['fecha_inicio']} a {manifest['trimestre']['fecha_fin']}",
         f"Generado: {manifest['generado_en']}",
         f"Root: {manifest['root']}",
         f"Carpeta cierre: {manifest['carpeta_cierre']}",
@@ -955,10 +960,12 @@ def main() -> int:
     mes_nombre = nombre_mes_dir(fecha_date)
     semana_inicio, semana_fin = rango_semana_lunes_domingo(fecha_date)
     semana_nombre = f"SEMANA_{semana_inicio.isoformat()}_a_{semana_fin.isoformat()}"
+    trimestre = cargar_trimestre_activo(ROOT, fecha_date)
 
     cierre_dia_dir = (
         CIERRES_DIR
-        / anio
+        / trimestre["anio"]
+        / trimestre["nombre_carpeta"]
         / mes_nombre
         / semana_nombre
         / f"Diario_{fecha}"
@@ -975,11 +982,16 @@ def main() -> int:
     validacion_path = validaciones_dir / f"validacion_local_{fecha}.json"
 
     print("=" * 100)
-    print("CIERRE DIARIO LOCAL SEGURO V2 - FACTURAS JOYCO")
+    print("CIERRE DIARIO LOCAL SEGURO V3 - FACTURAS JOYCO")
     print("=" * 100)
     print(f"Versión: {VERSION_CIERRE}")
     print(f"Root: {ROOT}")
     print(f"Fecha: {fecha}")
+    print(f"Trimestre activo: {trimestre['nombre_carpeta']}")
+    print(
+        "Rango trimestre: "
+        f"{trimestre['fecha_inicio']} a {trimestre['fecha_fin']}"
+    )
     print(f"Mes carpeta: {mes_nombre}")
     print(f"Semana: {semana_inicio.isoformat()} a {semana_fin.isoformat()}")
     print(f"Carpeta local destino: {cierre_dia_dir}")
@@ -1037,6 +1049,7 @@ def main() -> int:
             "tipo": "validacion_local_cierre_diario",
             "version": VERSION_CIERRE,
             "fecha": fecha,
+            "trimestre": trimestre,
             "generado_en": _dt.datetime.now().isoformat(timespec="seconds"),
             "excel": validacion_excel,
             "auditorias_detectadas": len(audit_files),
@@ -1049,9 +1062,10 @@ def main() -> int:
         validacion_path.write_text(json.dumps(validacion, ensure_ascii=False, indent=2), encoding="utf-8")
 
         manifest = {
-            "tipo": "cierre_diario_local_seguro_v2",
+            "tipo": "cierre_diario_local_seguro_v3",
             "version": VERSION_CIERRE,
             "fecha": fecha,
+            "trimestre": trimestre,
             "anio": anio,
             "mes": mes,
             "mes_nombre": mes_nombre,
@@ -1074,7 +1088,10 @@ def main() -> int:
             },
             "validacion_local": rel(validacion_path),
             "advertencias": advertencias,
-            "nota": "Cierre diario V2: evidencia solo del día, no histórico completo.",
+            "nota": (
+                "Cierre diario V3: evidencia solo del día, no histórico completo, "
+                "almacenada dentro del trimestre operativo activo."
+            ),
         }
 
         # Totales preliminares antes de generar el resumen.
@@ -1116,13 +1133,13 @@ def main() -> int:
             return 3
 
         print("=" * 100)
-        print("✅ Cierre diario local V2 generado correctamente.")
-        print("Siguiente paso: subir/validar en OneDrive con el script remoto V2.")
+        print("✅ Cierre diario local V3 generado correctamente.")
+        print("Siguiente paso: subir/validar en OneDrive con el uploader trimestral-compatible.")
         print("=" * 100)
         return 0
 
     except Exception as exc:
-        print(f"❌ Error generando cierre diario local V2: {type(exc).__name__}: {exc}")
+        print(f"❌ Error generando cierre diario local V3: {type(exc).__name__}: {exc}")
         print("⚠️ No subas ni archives nada hasta revisar el error.")
         return 1
     finally:

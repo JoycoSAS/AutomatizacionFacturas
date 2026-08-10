@@ -1,15 +1,47 @@
 ﻿# -*- coding: utf-8 -*-
 """
 JOYCO - Facturas Procesador
-Subida de cierre trimestral a SharePoint.
+Sincronización segura de la jerarquía trimestral completa en un único destino.
+
+Estructura oficial:
+
+Backups_Facturas_Produccion/
+└── YYYY/
+    └── TRIMESTRE_YYYY-MM-DD_A_YYYY-MM-DD/
+        ├── YYYY-MM_Mes/
+        │   ├── SEMANA_YYYY-MM-DD_a_YYYY-MM-DD/
+        │   │   ├── Diario_YYYY-MM-DD/
+        │   │   └── Semanal/
+        │   └── Mensual/
+        └── Trimestral/
+            ├── 01_Excel_Cierre/
+            ├── 02_Manifest/
+            ├── 03_Validaciones/
+            └── 04_Resumen/
+
+Principios:
+- Existe un único destino oficial: Backups_Facturas_Produccion.
+- Se sincroniza el contenedor completo del trimestre.
+- Cada archivo permanece en una sola ubicación dentro de la jerarquía.
+- No se copian diarios dentro de Semanal, semanas dentro de Mensual ni meses
+  dentro de Trimestral.
+- Los archivos remotos idénticos se verifican y se omiten; no se vuelven a
+  subir ni generan versiones innecesarias.
+- Los archivos faltantes se crean y los diferentes se actualizan.
+- Nunca se eliminan archivos remotos desde este script.
+- No se reemplaza data/facturas.xlsx ni el Excel activo de SharePoint.
+- No se actualiza cierre_trimestral_state.json.
+- No se ejecutan autoeliminaciones; esa fase se implementa y prueba aparte.
 
 Modos:
-- --dry-run: solo diagnostica y calcula rutas. No sube archivos.
-- --upload-cierre --confirmar SUBIR_CIERRE_TRIMESTRAL:
-  sube el cierre trimestral local a SharePoint principal y secundario,
-  con verificación fuerte.
-
-Esta versión NO reemplaza el Excel activo de SharePoint.
+- --dry-run:
+  valida únicamente la jerarquía local y muestra el destino calculado.
+  No usa Microsoft Graph.
+- --plan-remoto:
+  consulta el destino en modo de solo lectura y clasifica archivos como
+  idénticos, faltantes, diferentes o extras. No crea ni modifica nada.
+- --upload-cierre --confirmar SINCRONIZAR_TRIMESTRE_COMPLETO:
+  sincroniza y verifica la jerarquía trimestral completa en el único destino.
 """
 
 from __future__ import annotations
@@ -40,49 +72,84 @@ except Exception:
     pass
 
 from services.m365.token import get_access_token
-
-try:
-    from services.m365.sp_graph import SP_FOLDER as BASE_SP
-except Exception:
-    BASE_SP = ""
+from trimestre_activo import cargar_trimestre_activo
 
 DATA_DIR = ROOT / "data"
-CIERRES_TRIMESTRALES_DIR = DATA_DIR / "cierres_trimestrales"
-TMP_VERIFY_DIR = DATA_DIR / "_tmp_verificacion_sharepoint_trimestral"
+STATE_PATH = DATA_DIR / "state" / "cierre_trimestral_state.json"
+FACTURAS_PATH = DATA_DIR / "facturas.xlsx"
+CIERRES_DIR = DATA_DIR / "cierres_diarios"
+TMP_VERIFY_DIR = DATA_DIR / "_tmp_verificacion_jerarquia_trimestral"
 
-VERSION_UPLOAD = "2026-07-30-UPLOAD-CIERRE-TRIMESTRAL-V3.2-EVIDENCIA-REMOTA-LOGS-SEGUROS"
+VERSION_UPLOAD = (
+    "2026-08-06-UPLOAD-CIERRE-TRIMESTRAL-V6-UN-DESTINO-JERARQUIA-COMPLETA"
+)
 GRAPH = "https://graph.microsoft.com/v1.0"
-CONFIRMACION_UPLOAD = "SUBIR_CIERRE_TRIMESTRAL"
+CONFIRMACION_UPLOAD = "SINCRONIZAR_TRIMESTRE_COMPLETO"
+ESTADO_PREPARADO = "PREPARADO_PENDIENTE_VALIDACION_REMOTA"
+ROOT_OFICIAL = "Backups_Facturas_Produccion"
 
 load_dotenv(ROOT / ".env")
 
-BASE_SP = (BASE_SP or os.getenv("SP_FOLDER") or "").strip().strip("/")
+BACKUP_DRIVE_ID = (
+    os.getenv("BACKUP_DRIVE_ID")
+    or os.getenv("SP_BACKUP2_DRIVE_ID")
+    or ""
+).strip()
+BACKUP_ROOT_FOLDER = (
+    os.getenv("BACKUP_ROOT_FOLDER")
+    or os.getenv("SP_BACKUP2_FOLDER")
+    or ""
+).strip().strip("/")
 
-SP_DRIVE_ID = (os.getenv("SP_DRIVE_ID") or "").strip()
-SP_BACKUP2_HOSTNAME = (os.getenv("SP_BACKUP2_HOSTNAME") or "").strip()
-SP_BACKUP2_SITE_PATH = (os.getenv("SP_BACKUP2_SITE_PATH") or "").strip()
-SP_BACKUP2_DRIVE_ID = (os.getenv("SP_BACKUP2_DRIVE_ID") or "").strip()
-SP_BACKUP2_FOLDER = (os.getenv("SP_BACKUP2_FOLDER") or "").strip().strip("/")
-
-EXCLUIR_NOMBRES = {".env"}
-EXCLUIR_EXT = {".tmp", ".lock"}
+EXCLUIR_NOMBRES = {
+    ".env",
+    "Thumbs.db",
+    "desktop.ini",
+}
+EXCLUIR_EXT = {".tmp", ".lock", ".pyc"}
 EXCEL_EXT = {".xlsx", ".xlsm"}
 PREFIJO_VALIDACION_REMOTA = "validacion_remota_cierre_trimestral_"
+PREFIJOS_CONTROL_NO_PUBLICAR = (
+    PREFIJO_VALIDACION_REMOTA,
+    "estado_finalizacion_cierre_trimestral_",
+    "RESUMEN_FINALIZACION_CIERRE_TRIMESTRAL_",
+)
+DIRECTORIOS_TRIMESTRALES = {
+    "01_Excel_Cierre",
+    "02_Manifest",
+    "03_Validaciones",
+    "04_Resumen",
+}
+DIRECTORIOS_DUPLICACION_PROHIBIDOS = {
+    "03_Soporte_Diarios",
+    "03_Soporte_Semanas",
+    "03_Respaldos_Mensuales_Validados",
+    "07_Paquete_Mensual",
+}
+RE_MES = re.compile(r"^(\d{4})-(\d{2})_.+$")
+RE_SEMANA = re.compile(
+    r"^SEMANA_(\d{4}-\d{2}-\d{2})_[aA]_(\d{4}-\d{2}-\d{2})$"
+)
+RE_DIARIO = re.compile(r"^Diario_(\d{4}-\d{2}-\d{2})$")
 
 
 def ssl_verify() -> bool:
-    return (os.getenv("SSL_VERIFY") or "true").strip().lower() not in {"0", "false", "no", "off"}
+    return (os.getenv("SSL_VERIFY") or "true").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
 
 
-def headers() -> dict:
-    token = get_access_token()
-    return {"Authorization": f"Bearer {token}"}
+def headers() -> dict[str, str]:
+    return {"Authorization": f"Bearer {get_access_token()}"}
 
 
-def h_json() -> dict:
-    h = headers()
-    h["Content-Type"] = "application/json"
-    return h
+def headers_json() -> dict[str, str]:
+    resultado = headers()
+    resultado["Content-Type"] = "application/json"
+    return resultado
 
 
 def encode_path(path: str) -> str:
@@ -94,16 +161,14 @@ def encode_drive_id(drive_id: str) -> str:
 
 
 def resumen_drive(drive_id: str) -> str:
-    """Devuelve una referencia útil sin exponer el identificador completo."""
-    drive_id = str(drive_id or "").strip()
-    if not drive_id:
+    valor = str(drive_id or "").strip()
+    if not valor:
         return "(vacío)"
-    sufijo = drive_id[-6:] if len(drive_id) >= 6 else drive_id
-    return f"***{sufijo} (longitud={len(drive_id)})"
+    sufijo = valor[-6:] if len(valor) >= 6 else valor
+    return f"***{sufijo} (longitud={len(valor)})"
 
 
 def url_graph_segura(url: str) -> str:
-    """Enmascara identificadores de drive e item antes de escribir una URL en logs."""
     valor = str(url or "")
 
     def ocultar(match: re.Match[str]) -> str:
@@ -116,71 +181,826 @@ def url_graph_segura(url: str) -> str:
     return valor
 
 
-def graph_get(url: str, *, ok=(200,), timeout=60):
-    r = requests.get(url, headers=headers(), timeout=timeout, verify=ssl_verify())
-    if r.status_code not in ok:
-        raise RuntimeError(f"GET {r.status_code} {url_graph_segura(url)} -> {r.text[:500]}")
-    return r
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
-def graph_post(url: str, body: dict, *, ok=(200, 201), timeout=60):
-    r = requests.post(url, headers=h_json(), json=body, timeout=timeout, verify=ssl_verify())
-    if r.status_code not in ok:
-        raise RuntimeError(f"POST {r.status_code} {url_graph_segura(url)} -> {r.text[:500]}")
-    return r
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as archivo:
+        for bloque in iter(lambda: archivo.read(1024 * 1024), b""):
+            digest.update(bloque)
+    return digest.hexdigest()
 
 
-def graph_put_content(drive_id: str, remote_path: str, local_file: Path) -> dict:
-    url = f"{GRAPH}/drives/{encode_drive_id(drive_id)}/root:/{encode_path(remote_path)}:/content"
-    data = local_file.read_bytes()
-    r = requests.put(url, headers=headers(), data=data, timeout=300, verify=ssl_verify())
-    if r.status_code not in (200, 201):
-        raise RuntimeError(f"PUT {r.status_code} {url_graph_segura(url)} -> {r.text[:500]}")
-    return r.json()
+def normalizar_valor_excel(valor: Any) -> str:
+    if valor is None:
+        return "<NULL>"
+    if isinstance(valor, (datetime.datetime, datetime.date, datetime.time)):
+        return valor.isoformat()
+    if isinstance(valor, float):
+        return repr(valor)
+    return f"{type(valor).__name__}:{valor}"
 
 
-def graph_download_item_content(drive_id: str, item_id: str) -> bytes:
-    url = f"{GRAPH}/drives/{encode_drive_id(drive_id)}/items/{quote(item_id, safe='')}/content"
-    r = requests.get(url, headers=headers(), timeout=300, verify=ssl_verify(), allow_redirects=True)
-    if r.status_code != 200:
-        raise RuntimeError(f"DOWNLOAD {r.status_code} {url_graph_segura(url)} -> {r.text[:500]}")
-    return r.content
+def digest_datos_excel(path: Path) -> Tuple[str, dict[str, Any]]:
+    digest = hashlib.sha256()
+    resumen: dict[str, Any] = {
+        "sheets": [],
+        "non_empty_cells": 0,
+        "max_rows_total": 0,
+        "max_cols_total": 0,
+    }
+
+    libro = load_workbook(
+        path,
+        read_only=True,
+        data_only=False,
+        keep_links=False,
+    )
+    try:
+        nombres = list(libro.sheetnames)
+        digest.update(json.dumps(nombres, ensure_ascii=False).encode("utf-8"))
+
+        for hoja in libro.worksheets:
+            info = {
+                "title": hoja.title,
+                "max_row": int(hoja.max_row or 0),
+                "max_column": int(hoja.max_column or 0),
+                "non_empty_cells": 0,
+            }
+            resumen["max_rows_total"] += info["max_row"]
+            resumen["max_cols_total"] += info["max_column"]
+            digest.update(
+                f"\n[SHEET]{hoja.title}|{hoja.max_row}|{hoja.max_column}".encode(
+                    "utf-8"
+                )
+            )
+
+            for fila in hoja.iter_rows():
+                for celda in fila:
+                    if celda.value is None:
+                        continue
+                    info["non_empty_cells"] += 1
+                    resumen["non_empty_cells"] += 1
+                    payload = (
+                        f"{hoja.title}|{celda.coordinate}|"
+                        f"{normalizar_valor_excel(celda.value)}\n"
+                    )
+                    digest.update(payload.encode("utf-8", errors="replace"))
+
+            resumen["sheets"].append(info)
+    finally:
+        libro.close()
+
+    return digest.hexdigest(), resumen
 
 
-def obtener_item_por_path(drive_id: str, remote_path: str) -> Optional[dict]:
-    """
-    Recupera metadatos de un archivo remoto por su ruta.
+def leer_json(path: Path, descripcion: str) -> dict[str, Any]:
+    if not path.exists() or not path.is_file():
+        raise RuntimeError(f"No existe {descripcion}: {path}")
+    try:
+        datos = json.loads(path.read_text(encoding="utf-8-sig"))
+    except Exception as exc:
+        raise RuntimeError(
+            f"No fue posible leer {descripcion}: {path}: {exc}"
+        ) from exc
+    if not isinstance(datos, dict):
+        raise RuntimeError(f"{descripcion} no contiene un objeto JSON: {path}")
+    return datos
 
-    Se usa como contingencia cuando Microsoft Graph devuelve un error
-    transitorio durante el PUT, pero el archivo sí alcanzó a guardarse.
-    """
+
+def parse_fecha_iso(value: Any, campo: str) -> datetime.date:
+    try:
+        return datetime.date.fromisoformat(str(value or "").strip())
+    except Exception as exc:
+        raise RuntimeError(
+            f"Fecha inválida en {campo}: {value!r}. Usa YYYY-MM-DD."
+        ) from exc
+
+
+def validar_path_exacto(registrado: Any, esperado: Path, descripcion: str) -> None:
+    texto = str(registrado or "").strip()
+    if not texto:
+        raise RuntimeError(f"La preparación no registra {descripcion}.")
+    actual = Path(texto)
+    if actual.resolve() != esperado.resolve():
+        raise RuntimeError(
+            f"{descripcion} no coincide con la ruta oficial. "
+            f"Registrado={actual} | Esperado={esperado}"
+        )
+
+
+def debe_incluir_directorio(path: Path) -> bool:
+    nombre = path.name
+    if nombre == "__pycache__":
+        return False
+    if nombre.startswith(".tmp_") or nombre.startswith("_tmp"):
+        return False
+    if nombre.startswith(".migrando-"):
+        return False
+    return True
+
+
+def debe_incluir_archivo(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    if path.name in EXCLUIR_NOMBRES:
+        return False
+    if path.name.startswith("~$"):
+        return False
+    if path.suffix.lower() in EXCLUIR_EXT:
+        return False
+    if any(not debe_incluir_directorio(Path(parte)) for parte in path.parts):
+        return False
+    if path.name.startswith(PREFIJOS_CONTROL_NO_PUBLICAR):
+        return False
+    return True
+
+
+def listar_directorios_locales(base: Path) -> list[Path]:
+    resultado = [
+        path
+        for path in base.rglob("*")
+        if path.is_dir()
+        and all(
+            debe_incluir_directorio(Path(parte))
+            for parte in path.relative_to(base).parts
+        )
+    ]
+    return sorted(
+        resultado,
+        key=lambda p: (
+            len(p.relative_to(base).parts),
+            p.as_posix().lower(),
+        ),
+    )
+
+
+def listar_archivos_locales(base: Path) -> list[Path]:
+    return sorted(
+        [path for path in base.rglob("*") if debe_incluir_archivo(path)],
+        key=lambda p: p.as_posix().lower(),
+    )
+
+
+def digest_archivos(archivos: list[Path], base: Path) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    total_bytes = 0
+    for archivo in archivos:
+        relativa = archivo.relative_to(base).as_posix()
+        tamano = archivo.stat().st_size
+        total_bytes += tamano
+        digest.update(
+            f"{relativa}|{tamano}|{sha256_file(archivo)}\n".encode("utf-8")
+        )
+    return digest.hexdigest(), total_bytes
+
+
+def digest_jerarquia_inferior(
+    carpeta_periodo: Path,
+    inicio: datetime.date,
+    fin: datetime.date,
+) -> tuple[str, int, int, int]:
+    digest = hashlib.sha256()
+    total_archivos = 0
+    total_bytes = 0
+    meses_detectados = 0
+
+    for mes_dir in sorted(
+        carpeta_periodo.iterdir(),
+        key=lambda p: p.name.lower(),
+    ):
+        if not mes_dir.is_dir() or mes_dir.name == "Trimestral":
+            continue
+
+        match = RE_MES.match(mes_dir.name)
+        if not match:
+            continue
+
+        try:
+            mes_fecha = datetime.date(
+                int(match.group(1)),
+                int(match.group(2)),
+                1,
+            )
+        except ValueError:
+            continue
+
+        if (mes_fecha.year, mes_fecha.month) < (inicio.year, inicio.month):
+            continue
+        if (mes_fecha.year, mes_fecha.month) > (fin.year, fin.month):
+            continue
+
+        meses_detectados += 1
+        archivos_mes = sorted(
+            [p for p in mes_dir.rglob("*") if p.is_file()],
+            key=lambda p: p.as_posix().lower(),
+        )
+
+        for archivo in archivos_mes:
+            relativa = archivo.relative_to(carpeta_periodo).as_posix()
+            tamano = archivo.stat().st_size
+            digest.update(
+                f"{relativa}|{tamano}|{sha256_file(archivo)}\n".encode("utf-8")
+            )
+            total_archivos += 1
+            total_bytes += tamano
+
+    if meses_detectados <= 0:
+        raise RuntimeError(
+            "La carpeta del trimestre no contiene carpetas mensuales."
+        )
+
+    return digest.hexdigest(), total_archivos, total_bytes, meses_detectados
+
+
+def validar_excel_limpio(path: Path) -> dict[str, Any]:
+    if not path.exists() or not path.is_file():
+        raise RuntimeError(f"No existe el Excel limpio candidato: {path}")
+
+    libro = load_workbook(
+        path,
+        read_only=False,
+        data_only=False,
+        keep_links=False,
+    )
+    try:
+        if "Facturas" not in libro.sheetnames:
+            raise RuntimeError("El candidato limpio no contiene la hoja Facturas.")
+        hoja = libro["Facturas"]
+        tabla = (
+            hoja.tables["TblFacturas"].ref
+            if "TblFacturas" in hoja.tables
+            else None
+        )
+        info = {
+            "filas": int(hoja.max_row or 0),
+            "filas_datos": max(int(hoja.max_row or 0) - 1, 0),
+            "columnas": int(hoja.max_column or 0),
+            "tabla": tabla,
+            "sha256": sha256_file(path),
+        }
+        if info["filas"] != 1 or info["columnas"] != 19 or tabla != "A1:S1":
+            raise RuntimeError(
+                "El Excel limpio candidato no conserva la estructura esperada: "
+                f"{info}"
+            )
+        return info
+    finally:
+        libro.close()
+
+
+def validar_estructura_jerarquica(
+    carpeta_periodo: Path,
+    fecha_inicio: datetime.date,
+    fecha_fin: datetime.date,
+) -> dict[str, Any]:
+    if not carpeta_periodo.exists() or not carpeta_periodo.is_dir():
+        raise RuntimeError(
+            f"No existe la carpeta local del trimestre: {carpeta_periodo}"
+        )
+
+    prohibidos = [
+        path
+        for path in carpeta_periodo.rglob("*")
+        if path.is_dir() and path.name in DIRECTORIOS_DUPLICACION_PROHIBIDOS
+    ]
+    if prohibidos:
+        raise RuntimeError(
+            "Se detectaron carpetas que duplican cierres inferiores y no "
+            "pertenecen a la estructura aprobada: "
+            + "; ".join(str(path) for path in prohibidos)
+        )
+
+    top_dirs = [
+        path
+        for path in carpeta_periodo.iterdir()
+        if path.is_dir() and debe_incluir_directorio(path)
+    ]
+    trimestrales = [path for path in top_dirs if path.name == "Trimestral"]
+    meses = [path for path in top_dirs if RE_MES.match(path.name)]
+    desconocidos = [
+        path
+        for path in top_dirs
+        if path.name != "Trimestral" and not RE_MES.match(path.name)
+    ]
+
+    if len(trimestrales) != 1:
+        raise RuntimeError(
+            "Debe existir exactamente una carpeta Trimestral en la raíz "
+            f"del periodo. Encontradas={len(trimestrales)}"
+        )
+    if not meses:
+        raise RuntimeError("El trimestre no contiene carpetas mensuales.")
+    if desconocidos:
+        raise RuntimeError(
+            "La raíz del trimestre contiene directorios no aprobados: "
+            + "; ".join(path.name for path in desconocidos)
+        )
+
+    carpeta_trimestral = trimestrales[0]
+    subdirs_trimestral = {
+        path.name
+        for path in carpeta_trimestral.iterdir()
+        if path.is_dir() and debe_incluir_directorio(path)
+    }
+    if subdirs_trimestral != DIRECTORIOS_TRIMESTRALES:
+        raise RuntimeError(
+            "La carpeta Trimestral no contiene exactamente la estructura "
+            f"aprobada. Encontrados={sorted(subdirs_trimestral)} | "
+            f"Esperados={sorted(DIRECTORIOS_TRIMESTRALES)}"
+        )
+
+    if any(RE_MES.match(path.name) for path in carpeta_trimestral.rglob("*") if path.is_dir()):
+        raise RuntimeError("Se detectaron carpetas mensuales dentro de Trimestral.")
+    if any(RE_SEMANA.match(path.name) for path in carpeta_trimestral.rglob("*") if path.is_dir()):
+        raise RuntimeError("Se detectaron semanas dentro de Trimestral.")
+    if any(RE_DIARIO.match(path.name) for path in carpeta_trimestral.rglob("*") if path.is_dir()):
+        raise RuntimeError("Se detectaron diarios dentro de Trimestral.")
+
+    resumen = {
+        "meses": 0,
+        "semanas": 0,
+        "diarios": 0,
+        "cierres_semanales": 0,
+        "cierres_mensuales": 0,
+        "cierres_trimestrales": 1,
+        "advertencias": [],
+    }
+
+    for mes_dir in sorted(meses, key=lambda p: p.name.lower()):
+        match_mes = RE_MES.match(mes_dir.name)
+        assert match_mes is not None
+        mes_clave = f"{match_mes.group(1)}-{match_mes.group(2)}"
+        resumen["meses"] += 1
+
+        hijos_dir = [
+            path
+            for path in mes_dir.iterdir()
+            if path.is_dir() and debe_incluir_directorio(path)
+        ]
+        semanas = [path for path in hijos_dir if RE_SEMANA.match(path.name)]
+        mensuales = [path for path in hijos_dir if path.name == "Mensual"]
+        desconocidos_mes = [
+            path
+            for path in hijos_dir
+            if path.name != "Mensual" and not RE_SEMANA.match(path.name)
+        ]
+        if desconocidos_mes:
+            raise RuntimeError(
+                f"El mes {mes_dir.name} contiene directorios no aprobados: "
+                + "; ".join(path.name for path in desconocidos_mes)
+            )
+        if len(mensuales) > 1:
+            raise RuntimeError(
+                f"El mes {mes_dir.name} contiene más de una carpeta Mensual."
+            )
+        if mensuales:
+            resumen["cierres_mensuales"] += 1
+        else:
+            resumen["advertencias"].append(
+                f"{mes_dir.name} no contiene cierre Mensual."
+            )
+
+        for semana_dir in sorted(semanas, key=lambda p: p.name.lower()):
+            match_semana = RE_SEMANA.match(semana_dir.name)
+            assert match_semana is not None
+            inicio_semana = parse_fecha_iso(match_semana.group(1), "inicio semana")
+            fin_semana = parse_fecha_iso(match_semana.group(2), "fin semana")
+            if inicio_semana > fin_semana:
+                raise RuntimeError(
+                    f"Semana con rango invertido: {semana_dir.name}"
+                )
+            if fin_semana.strftime("%Y-%m") != mes_clave:
+                raise RuntimeError(
+                    "La semana debe pertenecer al mes de su fecha final. "
+                    f"Semana={semana_dir.name} | Mes={mes_dir.name}"
+                )
+
+            resumen["semanas"] += 1
+            hijos_semana = [
+                path
+                for path in semana_dir.iterdir()
+                if path.is_dir() and debe_incluir_directorio(path)
+            ]
+            diarios = [path for path in hijos_semana if RE_DIARIO.match(path.name)]
+            semanales = [path for path in hijos_semana if path.name == "Semanal"]
+            desconocidos_semana = [
+                path
+                for path in hijos_semana
+                if path.name != "Semanal" and not RE_DIARIO.match(path.name)
+            ]
+            if desconocidos_semana:
+                raise RuntimeError(
+                    f"La semana {semana_dir.name} contiene directorios no aprobados: "
+                    + "; ".join(path.name for path in desconocidos_semana)
+                )
+            if len(semanales) > 1:
+                raise RuntimeError(
+                    f"La semana {semana_dir.name} contiene más de una carpeta Semanal."
+                )
+            if semanales:
+                resumen["cierres_semanales"] += 1
+                diarios_dentro_semanal = [
+                    path
+                    for path in semanales[0].rglob("*")
+                    if path.is_dir() and RE_DIARIO.match(path.name)
+                ]
+                if diarios_dentro_semanal:
+                    raise RuntimeError(
+                        "Se detectaron diarios copiados dentro de Semanal: "
+                        + "; ".join(str(path) for path in diarios_dentro_semanal)
+                    )
+            else:
+                resumen["advertencias"].append(
+                    f"{semana_dir.name} no contiene cierre Semanal."
+                )
+
+            for diario_dir in diarios:
+                match_diario = RE_DIARIO.match(diario_dir.name)
+                assert match_diario is not None
+                fecha_diario = parse_fecha_iso(match_diario.group(1), "fecha diario")
+                if not (inicio_semana <= fecha_diario <= fin_semana):
+                    raise RuntimeError(
+                        "El diario está fuera del rango de su semana. "
+                        f"Diario={diario_dir.name} | Semana={semana_dir.name}"
+                    )
+                if not (fecha_inicio <= fecha_diario <= fecha_fin):
+                    raise RuntimeError(
+                        "El diario está fuera del rango del trimestre. "
+                        f"Diario={diario_dir.name} | "
+                        f"Trimestre={fecha_inicio} a {fecha_fin}"
+                    )
+                resumen["diarios"] += 1
+
+    return resumen
+
+
+def resolver_preparacion_trimestral() -> dict[str, Any]:
+    estado_activo = leer_json(STATE_PATH, "el estado trimestral activo")
+    if str(estado_activo.get("estado") or "").strip().upper() != "ACTIVO":
+        raise RuntimeError("El estado trimestral no está ACTIVO.")
+
+    fecha_inicio = parse_fecha_iso(
+        estado_activo.get("fecha_inicio_periodo_activo"),
+        "fecha_inicio_periodo_activo",
+    )
+    fecha_fin = parse_fecha_iso(
+        estado_activo.get("proximo_cierre_estimado"),
+        "proximo_cierre_estimado",
+    )
+    trimestre_inicio = cargar_trimestre_activo(ROOT, fecha_inicio)
+    trimestre_fin = cargar_trimestre_activo(ROOT, fecha_fin)
+
+    if trimestre_inicio["ruta_relativa"] != trimestre_fin["ruta_relativa"]:
+        raise RuntimeError(
+            "El helper trimestral devolvió rutas distintas para el periodo activo."
+        )
+
+    carpeta_periodo = CIERRES_DIR / Path(trimestre_fin["ruta_relativa"])
+    estructura = validar_estructura_jerarquica(
+        carpeta_periodo,
+        fecha_inicio,
+        fecha_fin,
+    )
+    carpeta_trimestral = carpeta_periodo / "Trimestral"
+    carpeta_excel = carpeta_trimestral / "01_Excel_Cierre"
+    carpeta_manifest = carpeta_trimestral / "02_Manifest"
+    carpeta_validaciones = carpeta_trimestral / "03_Validaciones"
+    carpeta_resumen = carpeta_trimestral / "04_Resumen"
+
+    estados_preparacion = sorted(
+        carpeta_validaciones.glob("estado_preparacion_cierre_trimestral_*.json")
+    )
+    if len(estados_preparacion) != 1:
+        raise RuntimeError(
+            "Se esperaba exactamente un estado de preparación y se encontraron "
+            f"{len(estados_preparacion)}."
+        )
+    estado_preparacion_path = estados_preparacion[0]
+    preparacion = leer_json(
+        estado_preparacion_path,
+        "el estado de preparación trimestral",
+    )
+
+    if preparacion.get("estado") != ESTADO_PREPARADO:
+        raise RuntimeError(
+            f"Estado de preparación inesperado: {preparacion.get('estado')!r}"
+        )
+    politica_preparacion = str(preparacion.get("politica_subida") or "").strip()
+    if politica_preparacion not in {
+        "SOLO_CARPETA_TRIMESTRAL",
+        "JERARQUIA_COMPLETA_UN_DESTINO",
+    }:
+        raise RuntimeError(
+            "Política de preparación no reconocida: "
+            f"{politica_preparacion!r}"
+        )
+
+    if str(preparacion.get("periodo") or "").strip() != str(
+        trimestre_fin["periodo_activo"]
+    ):
+        raise RuntimeError("El periodo preparado no coincide con el activo.")
+    if str(preparacion.get("nombre_carpeta_trimestre") or "").strip() != str(
+        trimestre_fin["nombre_carpeta"]
+    ):
+        raise RuntimeError("La carpeta preparada no coincide con el estado.")
+    if str(preparacion.get("fecha_inicio") or "").strip() != fecha_inicio.isoformat():
+        raise RuntimeError("La fecha inicial de la preparación es distinta.")
+    if str(preparacion.get("fecha_fin") or "").strip() != fecha_fin.isoformat():
+        raise RuntimeError("La fecha final de la preparación es distinta.")
+
+    validar_path_exacto(
+        preparacion.get("carpeta_periodo"),
+        carpeta_periodo,
+        "la carpeta del periodo",
+    )
+    validar_path_exacto(
+        preparacion.get("carpeta_cierre_trimestral"),
+        carpeta_trimestral,
+        "la carpeta de cierre trimestral",
+    )
+
+    excel_historico = carpeta_excel / (
+        f"facturas_{fecha_inicio.isoformat()}_a_{fecha_fin.isoformat()}.xlsx"
+    )
+    manifestes = sorted(carpeta_manifest.glob("manifest_cierre_trimestral_*.json"))
+    inventarios = sorted(
+        carpeta_manifest.glob("inventario_jerarquia_trimestral_*.json")
+    )
+    validaciones_locales = sorted(
+        carpeta_validaciones.glob("validacion_local_cierre_trimestral_*.json")
+    )
+    resumenes = sorted(
+        carpeta_resumen.glob("RESUMEN_CIERRE_TRIMESTRAL_*.txt")
+    )
+
+    for descripcion, encontrados in {
+        "manifest": manifestes,
+        "inventario": inventarios,
+        "validación local": validaciones_locales,
+        "resumen": resumenes,
+    }.items():
+        if len(encontrados) != 1:
+            raise RuntimeError(
+                f"Se esperaba exactamente un {descripcion} y se encontraron "
+                f"{len(encontrados)}."
+            )
+
+    manifest = manifestes[0]
+    inventario = inventarios[0]
+    validacion_local = validaciones_locales[0]
+    resumen = resumenes[0]
+
+    validar_path_exacto(
+        preparacion.get("excel_historico"),
+        excel_historico,
+        "el Excel histórico",
+    )
+    validar_path_exacto(preparacion.get("manifest"), manifest, "el manifest")
+    validar_path_exacto(
+        preparacion.get("inventario_jerarquia"),
+        inventario,
+        "el inventario",
+    )
+    validar_path_exacto(
+        preparacion.get("validacion_local"),
+        validacion_local,
+        "la validación local",
+    )
+
+    carpeta_control = (
+        DATA_DIR
+        / "state"
+        / "preparaciones_trimestrales"
+        / trimestre_fin["nombre_carpeta"]
+    )
+    candidato = Path(str(preparacion.get("excel_limpio_candidato") or ""))
+    respaldo_estado = Path(str(preparacion.get("respaldo_estado_activo") or ""))
+    if candidato.resolve().parent != carpeta_control.resolve():
+        raise RuntimeError(
+            "El Excel limpio candidato no está fuera del backup en la carpeta "
+            f"de control esperada: {carpeta_control}"
+        )
+    if respaldo_estado.resolve().parent != carpeta_control.resolve():
+        raise RuntimeError(
+            "El respaldo del estado no está en la carpeta de control esperada."
+        )
+
+    requeridos = [
+        excel_historico,
+        manifest,
+        inventario,
+        validacion_local,
+        estado_preparacion_path,
+        resumen,
+        candidato,
+        respaldo_estado,
+        FACTURAS_PATH,
+    ]
+    faltantes = [str(path) for path in requeridos if not path.is_file()]
+    if faltantes:
+        raise RuntimeError(
+            "La preparación trimestral está incompleta. Faltan: "
+            + "; ".join(faltantes)
+        )
+
+    hash_historico = str(preparacion.get("excel_historico_sha256") or "")
+    hash_activo = str(preparacion.get("excel_activo_sha256_al_preparar") or "")
+    hash_candidato = str(
+        preparacion.get("excel_limpio_candidato_sha256") or ""
+    )
+    hash_jerarquia_preparada = str(
+        preparacion.get("jerarquia_sha256_al_preparar") or ""
+    )
+    if not all(
+        [hash_historico, hash_activo, hash_candidato, hash_jerarquia_preparada]
+    ):
+        raise RuntimeError("La preparación no contiene todos los hashes obligatorios.")
+    if sha256_file(excel_historico) != hash_historico:
+        raise RuntimeError("El Excel histórico cambió después de prepararse.")
+    if sha256_file(FACTURAS_PATH) != hash_activo:
+        raise RuntimeError("data/facturas.xlsx cambió después de la preparación.")
+    if hash_historico != hash_activo:
+        raise RuntimeError("El Excel histórico y el activo preparado no coinciden.")
+    if sha256_file(candidato) != hash_candidato:
+        raise RuntimeError("El candidato limpio cambió después de prepararse.")
+
+    candidato_info = validar_excel_limpio(candidato)
+    manifest_datos = leer_json(manifest, "el manifest trimestral")
+    inventario_datos = leer_json(inventario, "el inventario trimestral")
+    validacion_datos = leer_json(validacion_local, "la validación local")
+    if manifest_datos.get("estado") != ESTADO_PREPARADO:
+        raise RuntimeError("El manifest no conserva el estado preparado.")
+    if validacion_datos.get("ok") is not True:
+        raise RuntimeError("La validación local trimestral no está OK.")
+    if validacion_datos.get("cierres_inferiores_copiados") is not False:
+        raise RuntimeError("La validación indica cierres inferiores copiados.")
+    if validacion_datos.get("zip_creado") is not False:
+        raise RuntimeError("La validación trimestral indica que creó un ZIP.")
+
+    (
+        hash_jerarquia_actual,
+        archivos_jerarquia_inferior,
+        bytes_jerarquia_inferior,
+        meses_detectados,
+    ) = digest_jerarquia_inferior(carpeta_periodo, fecha_inicio, fecha_fin)
+    if hash_jerarquia_actual != hash_jerarquia_preparada:
+        raise RuntimeError(
+            "La jerarquía de meses, semanas y diarios cambió después de preparar."
+        )
+    if (
+        str(inventario_datos.get("sha256_contenido_jerarquia") or "")
+        != hash_jerarquia_actual
+    ):
+        raise RuntimeError(
+            "El inventario no coincide con la jerarquía inferior preparada."
+        )
+
+    archivos = listar_archivos_locales(carpeta_periodo)
+    directorios = listar_directorios_locales(carpeta_periodo)
+    requeridos_base = {
+        excel_historico.resolve(),
+        manifest.resolve(),
+        inventario.resolve(),
+        validacion_local.resolve(),
+        estado_preparacion_path.resolve(),
+        resumen.resolve(),
+    }
+    presentes = {path.resolve() for path in archivos}
+    faltan_base = sorted(str(path) for path in requeridos_base - presentes)
+    if faltan_base:
+        raise RuntimeError(
+            "La jerarquía completa no incluye los seis archivos trimestrales "
+            "obligatorios: "
+            + "; ".join(faltan_base)
+        )
+
+    digest_completo, bytes_completos = digest_archivos(
+        archivos,
+        carpeta_periodo,
+    )
+
+    return {
+        "anio": trimestre_fin["anio"],
+        "periodo": trimestre_fin["nombre_carpeta"],
+        "periodo_activo": trimestre_fin["periodo_activo"],
+        "fecha_inicio": fecha_inicio.isoformat(),
+        "fecha_fin": fecha_fin.isoformat(),
+        "ruta_relativa_trimestre": trimestre_fin["ruta_relativa"],
+        "carpeta_periodo": carpeta_periodo,
+        "carpeta_trimestral": carpeta_trimestral,
+        "carpeta_validaciones": carpeta_validaciones,
+        "excel_historico": excel_historico,
+        "manifest": manifest,
+        "inventario": inventario,
+        "validacion_local": validacion_local,
+        "estado_preparacion": estado_preparacion_path,
+        "resumen": resumen,
+        "candidato": candidato,
+        "candidato_info": candidato_info,
+        "politica_preparacion": politica_preparacion,
+        "estructura": estructura,
+        "jerarquia_inferior_sha256": hash_jerarquia_actual,
+        "archivos_jerarquia_inferior": archivos_jerarquia_inferior,
+        "bytes_jerarquia_inferior": bytes_jerarquia_inferior,
+        "meses_detectados": meses_detectados,
+        "archivos": archivos,
+        "directorios": directorios,
+        "digest_completo": digest_completo,
+        "bytes_completos": bytes_completos,
+    }
+
+
+def validar_configuracion_remota() -> None:
+    if not BACKUP_DRIVE_ID:
+        raise RuntimeError(
+            "Falta BACKUP_DRIVE_ID en .env. "
+            "No se usará un segundo destino como reemplazo automático."
+        )
+    if not BACKUP_ROOT_FOLDER:
+        raise RuntimeError("Falta BACKUP_ROOT_FOLDER en .env.")
+    if BACKUP_ROOT_FOLDER != ROOT_OFICIAL:
+        raise RuntimeError(
+            "BACKUP_ROOT_FOLDER no coincide con el único destino oficial. "
+            f"Configurado={BACKUP_ROOT_FOLDER!r} | Esperado={ROOT_OFICIAL!r}"
+        )
+
+
+def calcular_ruta_remota(contexto: dict[str, Any]) -> str:
+    ruta_relativa = str(contexto["ruta_relativa_trimestre"]).strip("/")
+    partes = Path(ruta_relativa).parts
+    if (
+        len(partes) != 2
+        or partes[0] != contexto["anio"]
+        or partes[1] != contexto["periodo"]
+    ):
+        raise RuntimeError(
+            "La ruta relativa trimestral no coincide con el periodo: "
+            f"{ruta_relativa}"
+        )
+
+    remoto = f"{BACKUP_ROOT_FOLDER}/{ruta_relativa}".strip("/")
+    if remoto.endswith("/Trimestral"):
+        raise RuntimeError(
+            "La ruta remota termina en Trimestral; debe apuntar al contenedor "
+            "completo del trimestre."
+        )
+    if "03_Cierres_Trimestrales" in Path(remoto).parts:
+        raise RuntimeError(
+            "La ruta remota usa la jerarquía anterior retirada: " + remoto
+        )
+    if not remoto.startswith(f"{ROOT_OFICIAL}/"):
+        raise RuntimeError("La ruta remota está fuera del destino oficial.")
+    return remoto
+
+
+def validar_drive() -> dict[str, Any]:
+    url = (
+        f"{GRAPH}/drives/{encode_drive_id(BACKUP_DRIVE_ID)}"
+        "?$select=id,name,driveType,webUrl"
+    )
+    respuesta = requests.get(
+        url,
+        headers=headers(),
+        timeout=60,
+        verify=ssl_verify(),
+    )
+    if respuesta.status_code != 200:
+        raise RuntimeError(
+            f"GET {respuesta.status_code} {url_graph_segura(url)} -> "
+            f"{respuesta.text[:500]}"
+        )
+    return respuesta.json()
+
+
+def obtener_item_por_path(drive_id: str, remote_path: str) -> Optional[dict[str, Any]]:
     url = (
         f"{GRAPH}/drives/{encode_drive_id(drive_id)}"
         f"/root:/{encode_path(remote_path)}:"
+        "?$select=id,name,size,file,folder,eTag,parentReference"
     )
-    r = requests.get(url, headers=headers(), timeout=60, verify=ssl_verify())
-
-    if r.status_code == 200:
-        return r.json()
-    if r.status_code == 404:
+    respuesta = requests.get(
+        url,
+        headers=headers(),
+        timeout=60,
+        verify=ssl_verify(),
+    )
+    if respuesta.status_code == 200:
+        return respuesta.json()
+    if respuesta.status_code == 404:
         return None
-
-    raise RuntimeError(f"GET {r.status_code} {url_graph_segura(url)} -> {r.text[:500]}")
+    raise RuntimeError(
+        f"GET {respuesta.status_code} {url_graph_segura(url)} -> "
+        f"{respuesta.text[:500]}"
+    )
 
 
 def existe_path(drive_id: str, remote_path: str) -> bool:
     if not remote_path.strip("/"):
         return True
-
-    url = f"{GRAPH}/drives/{encode_drive_id(drive_id)}/root:/{encode_path(remote_path)}:"
-    r = requests.get(url, headers=headers(), timeout=60, verify=ssl_verify())
-
-    if r.status_code == 200:
-        return True
-    if r.status_code == 404:
-        return False
-
-    raise RuntimeError(f"GET {r.status_code} {url_graph_segura(url)} -> {r.text[:500]}")
+    return obtener_item_por_path(drive_id, remote_path) is not None
 
 
 def crear_folder(drive_id: str, parent_path: str, folder_name: str) -> None:
@@ -189,775 +1009,758 @@ def crear_folder(drive_id: str, parent_path: str, folder_name: str) -> None:
         "folder": {},
         "@microsoft.graph.conflictBehavior": "fail",
     }
-
     if parent_path.strip("/"):
-        url = f"{GRAPH}/drives/{encode_drive_id(drive_id)}/root:/{encode_path(parent_path)}:/children"
+        url = (
+            f"{GRAPH}/drives/{encode_drive_id(drive_id)}"
+            f"/root:/{encode_path(parent_path)}:/children"
+        )
     else:
         url = f"{GRAPH}/drives/{encode_drive_id(drive_id)}/root/children"
 
-    r = requests.post(url, headers=h_json(), json=body, timeout=60, verify=ssl_verify())
-
-    if r.status_code in (200, 201, 409):
+    respuesta = requests.post(
+        url,
+        headers=headers_json(),
+        json=body,
+        timeout=60,
+        verify=ssl_verify(),
+    )
+    if respuesta.status_code in (200, 201, 409):
         return
-
-    raise RuntimeError(f"POST {r.status_code} {url_graph_segura(url)} -> {r.text[:500]}")
+    raise RuntimeError(
+        f"POST {respuesta.status_code} {url_graph_segura(url)} -> "
+        f"{respuesta.text[:500]}"
+    )
 
 
 def ensure_folder_recursive(drive_id: str, folder_path: str) -> None:
-    folder_path = folder_path.strip("/")
-    if not folder_path:
-        return
-
     actual = ""
-    for parte in [p for p in folder_path.split("/") if p]:
+    for parte in [segmento for segmento in folder_path.strip("/").split("/") if segmento]:
         siguiente = f"{actual}/{parte}".strip("/")
         if not existe_path(drive_id, siguiente):
             crear_folder(drive_id, actual, parte)
         actual = siguiente
 
 
-def validar_drive_id(drive_id: str):
-    if not drive_id:
-        return None
-
-    url = f"{GRAPH}/drives/{encode_drive_id(drive_id)}?$select=id,name,webUrl"
-    r = requests.get(url, headers=headers(), timeout=60, verify=ssl_verify())
-
-    if r.status_code == 200:
-        return r.json()
-
-    print(f"⚠️ Drive ID no válido o no accesible: {resumen_drive(drive_id)}")
-    print(f"   Respuesta Graph: {r.status_code} {r.text[:250]}")
-    return None
-
-
-def listar_drives_site(hostname: str, site_path: str):
-    if not hostname or not site_path:
-        return []
-
-    site_path = site_path if site_path.startswith("/") else f"/{site_path}"
-    url = f"{GRAPH}/sites/{hostname}:{site_path}:/drives?$select=id,name,webUrl"
-    r = graph_get(url, timeout=60)
-    return r.json().get("value", [])
-
-
-def resolver_drive_secundario() -> str:
-    drive = validar_drive_id(SP_BACKUP2_DRIVE_ID)
-    if drive:
-        print(f"✅ Drive secundario validado por ID: {drive.get('name')} | {resumen_drive(str(drive.get('id') or ''))}")
-        return drive["id"]
-
-    print("🔎 Buscando drive secundario desde hostname/site_path...")
-    drives = listar_drives_site(SP_BACKUP2_HOSTNAME, SP_BACKUP2_SITE_PATH)
-
-    if not drives:
-        raise RuntimeError("No se encontraron drives para el site secundario.")
-
-    print("📚 Drives encontrados en site secundario:")
-    for d in drives:
-        print(f"   - {d.get('name')} | {resumen_drive(str(d.get('id') or ''))}")
-
-    preferidos = {"documentos", "documents", "shared documents"}
-    elegido = None
-
-    for d in drives:
-        if (d.get("name") or "").strip().lower() in preferidos:
-            elegido = d
-            break
-
-    if not elegido:
-        elegido = drives[0]
-
-    print(f"✅ Drive secundario resuelto: {elegido.get('name')} | {resumen_drive(str(elegido.get('id') or ''))}")
-    print("💡 Si este ID funciona, actualiza SP_BACKUP2_DRIVE_ID en .env con este valor.")
-    return elegido["id"]
-
-
-def sha256_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
-def sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def normalizar_valor_excel(v: Any) -> str:
-    if v is None:
-        return "<NULL>"
-    if isinstance(v, (datetime.datetime, datetime.date, datetime.time)):
-        return v.isoformat()
-    if isinstance(v, float):
-        return repr(v)
-    return f"{type(v).__name__}:{str(v)}"
-
-
-def digest_datos_excel(path: Path) -> Tuple[str, dict]:
-    h = hashlib.sha256()
-    resumen = {
-        "sheets": [],
-        "non_empty_cells": 0,
-        "max_rows_total": 0,
-        "max_cols_total": 0,
-    }
-
-    wb = load_workbook(path, read_only=True, data_only=False, keep_links=False)
-    try:
-        sheet_names = list(wb.sheetnames)
-        h.update(json.dumps(sheet_names, ensure_ascii=False).encode("utf-8"))
-
-        for ws in wb.worksheets:
-            sheet_info = {
-                "title": ws.title,
-                "max_row": int(ws.max_row or 0),
-                "max_column": int(ws.max_column or 0),
-                "non_empty_cells": 0,
-            }
-
-            resumen["max_rows_total"] += sheet_info["max_row"]
-            resumen["max_cols_total"] += sheet_info["max_column"]
-
-            h.update(f"\n[SHEET]{ws.title}|{ws.max_row}|{ws.max_column}".encode("utf-8"))
-
-            for row in ws.iter_rows():
-                for cell in row:
-                    v = cell.value
-                    if v is None:
-                        continue
-
-                    sheet_info["non_empty_cells"] += 1
-                    resumen["non_empty_cells"] += 1
-
-                    payload = f"{ws.title}|{cell.coordinate}|{normalizar_valor_excel(v)}\n"
-                    h.update(payload.encode("utf-8", errors="replace"))
-
-            resumen["sheets"].append(sheet_info)
-    finally:
-        wb.close()
-
-    return h.hexdigest(), resumen
-
-
-def escribir_temporal_descarga(rel: str, data: bytes) -> Path:
-    TMP_VERIFY_DIR.mkdir(parents=True, exist_ok=True)
-    seguro = rel.replace("/", "__").replace("\\", "__")
-    p = TMP_VERIFY_DIR / f"download_trimestral_{seguro}"
-    p.write_bytes(data)
-    return p
-
-
-def verificar_archivo_subido(
-    *,
-    local: Path,
-    rel: str,
-    drive_id: str,
-    item: dict,
-) -> bool:
-    item_id = item.get("id")
-
-    if not item_id:
-        raise RuntimeError("Graph no devolvió item.id; no se puede verificar descarga exacta.")
-
-    remote_bytes = graph_download_item_content(drive_id, item_id)
-
-    if local.suffix.lower() in EXCEL_EXT:
-        tmp = escribir_temporal_descarga(rel, remote_bytes)
-        try:
-            digest_local, resumen_local = digest_datos_excel(local)
-            digest_sp, resumen_sp = digest_datos_excel(tmp)
-
-            if digest_local != digest_sp:
-                print(f"❌ Excel con datos distintos: {rel}")
-                print(f"   Digest local: {digest_local}")
-                print(f"   Digest SP:    {digest_sp}")
-                print(f"   Resumen local: {json.dumps(resumen_local, ensure_ascii=False)}")
-                print(f"   Resumen SP:    {json.dumps(resumen_sp, ensure_ascii=False)}")
-                return False
-
-            print(
-                f"✅ Excel verificado por DATOS: {rel} | "
-                f"celdas_no_vacias={resumen_local.get('non_empty_cells')} | "
-                f"hojas={len(resumen_local.get('sheets', []))} | "
-                f"bytes_local={local.stat().st_size} | bytes_sp={len(remote_bytes)}"
-            )
-            return True
-        finally:
-            try:
-                tmp.unlink(missing_ok=True)
-            except Exception:
-                pass
-
-    hash_local = sha256_file(local)
-    hash_sp = sha256_bytes(remote_bytes)
-
-    if hash_local != hash_sp:
-        print(f"❌ Hash distinto: {rel}")
-        print(f"   SHA256 local: {hash_local}")
-        print(f"   SHA256 SP:    {hash_sp}")
-        print(f"   bytes_local={local.stat().st_size} | bytes_sp={len(remote_bytes)}")
-        return False
-
-    print(f"✅ Archivo verificado por SHA256 exacto: {rel} ({local.stat().st_size} bytes)")
-    return True
-
-
-def subir_y_verificar_con_reintentos(
-    nombre_destino: str,
-    drive_id: str,
-    remote_path: str,
-    local: Path,
-    rel: str,
-) -> bool:
-    """
-    Sube y verifica un archivo con tolerancia a respuestas transitorias.
-
-    Si Graph devuelve error durante el PUT, consulta la ruta remota antes
-    de repetir. Esto evita registrar como fallida una carga que sí terminó
-    correctamente en Microsoft 365, por ejemplo ante un HTTP 504.
-    """
-    item = None
-    ultimo_error_subida = None
-    espera_subida = 2
-    intentos_subida = 3
-
-    for intento in range(1, intentos_subida + 1):
-        try:
-            item = graph_put_content(drive_id, remote_path, local)
-            break
-        except Exception as exc:
-            ultimo_error_subida = exc
-            print(
-                f"⚠️ Subida intento {intento}/{intentos_subida} "
-                f"falló para {rel} en {nombre_destino}: {exc}"
-            )
-
-            try:
-                item_remoto = obtener_item_por_path(drive_id, remote_path)
-                if item_remoto:
-                    print(
-                        "✅ El archivo existe en el destino pese al error "
-                        "del PUT. Se verificará su contenido."
-                    )
-                    item = item_remoto
-                    break
-            except Exception as consulta_exc:
-                print(
-                    "⚠️ No fue posible comprobar todavía la ruta remota: "
-                    f"{consulta_exc}"
-                )
-
-            if intento < intentos_subida:
-                print(f"   Reintentando subida en {espera_subida}s...")
-                time.sleep(espera_subida)
-                espera_subida *= 2
-
-    if item is None:
-        print(
-            f"❌ Subida definitiva fallida para {rel} "
-            f"en {nombre_destino}: {ultimo_error_subida}"
+def listar_hijos(drive_id: str, item_id: str) -> list[dict[str, Any]]:
+    url: Optional[str] = (
+        f"{GRAPH}/drives/{encode_drive_id(drive_id)}"
+        f"/items/{quote(item_id, safe='')}/children"
+        "?$select=id,name,size,file,folder,eTag,parentReference&$top=200"
+    )
+    resultado: list[dict[str, Any]] = []
+    while url:
+        respuesta = requests.get(
+            url,
+            headers=headers(),
+            timeout=120,
+            verify=ssl_verify(),
         )
-        return False
-
-    intentos_verificacion = 4
-    espera_verificacion = 2
-    ultimo_error_verificacion = None
-
-    for intento in range(1, intentos_verificacion + 1):
-        try:
-            if verificar_archivo_subido(
-                local=local,
-                rel=rel,
-                drive_id=drive_id,
-                item=item,
-            ):
-                return True
-        except Exception as exc:
-            ultimo_error_verificacion = exc
-            print(
-                f"⚠️ Verificación intento {intento}/"
-                f"{intentos_verificacion} falló para {rel}: {exc}"
+        if respuesta.status_code != 200:
+            raise RuntimeError(
+                f"GET {respuesta.status_code} {url_graph_segura(url)} -> "
+                f"{respuesta.text[:500]}"
             )
+        datos = respuesta.json()
+        resultado.extend(datos.get("value", []))
+        url = datos.get("@odata.nextLink")
+    return resultado
 
-        if intento < intentos_verificacion:
-            print(
-                f"   Reintentando verificación "
-                f"en {espera_verificacion}s..."
-            )
-            time.sleep(espera_verificacion)
-            espera_verificacion *= 2
 
-    if ultimo_error_verificacion:
-        print(
-            f"❌ Verificación definitiva fallida para {rel}: "
-            f"{ultimo_error_verificacion}"
+def inventariar_remoto(
+    drive_id: str,
+    remote_base: str,
+) -> dict[str, Any]:
+    base_item = obtener_item_por_path(drive_id, remote_base)
+    if base_item is None:
+        return {
+            "base_existe": False,
+            "directorios": set(),
+            "archivos": {},
+        }
+    if not isinstance(base_item.get("folder"), dict):
+        raise RuntimeError(
+            "La ruta remota del trimestre existe, pero no es una carpeta: "
+            + remote_base
         )
-    else:
-        print(f"❌ Verificación definitiva fallida para {rel}.")
 
-    return False
+    directorios: set[str] = set()
+    archivos: dict[str, dict[str, Any]] = {}
+    pendientes: list[tuple[str, str]] = [(str(base_item["id"]), "")]
 
-
-def debe_subir(p: Path) -> bool:
-    if not p.is_file():
-        return False
-    if p.name in EXCLUIR_NOMBRES:
-        return False
-    if p.suffix.lower() in EXCLUIR_EXT:
-        return False
-    if p.name.startswith(PREFIJO_VALIDACION_REMOTA):
-        # La evidencia final se genera y publica después de validar
-        # todos los archivos históricos, para evitar autorreferencias.
-        return False
-    return True
-
-
-def buscar_ultimo_cierre_trimestral() -> dict:
-    if not CIERRES_TRIMESTRALES_DIR.exists():
-        raise RuntimeError(f"No existe carpeta de cierres trimestrales: {CIERRES_TRIMESTRALES_DIR}")
-
-    excels = sorted(
-        CIERRES_TRIMESTRALES_DIR.rglob("01_Excel_Cierre/facturas_*.xlsx"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-
-    if not excels:
-        raise RuntimeError("No se encontró ningún Excel cerrado trimestral en 01_Excel_Cierre.")
-
-    excel_cierre = excels[0]
-    carpeta_excel = excel_cierre.parent
-    carpeta_periodo = carpeta_excel.parent
-    carpeta_soportes = carpeta_periodo / "02_Soportes_Tecnicos"
-
-    periodo = carpeta_periodo.name
-    anio = carpeta_periodo.parent.name
-
-    archivos = [p for p in sorted(carpeta_periodo.rglob("*")) if debe_subir(p)]
-
-    manifests = sorted(
-        carpeta_soportes.glob("manifest_cierre_trimestral*.json"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-
-    resumenes = sorted(
-        carpeta_soportes.glob("RESUMEN_CIERRE_TRIMESTRAL*.txt"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
+    while pendientes:
+        item_id, prefijo = pendientes.pop()
+        for item in listar_hijos(drive_id, item_id):
+            nombre = str(item.get("name") or "").strip()
+            if not nombre:
+                continue
+            relativa = f"{prefijo}/{nombre}".strip("/")
+            if isinstance(item.get("folder"), dict):
+                directorios.add(relativa)
+                pendientes.append((str(item["id"]), relativa))
+            elif isinstance(item.get("file"), dict):
+                archivos[relativa] = item
 
     return {
-        "anio": anio,
-        "periodo": periodo,
-        "carpeta_periodo": carpeta_periodo,
-        "carpeta_excel": carpeta_excel,
-        "carpeta_soportes": carpeta_soportes,
-        "excel_cierre": excel_cierre,
-        "manifest": manifests[0] if manifests else None,
-        "resumen": resumenes[0] if resumenes else None,
+        "base_existe": True,
+        "directorios": directorios,
         "archivos": archivos,
     }
 
 
-def calcular_rutas_sp(cierre: dict) -> dict:
-    ruta_principal_cierre = (
-        f"{BASE_SP}/Backups/03_Cierres_Trimestrales/"
-        f"{cierre['anio']}/{cierre['periodo']}"
-    ).strip("/")
-
-    ruta_secundaria_cierre = (
-        f"{SP_BACKUP2_FOLDER}/03_Cierres_Trimestrales/"
-        f"{cierre['anio']}/{cierre['periodo']}"
-    ).strip("/")
-
-    ruta_excel_activo_principal = f"{BASE_SP}/excel/facturas.xlsx".strip("/")
-
-    return {
-        "principal_cierre": ruta_principal_cierre,
-        "secundaria_cierre": ruta_secundaria_cierre,
-        "excel_activo_principal": ruta_excel_activo_principal,
-    }
-
-
-def imprimir_diagnostico(cierre: dict, rutas: dict) -> None:
-    print("✅ Cierre trimestral local detectado.")
-    print(f"Año: {cierre['anio']}")
-    print(f"Periodo: {cierre['periodo']}")
-    print(f"Carpeta periodo: {cierre['carpeta_periodo']}")
-    print(f"Carpeta Excel cierre: {cierre['carpeta_excel']}")
-    print(f"Carpeta soportes: {cierre['carpeta_soportes']}")
-    print(f"Excel cierre: {cierre['excel_cierre']} ({cierre['excel_cierre'].stat().st_size} bytes)")
-
-    if cierre["manifest"]:
-        print(f"Manifest más reciente: {cierre['manifest']} ({cierre['manifest'].stat().st_size} bytes)")
-    else:
-        print("⚠️ No se encontró manifest.")
-
-    if cierre["resumen"]:
-        print(f"Resumen más reciente: {cierre['resumen']} ({cierre['resumen'].stat().st_size} bytes)")
-    else:
-        print("⚠️ No se encontró resumen.")
-
-    print("-" * 100)
-    print(f"📦 Archivos a subir: {len(cierre['archivos'])}")
-    for p in cierre["archivos"]:
-        rel = p.relative_to(cierre["carpeta_periodo"]).as_posix()
-        print(f"   - {rel} ({p.stat().st_size} bytes)")
-
-    print("-" * 100)
-    print("✅ Configuración SharePoint detectada.")
-    print(f"SP_DRIVE_ID principal: {resumen_drive(SP_DRIVE_ID)}")
-    print(f"SP_FOLDER principal: {BASE_SP or '(vacio)'}")
-    print(f"SP_BACKUP2_DRIVE_ID secundario: {resumen_drive(SP_BACKUP2_DRIVE_ID)}")
-    print(f"SP_BACKUP2_FOLDER secundario: {SP_BACKUP2_FOLDER or '(vacio)'}")
-
-    print("-" * 100)
-    print("PLAN SHAREPOINT:")
-    print("1. Subir cierre trimestral a ruta principal:")
-    print(f"   {rutas['principal_cierre']}")
-    print("2. Subir cierre trimestral a ruta secundaria:")
-    print(f"   {rutas['secundaria_cierre']}")
-    print("3. NO reemplazar todavía el Excel activo principal:")
-    print(f"   {rutas['excel_activo_principal']}")
+def graph_download_item_content(drive_id: str, item_id: str) -> bytes:
+    url = (
+        f"{GRAPH}/drives/{encode_drive_id(drive_id)}"
+        f"/items/{quote(item_id, safe='')}/content"
+    )
+    respuesta = requests.get(
+        url,
+        headers=headers(),
+        timeout=300,
+        verify=ssl_verify(),
+        allow_redirects=True,
+    )
+    if respuesta.status_code != 200:
+        raise RuntimeError(
+            f"DOWNLOAD {respuesta.status_code} {url_graph_segura(url)} -> "
+            f"{respuesta.text[:500]}"
+        )
+    return respuesta.content
 
 
-def validar_config_sp() -> None:
-    if not SP_DRIVE_ID:
-        raise RuntimeError("Falta SP_DRIVE_ID en .env.")
-    if not BASE_SP:
-        raise RuntimeError("Falta SP_FOLDER en .env.")
-    if not SP_BACKUP2_DRIVE_ID and not (SP_BACKUP2_HOSTNAME and SP_BACKUP2_SITE_PATH):
-        raise RuntimeError("Falta SP_BACKUP2_DRIVE_ID o SP_BACKUP2_HOSTNAME/SP_BACKUP2_SITE_PATH en .env.")
-    if not SP_BACKUP2_FOLDER:
-        raise RuntimeError("Falta SP_BACKUP2_FOLDER en .env.")
+def escribir_temporal_descarga(relativa: str, data: bytes) -> Path:
+    TMP_VERIFY_DIR.mkdir(parents=True, exist_ok=True)
+    seguro = relativa.replace("/", "__").replace("\\", "__")
+    path = TMP_VERIFY_DIR / f"remoto_{seguro}"
+    path.write_bytes(data)
+    return path
 
 
-def subir_archivos_destino(nombre_destino: str, drive_id: str, carpeta_sp: str, cierre: dict) -> bool:
-    print("-" * 100)
-    print(f"📁 Verificando/creando destino: {nombre_destino}")
-    print(f"   Drive ID: {resumen_drive(drive_id)}")
-    print(f"   SP_DIR:   {carpeta_sp}")
+def comparar_local_remoto(
+    local: Path,
+    relativa: str,
+    item_remoto: dict[str, Any],
+) -> tuple[bool, str]:
+    item_id = str(item_remoto.get("id") or "").strip()
+    if not item_id:
+        raise RuntimeError(f"El archivo remoto no tiene item.id: {relativa}")
 
-    try:
-        ensure_folder_recursive(drive_id, carpeta_sp)
-        print(f"✅ Carpeta SharePoint verificada/creada: {nombre_destino}")
-    except Exception as e:
-        print(f"❌ No se pudo verificar/crear carpeta SharePoint en {nombre_destino}: {e}")
-        return False
+    if local.suffix.lower() not in EXCEL_EXT:
+        tamano_remoto = int(item_remoto.get("size") or -1)
+        if tamano_remoto != local.stat().st_size:
+            return False, "TAMAÑO_DISTINTO"
 
-    ok_todos = True
+    contenido = graph_download_item_content(BACKUP_DRIVE_ID, item_id)
 
-    for local in cierre["archivos"]:
-        rel = local.relative_to(cierre["carpeta_periodo"]).as_posix()
-        remote_path = f"{carpeta_sp}/{rel}".strip("/")
-        remote_dir = "/".join(remote_path.split("/")[:-1])
-
+    if local.suffix.lower() in EXCEL_EXT:
+        temporal = escribir_temporal_descarga(relativa, contenido)
         try:
-            ensure_folder_recursive(drive_id, remote_dir)
+            digest_local, _ = digest_datos_excel(local)
+            digest_remoto, _ = digest_datos_excel(temporal)
+            return (
+                digest_local == digest_remoto,
+                "DATOS_EXCEL_IGUALES"
+                if digest_local == digest_remoto
+                else "DATOS_EXCEL_DISTINTOS",
+            )
+        finally:
+            temporal.unlink(missing_ok=True)
 
-            print("☁️ Subiendo a SharePoint:")
-            print(f"   Destino: {nombre_destino}")
-            print(f"   Local:   {local}")
-            print(f"   SP:      {remote_path}")
-
-            ok = subir_y_verificar_con_reintentos(nombre_destino, drive_id, remote_path, local, rel)
-            if not ok:
-                ok_todos = False
-
-        except Exception as e:
-            print(f"❌ Error subiendo/verificando {rel} a {nombre_destino}: {e}")
-            ok_todos = False
-
-    return ok_todos
-
-
-
-def construir_evidencia_archivos(cierre: dict) -> list[dict]:
-    evidencias = []
-
-    for local in cierre["archivos"]:
-        rel = local.relative_to(cierre["carpeta_periodo"]).as_posix()
-        evidencia = {
-            "ruta_relativa": rel,
-            "bytes": local.stat().st_size,
-            "sha256_archivo_local": sha256_file(local),
-        }
-
-        if local.suffix.lower() in EXCEL_EXT:
-            digest, resumen = digest_datos_excel(local)
-            evidencia["digest_datos_excel"] = digest
-            evidencia["resumen_datos_excel"] = resumen
-
-        evidencias.append(evidencia)
-
-    return evidencias
-
-
-def escribir_validacion_remota_cierre(
-    cierre: dict,
-    rutas: dict,
-    drive_secundario: str,
-    ok_principal: bool,
-    ok_secundaria: bool,
-) -> Path:
-    """
-    Registra el resultado de la validación de los archivos históricos.
-
-    La publicación de este JSON se realiza después y se verifica de forma
-    independiente en ambos destinos. La fase de finalización debe volver
-    a comprobar su existencia e integridad antes de limpiar el Excel activo.
-    """
-    carpeta_soportes = Path(cierre["carpeta_soportes"])
-    carpeta_soportes.mkdir(parents=True, exist_ok=True)
-
-    validacion_path = carpeta_soportes / (
-        f"{PREFIJO_VALIDACION_REMOTA}{cierre['periodo']}.json"
+    hash_local = sha256_file(local)
+    hash_remoto = sha256_bytes(contenido)
+    return (
+        hash_local == hash_remoto,
+        "SHA256_IGUAL" if hash_local == hash_remoto else "SHA256_DISTINTO",
     )
 
-    total = len(cierre["archivos"])
-    ok_global = bool(ok_principal and ok_secundaria)
 
-    datos = {
-        "tipo": "VALIDACION_REMOTA_CIERRE_TRIMESTRAL",
-        "version_script": VERSION_UPLOAD,
-        "generado_en": datetime.datetime.now().isoformat(
-            timespec="seconds"
-        ),
-        "ok": ok_global,
-        "estado": (
-            "ARCHIVOS_HISTORICOS_VALIDADOS_EN_AMBOS_DESTINOS"
-            if ok_global
-            else "VALIDACION_DE_ARCHIVOS_HISTORICOS_INCOMPLETA"
-        ),
-        "anio": cierre["anio"],
-        "periodo": cierre["periodo"],
-        "carpeta_local": str(cierre["carpeta_periodo"]),
-        "excel_cierre": str(cierre["excel_cierre"]),
-        "total_archivos_historicos": total,
-        "principal": {
-            "nombre": "PRINCIPAL_CONTABILIDAD",
-            "drive_id": SP_DRIVE_ID,
-            "remote_base": rutas["principal_cierre"],
-            "ok": bool(ok_principal),
-            "archivos_verificados": total if ok_principal else 0,
-        },
-        "secundaria": {
-            "nombre": "SECUNDARIA_CONTROL_INTERNO",
-            "drive_id": drive_secundario,
-            "remote_base": rutas["secundaria_cierre"],
-            "ok": bool(ok_secundaria),
-            "archivos_verificados": total if ok_secundaria else 0,
-        },
-        "archivos_historicos": construir_evidencia_archivos(cierre),
-        "nota": (
-            "Esta evidencia registra la validación archivo por archivo "
-            "del cierre histórico. No autoriza por sí sola la limpieza "
-            "del Excel activo. La fase de finalización debe comprobar "
-            "que este JSON existe y coincide en ambos destinos remotos."
-        ),
+def construir_plan_remoto(
+    contexto: dict[str, Any],
+    remote_base: str,
+) -> dict[str, Any]:
+    inventario = inventariar_remoto(BACKUP_DRIVE_ID, remote_base)
+
+    dirs_locales = {
+        path.relative_to(contexto["carpeta_periodo"]).as_posix()
+        for path in contexto["directorios"]
+    }
+    archivos_locales = {
+        path.relative_to(contexto["carpeta_periodo"]).as_posix(): path
+        for path in contexto["archivos"]
+    }
+    dirs_remotos: set[str] = inventario["directorios"]
+    archivos_remotos: dict[str, dict[str, Any]] = inventario["archivos"]
+
+    conflictos = []
+    for relativa in sorted(dirs_locales & set(archivos_remotos)):
+        conflictos.append(
+            f"La ruta local es carpeta pero la ruta remota es archivo: {relativa}"
+        )
+    for relativa in sorted(set(archivos_locales) & dirs_remotos):
+        conflictos.append(
+            f"La ruta local es archivo pero la ruta remota es carpeta: {relativa}"
+        )
+
+    faltan_directorios = sorted(
+        dirs_locales - dirs_remotos,
+        key=lambda ruta: (len(Path(ruta).parts), ruta.lower()),
+    )
+    identicos: list[str] = []
+    faltantes: list[str] = []
+    diferentes: list[str] = []
+    detalles: dict[str, str] = {}
+
+    existentes = [rel for rel in archivos_locales if rel in archivos_remotos]
+    total_existentes = len(existentes)
+    revisados = 0
+
+    for relativa, local in archivos_locales.items():
+        remoto = archivos_remotos.get(relativa)
+        if remoto is None:
+            faltantes.append(relativa)
+            detalles[relativa] = "NO_EXISTE_REMOTO"
+            continue
+
+        iguales, motivo = comparar_local_remoto(local, relativa, remoto)
+        detalles[relativa] = motivo
+        if iguales:
+            identicos.append(relativa)
+        else:
+            diferentes.append(relativa)
+
+        revisados += 1
+        if total_existentes >= 100 and revisados % 100 == 0:
+            print(
+                f"   Comparación remota: {revisados}/{total_existentes} "
+                "archivos existentes revisados..."
+            )
+
+    gestionados = set(archivos_locales)
+    prefijo_evidencia = (
+        "Trimestral/03_Validaciones/" + PREFIJO_VALIDACION_REMOTA
+    )
+    extras = sorted(
+        relativa
+        for relativa in set(archivos_remotos) - gestionados
+        if not relativa.startswith(prefijo_evidencia)
+    )
+
+    return {
+        "base_existe": inventario["base_existe"],
+        "faltan_directorios": faltan_directorios,
+        "identicos": sorted(identicos),
+        "faltantes": sorted(faltantes),
+        "diferentes": sorted(diferentes),
+        "extras": extras,
+        "conflictos": conflictos,
+        "detalles": detalles,
+        "archivos_remotos": archivos_remotos,
+        "directorios_remotos": dirs_remotos,
     }
 
-    temporal = validacion_path.with_suffix(".json.tmp")
+
+def graph_put_content(drive_id: str, remote_path: str, local_file: Path) -> dict[str, Any]:
+    url = (
+        f"{GRAPH}/drives/{encode_drive_id(drive_id)}"
+        f"/root:/{encode_path(remote_path)}:/content"
+    )
+    respuesta = requests.put(
+        url,
+        headers=headers(),
+        data=local_file.read_bytes(),
+        timeout=300,
+        verify=ssl_verify(),
+    )
+    if respuesta.status_code not in (200, 201):
+        raise RuntimeError(
+            f"PUT {respuesta.status_code} {url_graph_segura(url)} -> "
+            f"{respuesta.text[:500]}"
+        )
+    return respuesta.json()
+
+
+def verificar_archivo_subido(
+    local: Path,
+    relativa: str,
+    item: dict[str, Any],
+) -> bool:
+    item_id = str(item.get("id") or "").strip()
+    if not item_id:
+        raise RuntimeError("Graph no devolvió item.id para la verificación.")
+
+    contenido = graph_download_item_content(BACKUP_DRIVE_ID, item_id)
+    if local.suffix.lower() in EXCEL_EXT:
+        temporal = escribir_temporal_descarga(relativa, contenido)
+        try:
+            digest_local, resumen_local = digest_datos_excel(local)
+            digest_remoto, _ = digest_datos_excel(temporal)
+            if digest_local != digest_remoto:
+                print(f"❌ Excel remoto con datos distintos: {relativa}")
+                return False
+            print(
+                f"✅ Excel verificado por datos: {relativa} | "
+                f"celdas_no_vacias={resumen_local['non_empty_cells']}"
+            )
+            return True
+        finally:
+            temporal.unlink(missing_ok=True)
+
+    if sha256_file(local) != sha256_bytes(contenido):
+        print(f"❌ SHA256 remoto distinto: {relativa}")
+        return False
+    print(f"✅ Archivo verificado por SHA256: {relativa}")
+    return True
+
+
+def subir_y_verificar(
+    remote_path: str,
+    local: Path,
+    relativa: str,
+) -> bool:
+    item: Optional[dict[str, Any]] = None
+    ultimo_error: Optional[Exception] = None
+    espera = 2
+
+    for intento in range(1, 4):
+        try:
+            item = graph_put_content(BACKUP_DRIVE_ID, remote_path, local)
+            break
+        except Exception as exc:
+            ultimo_error = exc
+            print(f"⚠️ Subida intento {intento}/3 falló para {relativa}: {exc}")
+            try:
+                item_existente = obtener_item_por_path(
+                    BACKUP_DRIVE_ID,
+                    remote_path,
+                )
+                if item_existente:
+                    item = item_existente
+                    print(
+                        "✅ El archivo existe pese al error del PUT; se "
+                        "verificará su contenido."
+                    )
+                    break
+            except Exception as consulta_exc:
+                print(
+                    "⚠️ No fue posible comprobar aún la ruta remota: "
+                    f"{consulta_exc}"
+                )
+            if intento < 3:
+                time.sleep(espera)
+                espera *= 2
+
+    if item is None:
+        print(f"❌ No fue posible subir {relativa}: {ultimo_error}")
+        return False
+
+    espera = 2
+    for intento in range(1, 5):
+        try:
+            if verificar_archivo_subido(local, relativa, item):
+                return True
+        except Exception as exc:
+            print(
+                f"⚠️ Verificación intento {intento}/4 falló para "
+                f"{relativa}: {exc}"
+            )
+        if intento < 4:
+            time.sleep(espera)
+            espera *= 2
+
+    print(f"❌ Verificación definitiva fallida: {relativa}")
+    return False
+
+
+def ruta_evidencia(contexto: dict[str, Any]) -> Path:
+    periodo_seguro = re.sub(
+        r"[^A-Za-z0-9._-]+",
+        "_",
+        contexto["periodo_activo"],
+    ).strip("._-")
+    return contexto["carpeta_validaciones"] / (
+        f"{PREFIJO_VALIDACION_REMOTA}{periodo_seguro}.json"
+    )
+
+
+def evidencia_vigente(
+    path: Path,
+    contexto: dict[str, Any],
+    remote_base: str,
+) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        datos = leer_json(path, "la evidencia remota existente")
+    except Exception:
+        return False
+    return bool(
+        datos.get("tipo") == "VALIDACION_REMOTA_ESTRUCTURA_TRIMESTRAL"
+        and datos.get("ok") is True
+        and datos.get("estado")
+        == "JERARQUIA_COMPLETA_VALIDADA_EN_DESTINO_UNICO"
+        and datos.get("destino_unico") is True
+        and datos.get("remote_base") == remote_base
+        and datos.get("digest_jerarquia_completa")
+        == contexto["digest_completo"]
+        and int(datos.get("total_archivos_base") or -1)
+        == len(contexto["archivos"])
+    )
+
+
+def preparar_evidencia(
+    contexto: dict[str, Any],
+    remote_base: str,
+    plan: dict[str, Any],
+    creados: int,
+    actualizados: int,
+    omitidos: int,
+) -> tuple[Path, bool]:
+    path = ruta_evidencia(contexto)
+    if evidencia_vigente(path, contexto, remote_base):
+        return path, True
+
+    datos = {
+        "tipo": "VALIDACION_REMOTA_ESTRUCTURA_TRIMESTRAL",
+        "version_script": VERSION_UPLOAD,
+        "generado_en": datetime.datetime.now().astimezone().isoformat(
+            timespec="seconds"
+        ),
+        "ok": True,
+        "estado": "JERARQUIA_COMPLETA_VALIDADA_EN_DESTINO_UNICO",
+        "destino_unico": True,
+        "periodo": contexto["periodo"],
+        "periodo_activo": contexto["periodo_activo"],
+        "fecha_inicio": contexto["fecha_inicio"],
+        "fecha_fin": contexto["fecha_fin"],
+        "carpeta_local_publicada": str(contexto["carpeta_periodo"]),
+        "remote_base": remote_base,
+        "drive": resumen_drive(BACKUP_DRIVE_ID),
+        "digest_jerarquia_completa": contexto["digest_completo"],
+        "total_archivos_base": len(contexto["archivos"]),
+        "total_directorios": len(contexto["directorios"]),
+        "total_bytes": contexto["bytes_completos"],
+        "estructura": contexto["estructura"],
+        "sincronizacion": {
+            "archivos_creados": creados,
+            "archivos_actualizados": actualizados,
+            "archivos_omitidos_por_ser_identicos": omitidos,
+            "archivos_extras_remotos_conservados": len(plan["extras"]),
+            "directorios_creados": len(plan["faltan_directorios"]),
+            "eliminaciones_remotas": 0,
+        },
+        "controles": {
+            "unico_destino": True,
+            "jerarquia_completa": True,
+            "cada_archivo_en_una_sola_ubicacion": True,
+            "diarios_copiados_dentro_de_semanal": False,
+            "semanas_copiadas_dentro_de_mensual": False,
+            "meses_copiados_dentro_de_trimestral": False,
+            "excel_limpio_candidato_subido": False,
+            "excel_activo_reemplazado": False,
+            "estado_trimestral_actualizado": False,
+            "autoeliminaciones_ejecutadas": False,
+            "archivos_remotos_eliminados": False,
+        },
+    }
+
+    temporal = path.with_suffix(path.suffix + ".tmp")
     temporal.write_text(
         json.dumps(datos, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    temporal.replace(validacion_path)
+    temporal.replace(path)
+    return path, False
 
-    return validacion_path
 
-
-def publicar_y_verificar_evidencia(
-    *,
-    validacion_path: Path,
-    cierre: dict,
-    rutas: dict,
-    drive_secundario: str,
-) -> Tuple[bool, bool]:
-    validacion_rel = validacion_path.relative_to(
-        cierre["carpeta_periodo"]
-    ).as_posix()
-
-    remoto_principal = (
-        f"{rutas['principal_cierre']}/{validacion_rel}"
-    ).strip("/")
-
-    remoto_secundario = (
-        f"{rutas['secundaria_cierre']}/{validacion_rel}"
-    ).strip("/")
-
-    print("-" * 100)
-    print("📄 Publicando evidencia final en ambos destinos...")
-
-    ok_principal = subir_y_verificar_con_reintentos(
-        "PRINCIPAL_CONTABILIDAD",
-        SP_DRIVE_ID,
-        remoto_principal,
-        validacion_path,
-        validacion_rel,
-    )
-
-    ok_secundaria = subir_y_verificar_con_reintentos(
-        "SECUNDARIA_CONTROL_INTERNO",
-        drive_secundario,
-        remoto_secundario,
-        validacion_path,
-        validacion_rel,
-    )
-
-    return ok_principal, ok_secundaria
-
-def ejecutar_upload_cierre(cierre: dict, rutas: dict) -> int:
-    validar_config_sp()
-
+def limpiar_temporales() -> None:
     try:
-        print("🔐 Validando drive principal...")
-        principal = validar_drive_id(SP_DRIVE_ID)
-        if not principal:
-            print("❌ SP_DRIVE_ID principal no es válido o no es accesible.")
-            return 1
+        if TMP_VERIFY_DIR.exists():
+            for path in TMP_VERIFY_DIR.iterdir():
+                if path.is_file():
+                    path.unlink(missing_ok=True)
+            TMP_VERIFY_DIR.rmdir()
+    except Exception:
+        pass
 
-        print(f"✅ Drive principal validado: {principal.get('name')} | {resumen_drive(str(principal.get('id') or ''))}")
 
-        print("🔐 Validando/resolviendo drive secundario...")
-        drive_secundario = resolver_drive_secundario()
+def imprimir_diagnostico_local(
+    contexto: dict[str, Any],
+    remote_base: str,
+) -> None:
+    print("Jerarquía trimestral local validada.")
+    print(f"Periodo operativo: {contexto['periodo_activo']}")
+    print(f"Rango: {contexto['fecha_inicio']} a {contexto['fecha_fin']}")
+    print(f"Carpeta completa que se sincronizará: {contexto['carpeta_periodo']}")
+    print(f"Destino único: {remote_base}")
+    print(f"Drive: {resumen_drive(BACKUP_DRIVE_ID)}")
+    print(f"Directorios locales: {len(contexto['directorios'])}")
+    print(f"Archivos base: {len(contexto['archivos'])}")
+    print(f"Bytes totales: {contexto['bytes_completos']}")
+    print(f"SHA256 lógico de la jerarquía completa: {contexto['digest_completo']}")
+    estructura = contexto["estructura"]
+    print(
+        "Niveles detectados: "
+        f"meses={estructura['meses']} | "
+        f"semanas={estructura['semanas']} | "
+        f"diarios={estructura['diarios']} | "
+        f"cierres_semanales={estructura['cierres_semanales']} | "
+        f"cierres_mensuales={estructura['cierres_mensuales']} | "
+        f"cierres_trimestrales={estructura['cierres_trimestrales']}"
+    )
+    if estructura["advertencias"]:
+        print("Advertencias de completitud histórica:")
+        for advertencia in estructura["advertencias"]:
+            print(f"   - {advertencia}")
+    if contexto["politica_preparacion"] == "SOLO_CARPETA_TRIMESTRAL":
+        print(
+            "Nota: la preparación local conserva el nombre de política "
+            "anterior, pero su digest de la jerarquía inferior fue revalidado."
+        )
+    print("-" * 100)
+    print("CONTROLES:")
+    print(f"- Único destino oficial: {ROOT_OFICIAL}")
+    print("- Se sincroniza el trimestre completo, no solo Trimestral.")
+    print("- Los archivos idénticos se omiten y no se vuelven a subir.")
+    print("- No se eliminan archivos remotos.")
+    print("- No se sube el candidato limpio.")
+    print("- No se reemplaza el Excel activo local ni remoto.")
+    print("- No se actualiza cierre_trimestral_state.json.")
+    print("- No se ejecutan autoeliminaciones en este script.")
 
-    except Exception as e:
-        print(f"❌ Error validando drives: {e}")
+
+def imprimir_plan(plan: dict[str, Any]) -> None:
+    print("-" * 100)
+    print("PLAN REMOTO DE SOLO LECTURA")
+    print(f"Carpeta trimestral remota existente: {plan['base_existe']}")
+    print(f"Directorios faltantes: {len(plan['faltan_directorios'])}")
+    print(f"Archivos idénticos que se omitirán: {len(plan['identicos'])}")
+    print(f"Archivos faltantes que se crearían: {len(plan['faltantes'])}")
+    print(f"Archivos diferentes que se actualizarían: {len(plan['diferentes'])}")
+    print(f"Archivos extras remotos que se conservarán: {len(plan['extras'])}")
+    print(f"Conflictos de tipo archivo/carpeta: {len(plan['conflictos'])}")
+
+    for titulo, valores in (
+        ("CONFLICTOS", plan["conflictos"]),
+        ("PRIMEROS ARCHIVOS FALTANTES", plan["faltantes"][:20]),
+        ("PRIMEROS ARCHIVOS DIFERENTES", plan["diferentes"][:20]),
+        ("PRIMEROS EXTRAS REMOTOS", plan["extras"][:20]),
+    ):
+        if valores:
+            print(f"{titulo}:")
+            for valor in valores:
+                print(f"   - {valor}")
+
+
+def ejecutar_sincronizacion(
+    contexto: dict[str, Any],
+    remote_base: str,
+    plan: dict[str, Any],
+) -> int:
+    if plan["conflictos"]:
+        print("Sincronización bloqueada por conflictos archivo/carpeta.")
         return 1
 
-    ok_principal = subir_archivos_destino(
-        "PRINCIPAL_CONTABILIDAD",
-        SP_DRIVE_ID,
-        rutas["principal_cierre"],
-        cierre,
-    )
+    print("-" * 100)
+    print("Preparando estructura remota faltante...")
+    ensure_folder_recursive(BACKUP_DRIVE_ID, remote_base)
+    for relativa in plan["faltan_directorios"]:
+        ensure_folder_recursive(
+            BACKUP_DRIVE_ID,
+            f"{remote_base}/{relativa}".strip("/"),
+        )
 
-    ok_secundaria = subir_archivos_destino(
-        "SECUNDARIA_CONTROL_INTERNO",
-        drive_secundario,
-        rutas["secundaria_cierre"],
-        cierre,
-    )
+    archivos_por_relativa = {
+        path.relative_to(contexto["carpeta_periodo"]).as_posix(): path
+        for path in contexto["archivos"]
+    }
+    pendientes = [
+        ("CREAR", relativa) for relativa in plan["faltantes"]
+    ] + [
+        ("ACTUALIZAR", relativa) for relativa in plan["diferentes"]
+    ]
 
-    validacion_path = escribir_validacion_remota_cierre(
-        cierre=cierre,
-        rutas=rutas,
-        drive_secundario=drive_secundario,
-        ok_principal=ok_principal,
-        ok_secundaria=ok_secundaria,
+    creados = 0
+    actualizados = 0
+    errores: list[str] = []
+
+    for indice, (accion, relativa) in enumerate(pendientes, start=1):
+        local = archivos_por_relativa[relativa]
+        remote_path = f"{remote_base}/{relativa}".strip("/")
+        try:
+            print(
+                f"[{indice}/{len(pendientes)}] {accion}: {relativa}"
+            )
+            if not subir_y_verificar(remote_path, local, relativa):
+                errores.append(relativa)
+            elif accion == "CREAR":
+                creados += 1
+            else:
+                actualizados += 1
+        except Exception as exc:
+            print(f"❌ Error procesando {relativa}: {exc}")
+            errores.append(relativa)
+
+    if errores:
+        print("-" * 100)
+        print(f"Sincronización incompleta. Archivos con error: {len(errores)}")
+        for relativa in errores[:50]:
+            print(f"   - {relativa}")
+        print("No se generó evidencia de éxito.")
+        return 1
+
+    evidencia_path, reutilizada = preparar_evidencia(
+        contexto,
+        remote_base,
+        plan,
+        creados,
+        actualizados,
+        len(plan["identicos"]),
     )
+    relativa_evidencia = evidencia_path.relative_to(
+        contexto["carpeta_periodo"]
+    ).as_posix()
+    remote_evidencia = f"{remote_base}/{relativa_evidencia}".strip("/")
 
     print("-" * 100)
-    print(f"📄 Evidencia local generada: {validacion_path}")
-
-    ok_evidencia_principal = False
-    ok_evidencia_secundaria = False
-
-    if ok_principal and ok_secundaria:
-        (
-            ok_evidencia_principal,
-            ok_evidencia_secundaria,
-        ) = publicar_y_verificar_evidencia(
-            validacion_path=validacion_path,
-            cierre=cierre,
-            rutas=rutas,
-            drive_secundario=drive_secundario,
-        )
-
-    ok_global = bool(
-        ok_principal
-        and ok_secundaria
-        and ok_evidencia_principal
-        and ok_evidencia_secundaria
-    )
+    if reutilizada:
+        print("Evidencia local vigente reutilizada sin reescribirla.")
+        item = obtener_item_por_path(BACKUP_DRIVE_ID, remote_evidencia)
+        if item is not None:
+            iguales, _ = comparar_local_remoto(
+                evidencia_path,
+                relativa_evidencia,
+                item,
+            )
+            if iguales:
+                print("Evidencia remota ya era idéntica; no se volvió a subir.")
+            elif not subir_y_verificar(
+                remote_evidencia,
+                evidencia_path,
+                relativa_evidencia,
+            ):
+                return 1
+        elif not subir_y_verificar(
+            remote_evidencia,
+            evidencia_path,
+            relativa_evidencia,
+        ):
+            return 1
+    else:
+        print(f"Publicando evidencia final: {relativa_evidencia}")
+        if not subir_y_verificar(
+            remote_evidencia,
+            evidencia_path,
+            relativa_evidencia,
+        ):
+            return 1
 
     print("-" * 100)
-
-    if ok_global:
-        print(
-            "✅ Subida del cierre trimestral terminada correctamente "
-            "en ambas rutas."
-        )
-        print("✅ Verificación aplicada:")
-        print(
-            "   - JSON/TXT/otros: SHA256 exacto después de descargar."
-        )
-        print(
-            "   - Excel: comparación de datos internos hoja/celda."
-        )
-        print(
-            "✅ Evidencia final publicada y verificada "
-            "en los dos destinos."
-        )
-        print(
-            "⚠️ No se reemplazó el Excel activo "
-            "ni se actualizó el estado trimestral."
-        )
-        print("=" * 100)
-        return 0
-
-    print(
-        "❌ La subida, validación o publicación de la evidencia "
-        "terminó con errores."
-    )
-    print(
-        "⚠️ No ejecutes la fase de finalización "
-        "hasta revisar el error."
-    )
-    print("=" * 100)
-    return 1
+    print("✅ JERARQUÍA TRIMESTRAL COMPLETA SINCRONIZADA Y VERIFICADA.")
+    print(f"Archivos creados: {creados}")
+    print(f"Archivos actualizados: {actualizados}")
+    print(f"Archivos idénticos omitidos: {len(plan['identicos'])}")
+    print(f"Extras remotos conservados sin eliminación: {len(plan['extras'])}")
+    print("Destino utilizado: uno solo.")
+    print("El Excel activo y el estado trimestral permanecen intactos.")
+    print("Las autoeliminaciones siguen pendientes y bloqueadas.")
+    return 0
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dry-run", action="store_true", help="Solo diagnostica, no sube archivos.")
-    parser.add_argument("--upload-cierre", action="store_true", help="Sube cierre trimestral a SharePoint.")
-    parser.add_argument("--confirmar", default=None, help="Confirmación obligatoria para --upload-cierre.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Valida, compara o sincroniza la jerarquía trimestral completa "
+            "en Backups_Facturas_Produccion."
+        )
+    )
+    modos = parser.add_mutually_exclusive_group()
+    modos.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Valida localmente; no usa Graph.",
+    )
+    modos.add_argument(
+        "--plan-remoto",
+        action="store_true",
+        help="Compara con Graph en solo lectura; no modifica nada.",
+    )
+    modos.add_argument(
+        "--upload-cierre",
+        action="store_true",
+        help="Sincroniza la jerarquía trimestral completa.",
+    )
+    parser.add_argument(
+        "--confirmar",
+        default=None,
+        help="Confirmación obligatoria para la sincronización real.",
+    )
     args = parser.parse_args()
 
-    if args.dry_run and args.upload_cierre:
-        print("❌ Usa solo un modo: --dry-run o --upload-cierre.")
-        return 1
-
-    modo = "UPLOAD_CIERRE" if args.upload_cierre else "DRY RUN"
+    if args.upload_cierre:
+        modo = "SINCRONIZAR JERARQUÍA COMPLETA"
+    elif args.plan_remoto:
+        modo = "PLAN REMOTO SOLO LECTURA"
+    else:
+        modo = "DRY RUN LOCAL"
 
     print("=" * 100)
-    print(f"SUBIDA CIERRE TRIMESTRAL SHAREPOINT - {modo}")
+    print(f"BACKUP TRIMESTRAL - UN DESTINO - {modo}")
     print("=" * 100)
     print(f"Versión: {VERSION_UPLOAD}")
     print(f"Root: {ROOT}")
     print("-" * 100)
 
     try:
-        cierre = buscar_ultimo_cierre_trimestral()
-        rutas = calcular_rutas_sp(cierre)
-        imprimir_diagnostico(cierre, rutas)
+        contexto = resolver_preparacion_trimestral()
+        remote_base = calcular_ruta_remota(contexto)
+        imprimir_diagnostico_local(contexto, remote_base)
 
-        if not args.upload_cierre:
+        if not args.plan_remoto and not args.upload_cierre:
             print("-" * 100)
-            print("✅ DRY RUN SharePoint finalizado. No se subió ningún archivo.")
+            print("DRY-RUN local finalizado.")
+            print("No se usó Graph ni se modificó ningún archivo.")
             print("=" * 100)
             return 0
 
+        validar_configuracion_remota()
+        print("-" * 100)
+        print("Validando el único drive de backup...")
+        drive = validar_drive()
+        print(
+            f"Drive validado: {drive.get('name')} | "
+            f"tipo={drive.get('driveType')} | "
+            f"{resumen_drive(str(drive.get('id') or ''))}"
+        )
+        print("Inventariando y comparando el destino en modo seguro...")
+        plan = construir_plan_remoto(contexto, remote_base)
+        imprimir_plan(plan)
+
+        if args.plan_remoto:
+            print("-" * 100)
+            print("PLAN REMOTO FINALIZADO.")
+            print("No se creó, subió, actualizó ni eliminó ningún archivo.")
+            print("=" * 100)
+            return 1 if plan["conflictos"] else 0
+
         if args.confirmar != CONFIRMACION_UPLOAD:
             print("-" * 100)
-            print("❌ Subida real bloqueada por falta de confirmación.")
-            print("Para subir el cierre trimestral usa:")
-            print(f"python scripts\\subir_cierre_trimestral_sharepoint.py --upload-cierre --confirmar {CONFIRMACION_UPLOAD}")
+            print("Sincronización real bloqueada por falta de confirmación.")
+            print(
+                "Usa --upload-cierre --confirmar "
+                f"{CONFIRMACION_UPLOAD}"
+            )
             print("=" * 100)
             return 1
 
-        return ejecutar_upload_cierre(cierre, rutas)
-
+        resultado = ejecutar_sincronizacion(contexto, remote_base, plan)
+        print("=" * 100)
+        return resultado
     except Exception as exc:
-        print(f"❌ Error en subida trimestral SharePoint: {exc}")
-        print("No se subió ningún archivo.")
+        print(f"❌ Error en el backup trimestral: {type(exc).__name__}: {exc}")
+        print("No se modificó el Excel activo ni el estado trimestral.")
         print("=" * 100)
         return 1
+    finally:
+        limpiar_temporales()
 
 
 if __name__ == "__main__":
