@@ -54,7 +54,7 @@ except Exception:
 
 from trimestre_activo import cargar_trimestre_activo
 
-VERSION_CIERRE = "2026-08-04-CIERRE-DIARIO-SEGURO-V3-JERARQUIA-TRIMESTRAL"
+VERSION_CIERRE = "2026-08-12-CIERRE-DIARIO-SEGURO-V3-FILTRO-FECHA-AUDITORIA"
 
 DATA_DIR = ROOT / "data"
 AUDIT_DIR = DATA_DIR / "audit"
@@ -143,6 +143,31 @@ COLS_ASUNTO_AUDIT = [
     "email subject",
     "mail_subject",
     "mail subject",
+]
+COLS_FECHA_AUDIT = [
+    "fecha_hora",
+    "fecha hora",
+    "fecha_hora_proceso",
+    "fecha hora proceso",
+    "timestamp",
+    "procesado_en",
+    "procesado en",
+    "processed_at",
+    "processed at",
+]
+COLS_INICIO_AUDIT = [
+    "inicio",
+    "fecha_inicio",
+    "fecha inicio",
+    "started_at",
+    "started at",
+]
+COLS_FIN_AUDIT = [
+    "fin",
+    "fecha_fin",
+    "fecha fin",
+    "finished_at",
+    "finished at",
 ]
 COLS_CONCEPTO = ["concepto"]
 
@@ -342,14 +367,118 @@ def leer_csv_dicts(path: Path) -> list[dict[str, str]]:
     return []
 
 
-def recolectar_audits(fecha: str) -> list[Path]:
-    patrones = [
-        f"audit_detalle_{fecha}.csv",
-        f"audit_runs_{fecha}.csv",
-        f"audit_*_{fecha}.csv",
-        f"*{fecha}*.csv",
-    ]
+def _fecha_en_nombre_archivo(path: Path, fecha: str) -> bool:
+    fecha_compacta = fecha.replace("-", "")
+    name = path.name.lower()
+    return fecha in name or fecha_compacta in name
+
+
+def _parse_datetime_audit(value: Any) -> Optional[_dt.datetime]:
+    if value is None:
+        return None
+    if isinstance(value, _dt.datetime):
+        return value
+    if isinstance(value, _dt.date):
+        return _dt.datetime.combine(value, _dt.time.min)
+
+    s = str(value).strip()
+    if not s:
+        return None
+
+    candidate = s.replace("Z", "+00:00")
+    try:
+        parsed = _dt.datetime.fromisoformat(candidate)
+        if parsed.tzinfo is not None:
+            parsed = parsed.replace(tzinfo=None)
+        return parsed
+    except Exception:
+        pass
+
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%d/%m/%Y %H:%M:%S",
+        "%d-%m-%Y %H:%M:%S",
+        "%Y-%m-%d",
+        "%d/%m/%Y",
+        "%d-%m-%Y",
+    ):
+        try:
+            return _dt.datetime.strptime(s[:19], fmt)
+        except Exception:
+            continue
+    return None
+
+
+def _intervalo_audit_incluye_fecha(row: dict[str, Any], fecha: str) -> bool:
+    inicio_raw = extraer_primer_valor_no_vacio(row, COLS_INICIO_AUDIT)
+    fin_raw = extraer_primer_valor_no_vacio(row, COLS_FIN_AUDIT)
+
+    inicio = _parse_datetime_audit(inicio_raw)
+    fin = _parse_datetime_audit(fin_raw)
+
+    if inicio is None and fin is None:
+        return False
+
+    target = validar_fecha(fecha)
+    inicio_dia = _dt.datetime.combine(target, _dt.time.min)
+    fin_dia = _dt.datetime.combine(target, _dt.time.max)
+
+    if inicio is None:
+        inicio = fin
+    if fin is None:
+        fin = inicio
+
+    assert inicio is not None and fin is not None
+    if fin < inicio:
+        inicio, fin = fin, inicio
+
+    return inicio <= fin_dia and fin >= inicio_dia
+
+
+def _fila_audit_corresponde_fecha(
+    row: dict[str, Any],
+    fecha: str,
+    *,
+    archivo: Optional[Path] = None,
+    permitir_fallback_nombre: bool = True,
+) -> tuple[bool, str]:
+    """
+    Decide si una fila de auditoría pertenece a la fecha solicitada.
+
+    Prioridad:
+    1. fecha_hora (o equivalente) de la propia fila;
+    2. intervalo inicio/fin para filas de resumen de ejecución;
+    3. compatibilidad histórica por nombre de archivo solo si la fila
+       no contiene ninguna fecha utilizable.
+    """
+    fecha_hora = extraer_primer_valor_no_vacio(row, COLS_FECHA_AUDIT)
+    if fecha_hora:
+        if fecha_valor_coincide(fecha_hora, fecha):
+            return True, "fecha_hora"
+        return False, "otra_fecha"
+
+    inicio = extraer_primer_valor_no_vacio(row, COLS_INICIO_AUDIT)
+    fin = extraer_primer_valor_no_vacio(row, COLS_FIN_AUDIT)
+    if inicio or fin:
+        if _intervalo_audit_incluye_fecha(row, fecha):
+            return True, "intervalo_run"
+        return False, "otro_intervalo"
+
+    if permitir_fallback_nombre and archivo is not None and _fecha_en_nombre_archivo(archivo, fecha):
+        return True, "fallback_nombre"
+
+    return False, "sin_fecha"
+
+
+def _rutas_audit_disponibles() -> list[Path]:
     rutas: list[Path] = []
+    patrones = (
+        "audit_detalle_*.csv",
+        "audit_runs_*.csv",
+        "audit_*.csv",
+    )
+
     for base in (AUDIT_DIR, DATA_DIR, ROOT):
         if not base.exists():
             continue
@@ -358,17 +487,62 @@ def recolectar_audits(fecha: str) -> list[Path]:
                 if p.is_file() and "audit" in p.name.lower():
                     rutas.append(p)
 
-    vistos = set()
-    out = []
+    vistos: set[str] = set()
+    out: list[Path] = []
     for p in rutas:
         try:
-            key = str(p.resolve()).lower()
+            key = str(p.resolve()).casefold()
         except Exception:
-            key = str(p).lower()
+            key = str(p).casefold()
         if key not in vistos:
             vistos.add(key)
             out.append(p)
-    return sorted(out)
+
+    return sorted(out, key=lambda p: str(p).casefold())
+
+
+def recolectar_audits(fecha: str) -> list[Path]:
+    """
+    Localiza auditorías relevantes por contenido, no solo por el nombre.
+
+    Esto permite reconstruir correctamente días históricos cuando una
+    ejecución larga comenzó un día y terminó al siguiente, dejando filas
+    del día anterior dentro de un CSV cuyo nombre corresponde al día de
+    finalización.
+    """
+    relevantes: list[Path] = []
+
+    for p in _rutas_audit_disponibles():
+        rows = leer_csv_dicts(p)
+
+        if not rows:
+            if _fecha_en_nombre_archivo(p, fecha):
+                relevantes.append(p)
+            continue
+
+        for row in rows:
+            coincide, _motivo = _fila_audit_corresponde_fecha(
+                row,
+                fecha,
+                archivo=p,
+                permitir_fallback_nombre=True,
+            )
+            if coincide:
+                relevantes.append(p)
+                break
+
+    vistos: set[str] = set()
+    out: list[Path] = []
+    for p in relevantes:
+        try:
+            key = str(p.resolve()).casefold()
+        except Exception:
+            key = str(p).casefold()
+        if key not in vistos:
+            vistos.add(key)
+            out.append(p)
+
+    return sorted(out, key=lambda p: str(p).casefold())
 
 
 def log_corresponde_fecha(path: Path, fecha: str) -> bool:
@@ -543,20 +717,19 @@ def extraer_radicado_desde_asunto(asunto: str) -> str:
 
 def extraer_candidatos_desde_audits(
     audit_files: list[Path],
-) -> dict[str, set[str]]:
+    fecha: str,
+) -> tuple[dict[str, set[str]], dict[str, Any]]:
     """
-    Extrae identificadores de las auditorías del día.
+    Extrae identificadores únicamente de las filas de auditoría que
+    corresponden realmente a la fecha del cierre.
 
-    Los registros normales suelen coincidir por CUFE. Los registros mínimos
-    pueden no tener CUFE, pero conservan número, radicado y archivo. En esos
-    casos:
+    La fecha interna de la fila (fecha_hora o equivalente) tiene prioridad
+    sobre el nombre físico del CSV. Esto evita que una ejecución que cruza
+    medianoche arrastre al cierre del día siguiente todas las facturas
+    procesadas el día anterior.
 
-    - el radicado puede venir dentro del asunto del correo;
-    - el archivo puede venir en pdf_name u otra columna equivalente.
-
-    Nunca se habilita una coincidencia únicamente por número. Las
-    combinaciones número+radicado, número+archivo o radicado+archivo reducen
-    el riesgo de incluir registros de otro día.
+    Para auditorías antiguas sin fecha por fila se mantiene compatibilidad
+    usando el nombre del archivo como fallback.
     """
     candidatos: dict[str, set[str]] = {
         "cufe": set(),
@@ -568,8 +741,42 @@ def extraer_candidatos_desde_audits(
         "radicado_archivo": set(),
     }
 
+    meta: dict[str, Any] = {
+        "fecha_objetivo": fecha,
+        "archivos_revisados": [rel(p) for p in audit_files],
+        "filas_auditoria_leidas": 0,
+        "filas_aceptadas_fecha": 0,
+        "filas_descartadas_otra_fecha": 0,
+        "filas_aceptadas_intervalo_run": 0,
+        "filas_aceptadas_fallback_nombre": 0,
+        "filas_sin_fecha_ignoradas": 0,
+    }
+
     for audit in audit_files:
         for row in leer_csv_dicts(audit):
+            meta["filas_auditoria_leidas"] += 1
+
+            coincide, motivo = _fila_audit_corresponde_fecha(
+                row,
+                fecha,
+                archivo=audit,
+                permitir_fallback_nombre=True,
+            )
+
+            if not coincide:
+                if motivo in {"otra_fecha", "otro_intervalo"}:
+                    meta["filas_descartadas_otra_fecha"] += 1
+                else:
+                    meta["filas_sin_fecha_ignoradas"] += 1
+                continue
+
+            if motivo == "intervalo_run":
+                meta["filas_aceptadas_intervalo_run"] += 1
+            elif motivo == "fallback_nombre":
+                meta["filas_aceptadas_fallback_nombre"] += 1
+            else:
+                meta["filas_aceptadas_fecha"] += 1
+
             cufe = extraer_primer_valor_no_vacio(row, COLS_CUFE)
             numero = extraer_primer_valor_no_vacio(row, COLS_NUMERO)
             radicado = extraer_primer_valor_no_vacio(row, COLS_RADICADO)
@@ -615,7 +822,7 @@ def extraer_candidatos_desde_audits(
                     f"{radicado_key}|{archivo_key}"
                 )
 
-    return candidatos
+    return candidatos, meta
 
 
 def fila_match_candidatos(
@@ -719,11 +926,15 @@ def obtener_filas_diarias_desde_excel(
             meta["columna_fecha_procesamiento"] = headers[idx_fecha]
             return headers, rows_fecha, meta
 
-        candidatos = extraer_candidatos_desde_audits(audit_files)
+        candidatos, meta_auditoria = extraer_candidatos_desde_audits(
+            audit_files,
+            fecha,
+        )
         total_candidates = sum(len(v) for v in candidatos.values())
 
         meta["audit_files_usados"] = [rel(p) for p in audit_files]
         meta["candidatos_extraidos"] = {k: len(v) for k, v in candidatos.items()}
+        meta["filtro_auditoria_por_fecha"] = meta_auditoria
 
         if total_candidates <= 0:
             meta["metodo_seleccion"] = "sin_candidatos_auditoria"
@@ -734,6 +945,15 @@ def obtener_filas_diarias_desde_excel(
             return headers, [], meta
 
         print(f"?? Cruzando Excel operativo contra auditor?a del d?a. Candidatos={total_candidates}")
+        print(
+            "?? Filtro auditoria por fecha: "
+            f"leidas={meta_auditoria['filas_auditoria_leidas']} | "
+            f"aceptadas_fecha={meta_auditoria['filas_aceptadas_fecha']} | "
+            f"aceptadas_intervalo={meta_auditoria['filas_aceptadas_intervalo_run']} | "
+            f"fallback_nombre={meta_auditoria['filas_aceptadas_fallback_nombre']} | "
+            f"descartadas_otra_fecha={meta_auditoria['filas_descartadas_otra_fecha']} | "
+            f"sin_fecha_ignoradas={meta_auditoria['filas_sin_fecha_ignoradas']}"
+        )
 
         rows_match = []
         for idx, row in enumerate(rows_all, start=1):
@@ -808,15 +1028,117 @@ def crear_excel_diario(destino: Path, headers: list[Any], rows: list[list[Any]])
     }
 
 
-def copiar_auditorias(audit_files: list[Path], destino_dir: Path) -> list[dict[str, Any]]:
+def _leer_csv_con_campos(path: Path) -> tuple[list[str], list[dict[str, str]]]:
+    for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            with path.open("r", encoding=encoding, newline="") as f:
+                reader = csv.DictReader(f)
+                fieldnames = list(reader.fieldnames or [])
+                rows = [dict(r or {}) for r in reader]
+                return fieldnames, rows
+        except UnicodeDecodeError:
+            continue
+        except Exception:
+            return [], []
+    return [], []
+
+
+def _nombre_audit_diario(origen: Path, fecha: str) -> str:
+    name = origen.name
+    lower = name.lower()
+    if lower.startswith("audit_detalle_"):
+        return f"audit_detalle_{fecha}.csv"
+    if lower.startswith("audit_runs_"):
+        return f"audit_runs_{fecha}.csv"
+    return name
+
+
+def copiar_auditorias(
+    audit_files: list[Path],
+    destino_dir: Path,
+    fecha: str,
+) -> list[dict[str, Any]]:
+    """
+    Copia evidencia de auditoría filtrada a la fecha del cierre.
+
+    Si el CSV de origen mezcla días, solo se escriben en el cierre las filas
+    que pertenecen a la fecha solicitada. Los archivos detalle/runs se
+    renombran con la fecha real del cierre para evitar confusión histórica.
+    """
     items: list[dict[str, Any]] = []
     destino_dir.mkdir(parents=True, exist_ok=True)
+
+    acumulados: dict[str, dict[str, Any]] = {}
+
     for origen in audit_files:
-        destino = destino_dir / origen.name
-        info = copiar_archivo(origen, destino)
-        if info:
-            info["categoria"] = "auditoria"
-            items.append(info)
+        fieldnames, rows = _leer_csv_con_campos(origen)
+        if not fieldnames:
+            continue
+
+        filtradas: list[dict[str, str]] = []
+        for row in rows:
+            coincide, _motivo = _fila_audit_corresponde_fecha(
+                row,
+                fecha,
+                archivo=origen,
+                permitir_fallback_nombre=True,
+            )
+            if coincide:
+                filtradas.append(row)
+
+        if not filtradas:
+            continue
+
+        nombre_destino = _nombre_audit_diario(origen, fecha)
+        bucket = acumulados.setdefault(
+            nombre_destino,
+            {
+                "fieldnames": [],
+                "rows": [],
+                "origenes": [],
+            },
+        )
+
+        for field in fieldnames:
+            if field not in bucket["fieldnames"]:
+                bucket["fieldnames"].append(field)
+
+        bucket["rows"].extend(filtradas)
+        bucket["origenes"].append(origen)
+
+    for nombre_destino, bucket in sorted(acumulados.items()):
+        destino = destino_dir / nombre_destino
+        fieldnames = list(bucket["fieldnames"])
+        rows = list(bucket["rows"])
+
+        unicas: list[dict[str, str]] = []
+        vistos: set[tuple[str, ...]] = set()
+        for row in rows:
+            key = tuple(clean_value(row.get(field, "")) for field in fieldnames)
+            if key in vistos:
+                continue
+            vistos.add(key)
+            unicas.append(row)
+
+        with destino.open("w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=fieldnames,
+                extrasaction="ignore",
+            )
+            writer.writeheader()
+            writer.writerows(unicas)
+
+        origenes = bucket["origenes"]
+        info = info_archivo(
+            destino,
+            origen=origenes[0] if origenes else None,
+            categoria="auditoria",
+        )
+        info["origenes_fuente"] = [rel(p) for p in origenes]
+        info["filas_filtradas_fecha"] = len(unicas)
+        items.append(info)
+
     return items
 
 
@@ -1040,7 +1362,7 @@ def main() -> int:
             d.mkdir(parents=True, exist_ok=True)
 
         excel_info = crear_excel_diario(excel_diario_path, list(headers), filas_diarias)
-        auditorias_info = copiar_auditorias(audit_files, auditoria_dir)
+        auditorias_info = copiar_auditorias(audit_files, auditoria_dir, fecha)
         logs_info = copiar_logs(log_files, logs_dir)
         env_info = crear_snapshot_env_redactado(manifest_dir, fecha)
 
