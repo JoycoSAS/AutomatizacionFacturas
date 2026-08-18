@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 JOYCO - Facturas Procesador
-Cierre diario local seguro V3
+Cierre diario local seguro V5
 
-Política V3:
+Política V5:
 - El cierre diario NO copia el histórico completo de facturas.xlsx.
 - Genera un Excel diario con las facturas registradas/procesadas en la fecha del cierre.
 - Incluye auditorías del día, logs de producción local/VPS, manifest, resumen y validación local.
@@ -54,7 +54,7 @@ except Exception:
 
 from trimestre_activo import cargar_trimestre_activo
 
-VERSION_CIERRE = "2026-08-12-CIERRE-DIARIO-SEGURO-V3-FILTRO-FECHA-AUDITORIA"
+VERSION_CIERRE = "2026-08-13-CIERRE-DIARIO-SEGURO-V5-MAPEO-APROBACIONES"
 
 DATA_DIR = ROOT / "data"
 AUDIT_DIR = DATA_DIR / "audit"
@@ -76,6 +76,22 @@ LOCKS_DIR = DATA_DIR / "locks"
 FACTURAS_PATH = Path(os.getenv("ARCHIVO_EXCEL_LOCAL", str(DATA_DIR / "facturas.xlsx")))
 if not FACTURAS_PATH.is_absolute():
     FACTURAS_PATH = ROOT / FACTURAS_PATH
+
+_MAPEO_APROBACIONES_RAW = str(
+    os.getenv("CIERRE_DIARIO_MAPEO_APROBACIONES") or ""
+).strip()
+
+MAPEO_APROBACIONES_PATH: Optional[Path] = (
+    Path(_MAPEO_APROBACIONES_RAW)
+    if _MAPEO_APROBACIONES_RAW
+    else None
+)
+
+if (
+    MAPEO_APROBACIONES_PATH is not None
+    and not MAPEO_APROBACIONES_PATH.is_absolute()
+):
+    MAPEO_APROBACIONES_PATH = ROOT / MAPEO_APROBACIONES_PATH
 
 LOCK_FILE = LOCKS_DIR / "cierre_diario_seguro.lock"
 LOCK_TTL_SECONDS = int(os.getenv("LOCK_TTL_SECONDS", "3600") or "3600")
@@ -183,7 +199,7 @@ EXCEL_TABLE_NAME = "TblFacturasDiario"
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Genera cierre diario local seguro V3.")
+    parser = argparse.ArgumentParser(description="Genera cierre diario local seguro V5.")
     parser.add_argument(
         "--fecha",
         default=_dt.datetime.now().strftime("%Y-%m-%d"),
@@ -715,6 +731,24 @@ def extraer_radicado_desde_asunto(asunto: str) -> str:
     return match.group(1) if match else ""
 
 
+def canon_numero(value: Any) -> str:
+    """
+    Normaliza únicamente números de factura puramente numéricos.
+
+    Ejemplos:
+    001 -> 1
+    000123 -> 123
+    FE001 -> fe001
+    I6C7331363 -> i6c7331363
+    """
+    key = norm_key(value)
+
+    if key.isdigit():
+        return str(int(key))
+
+    return key
+
+
 def extraer_candidatos_desde_audits(
     audit_files: list[Path],
     fecha: str,
@@ -796,7 +830,7 @@ def extraer_candidatos_desde_audits(
                 radicado = extraer_radicado_desde_asunto(asunto)
 
             cufe_key = norm_key(cufe)
-            numero_key = norm_key(numero)
+            numero_key = canon_numero(numero)
             radicado_key = norm_key(radicado)
             archivo_key = norm_key(archivo)
 
@@ -825,34 +859,157 @@ def extraer_candidatos_desde_audits(
     return candidatos, meta
 
 
+
+def cargar_identidades_mapeo_aprobaciones(
+    fecha: str,
+) -> Optional[dict[str, Any]]:
+    """
+    Carga las identidades Radicado + Número de factura cuya fecha de
+    aprobación coincide exactamente con el cierre solicitado.
+
+    Solo se activa cuando CIERRE_DIARIO_MAPEO_APROBACIONES está definido.
+    """
+    if MAPEO_APROBACIONES_PATH is None:
+        return None
+
+    if not MAPEO_APROBACIONES_PATH.is_file():
+        raise RuntimeError(
+            "No existe matriz histórica de aprobaciones: "
+            f"{MAPEO_APROBACIONES_PATH}"
+        )
+
+    identidades: set[tuple[str, str]] = set()
+    filas_esperadas = 0
+    registros_fecha = 0
+
+    with MAPEO_APROBACIONES_PATH.open(
+        "r",
+        encoding="utf-8-sig",
+        newline="",
+    ) as fh:
+        reader = csv.DictReader(fh)
+
+        requeridas = {
+            "Radicado",
+            "NumeroFactura",
+            "FilasExcel",
+            "FechaAprobacion",
+            "Estado",
+        }
+
+        disponibles = set(reader.fieldnames or [])
+        faltantes = requeridas - disponibles
+
+        if faltantes:
+            raise RuntimeError(
+                "Matriz histórica incompleta. "
+                f"Faltan columnas: {sorted(faltantes)}"
+            )
+
+        for raw in reader:
+            if str(raw.get("Estado") or "").strip() != "MAPEADO":
+                continue
+
+            if str(raw.get("FechaAprobacion") or "").strip() != fecha:
+                continue
+
+            radicado = norm_key(raw.get("Radicado"))
+            numero = canon_numero(raw.get("NumeroFactura"))
+
+            if not radicado or not numero:
+                raise RuntimeError(
+                    "Identidad incompleta en matriz histórica "
+                    f"para fecha {fecha}: {raw}"
+                )
+
+            identidad = (radicado, numero)
+
+            if identidad in identidades:
+                raise RuntimeError(
+                    "Identidad duplicada en matriz histórica: "
+                    f"{radicado} | {numero} | {fecha}"
+                )
+
+            identidades.add(identidad)
+            registros_fecha += 1
+
+            try:
+                filas_esperadas += int(
+                    float(str(raw.get("FilasExcel") or "0").strip())
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "FilasExcel inválido en matriz histórica para "
+                    f"{radicado} | {numero}: {raw.get('FilasExcel')!r}"
+                ) from exc
+
+    return {
+        "path": str(MAPEO_APROBACIONES_PATH),
+        "fecha": fecha,
+        "identidades": identidades,
+        "identidades_esperadas": registros_fecha,
+        "filas_esperadas": filas_esperadas,
+    }
+
+
 def fila_match_candidatos(
     row_values: Sequence[Any],
     headers: Sequence[Any],
     candidatos: dict[str, set[str]],
+    radicados_unicos_excel: Optional[set[str]] = None,
 ) -> bool:
-    idx_cufe = find_col(headers, COLS_CUFE)
     idx_numero = find_col(headers, COLS_NUMERO)
     idx_radicado = find_col(headers, COLS_RADICADO)
     idx_archivo = find_col(headers, COLS_ARCHIVO)
 
-    cufe = norm_key(row_values[idx_cufe]) if idx_cufe is not None and idx_cufe < len(row_values) else ""
-    numero = norm_key(row_values[idx_numero]) if idx_numero is not None and idx_numero < len(row_values) else ""
-    radicado = norm_key(row_values[idx_radicado]) if idx_radicado is not None and idx_radicado < len(row_values) else ""
-    archivo = norm_key(row_values[idx_archivo]) if idx_archivo is not None and idx_archivo < len(row_values) else ""
+    numero = (
+        canon_numero(row_values[idx_numero])
+        if idx_numero is not None and idx_numero < len(row_values)
+        else ""
+    )
+    radicado = (
+        norm_key(row_values[idx_radicado])
+        if idx_radicado is not None and idx_radicado < len(row_values)
+        else ""
+    )
+    archivo = (
+        norm_key(row_values[idx_archivo])
+        if idx_archivo is not None and idx_archivo < len(row_values)
+        else ""
+    )
 
-    if cufe and cufe in candidatos["cufe"]:
-        return True
-    if numero and radicado and f"{numero}|{radicado}" in candidatos["numero_radicado"]:
-        return True
-    if numero and archivo and f"{numero}|{archivo}" in candidatos["numero_archivo"]:
-        return True
-    if radicado and archivo and f"{radicado}|{archivo}" in candidatos["radicado_archivo"]:
+    # Match principal: identidad exacta.
+    if (
+        numero
+        and radicado
+        and f"{numero}|{radicado}" in candidatos["numero_radicado"]
+    ):
         return True
 
-    # Fallback más flexible, solo cuando hay combinación para reducir falsos positivos.
-    if numero and radicado and numero in candidatos["numero"] and radicado in candidatos["radicado"]:
+    # Compatibilidad cuando falta radicado pero existe archivo.
+    if (
+        numero
+        and archivo
+        and f"{numero}|{archivo}" in candidatos["numero_archivo"]
+    ):
         return True
-    if numero and archivo and numero in candidatos["numero"] and archivo in candidatos["archivo"]:
+
+    # Compatibilidad cuando falta número pero existe archivo.
+    if (
+        radicado
+        and archivo
+        and f"{radicado}|{archivo}" in candidatos["radicado_archivo"]
+    ):
+        return True
+
+    # Fallback controlado:
+    # solo usar radicado si dentro del Excel identifica un único número.
+    if (
+        radicado
+        and radicados_unicos_excel
+        and radicado in radicados_unicos_excel
+        and radicado in candidatos["radicado"]
+    ):
         return True
 
     return False
@@ -916,6 +1073,149 @@ def obtener_filas_diarias_desde_excel(
             "advertencias": [],
         }
 
+        # ============================================================
+        # V5 - RECONSTRUCCIÓN HISTÓRICA POR FECHA DE APROBACIÓN
+        # ============================================================
+        # Si existe CIERRE_DIARIO_MAPEO_APROBACIONES, la matriz congelada
+        # tiene prioridad sobre auditorías y fechas de procesamiento.
+        # La identidad exigida es:
+        #
+        #   Radicado + Número de factura
+        #
+        # y la matriz ya contiene la FechaAprobacion validada.
+        # ============================================================
+
+        mapeo = cargar_identidades_mapeo_aprobaciones(fecha)
+
+        if mapeo is not None:
+            idx_numero_excel = find_col(headers, COLS_NUMERO)
+            idx_radicado_excel = find_col(headers, COLS_RADICADO)
+
+            if idx_numero_excel is None:
+                raise RuntimeError(
+                    "No se encontró columna Número de factura "
+                    "en el Excel congelado."
+                )
+
+            if idx_radicado_excel is None:
+                raise RuntimeError(
+                    "No se encontró columna Radicado "
+                    "en el Excel congelado."
+                )
+
+            identidades_objetivo = set(
+                mapeo["identidades"]
+            )
+
+            identidades_encontradas: set[
+                tuple[str, str]
+            ] = set()
+
+            rows_fecha: list[list[Any]] = []
+
+            for row in rows_all:
+                radicado = (
+                    norm_key(row[idx_radicado_excel])
+                    if idx_radicado_excel < len(row)
+                    else ""
+                )
+
+                numero = (
+                    canon_numero(row[idx_numero_excel])
+                    if idx_numero_excel < len(row)
+                    else ""
+                )
+
+                identidad = (
+                    radicado,
+                    numero,
+                )
+
+                if identidad not in identidades_objetivo:
+                    continue
+
+                rows_fecha.append(row)
+                identidades_encontradas.add(
+                    identidad
+                )
+
+            identidades_faltantes = sorted(
+                identidades_objetivo
+                - identidades_encontradas
+            )
+
+            filas_esperadas = int(
+                mapeo["filas_esperadas"]
+            )
+
+            meta["metodo_seleccion"] = (
+                "mapeo_aprobaciones_radicado_numero"
+            )
+
+            meta["mapeo_aprobaciones"] = {
+                "archivo": rel(
+                    MAPEO_APROBACIONES_PATH
+                ),
+                "fecha": fecha,
+                "identidades_esperadas": int(
+                    mapeo["identidades_esperadas"]
+                ),
+                "identidades_encontradas": len(
+                    identidades_encontradas
+                ),
+                "filas_esperadas": filas_esperadas,
+                "filas_encontradas": len(
+                    rows_fecha
+                ),
+                "identidades_faltantes": [
+                    {
+                        "radicado": rad,
+                        "numero": num,
+                    }
+                    for rad, num
+                    in identidades_faltantes
+                ],
+            }
+
+            print(
+                "🧭 Selección histórica por matriz: "
+                f"fecha={fecha} | "
+                f"identidades="
+                f"{len(identidades_encontradas)}/"
+                f"{mapeo['identidades_esperadas']} | "
+                f"filas={len(rows_fecha)}/"
+                f"{filas_esperadas}"
+            )
+
+            if identidades_faltantes:
+                raise RuntimeError(
+                    "La matriz histórica contiene "
+                    f"{len(identidades_faltantes)} "
+                    "identidad(es) que no aparecen "
+                    "en el Excel congelado."
+                )
+
+            if (
+                len(identidades_encontradas)
+                != int(
+                    mapeo["identidades_esperadas"]
+                )
+            ):
+                raise RuntimeError(
+                    "Cantidad de identidades distinta "
+                    "a la matriz histórica."
+                )
+
+            if len(rows_fecha) != filas_esperadas:
+                raise RuntimeError(
+                    "Cantidad de filas distinta a la "
+                    "matriz histórica: "
+                    f"esperadas={filas_esperadas} | "
+                    f"encontradas={len(rows_fecha)}"
+                )
+
+            return headers, rows_fecha, meta
+
         idx_fecha = find_col(headers, COLUMNAS_FECHA_PROCESO_CANDIDATAS)
         if idx_fecha is not None:
             rows_fecha = [
@@ -955,9 +1255,52 @@ def obtener_filas_diarias_desde_excel(
             f"sin_fecha_ignoradas={meta_auditoria['filas_sin_fecha_ignoradas']}"
         )
 
+        idx_numero_excel = find_col(headers, COLS_NUMERO)
+        idx_radicado_excel = find_col(headers, COLS_RADICADO)
+
+        numeros_por_radicado: dict[str, set[str]] = {}
+
+        if idx_radicado_excel is not None:
+            for row in rows_all:
+                if idx_radicado_excel >= len(row):
+                    continue
+
+                radicado_excel = norm_key(row[idx_radicado_excel])
+
+                if not radicado_excel:
+                    continue
+
+                numero_excel = (
+                    canon_numero(row[idx_numero_excel])
+                    if (
+                        idx_numero_excel is not None
+                        and idx_numero_excel < len(row)
+                    )
+                    else ""
+                )
+
+                if numero_excel:
+                    numeros_por_radicado.setdefault(
+                        radicado_excel,
+                        set(),
+                    ).add(numero_excel)
+
+        radicados_unicos_excel = {
+            radicado
+            for radicado, numeros in numeros_por_radicado.items()
+            if len(numeros) == 1
+        }
+
+        meta["radicados_unicos_excel"] = len(radicados_unicos_excel)
+
         rows_match = []
         for idx, row in enumerate(rows_all, start=1):
-            if fila_match_candidatos(row, headers, candidatos):
+            if fila_match_candidatos(
+                row,
+                headers,
+                candidatos,
+                radicados_unicos_excel,
+            ):
                 rows_match.append(row)
 
             if idx % 1000 == 0:
@@ -1222,7 +1565,7 @@ def validar_excel_generado(path: Path, expected_columns: int) -> dict[str, Any]:
 
 def generar_resumen_txt(path: Path, manifest: dict[str, Any]) -> None:
     lines = [
-        "CIERRE DIARIO LOCAL SEGURO V3 - FACTURAS JOYCO",
+        "CIERRE DIARIO LOCAL SEGURO V5 - FACTURAS JOYCO",
         "=" * 90,
         f"Versión: {manifest['version']}",
         f"Fecha cierre: {manifest['fecha']}",
@@ -1304,7 +1647,7 @@ def main() -> int:
     validacion_path = validaciones_dir / f"validacion_local_{fecha}.json"
 
     print("=" * 100)
-    print("CIERRE DIARIO LOCAL SEGURO V3 - FACTURAS JOYCO")
+    print("CIERRE DIARIO LOCAL SEGURO V5 - FACTURAS JOYCO")
     print("=" * 100)
     print(f"Versión: {VERSION_CIERRE}")
     print(f"Root: {ROOT}")
@@ -1384,7 +1727,7 @@ def main() -> int:
         validacion_path.write_text(json.dumps(validacion, ensure_ascii=False, indent=2), encoding="utf-8")
 
         manifest = {
-            "tipo": "cierre_diario_local_seguro_v3",
+            "tipo": "cierre_diario_local_seguro_v5",
             "version": VERSION_CIERRE,
             "fecha": fecha,
             "trimestre": trimestre,
@@ -1411,7 +1754,7 @@ def main() -> int:
             "validacion_local": rel(validacion_path),
             "advertencias": advertencias,
             "nota": (
-                "Cierre diario V3: evidencia solo del día, no histórico completo, "
+                "Cierre diario V5: evidencia solo del día, no histórico completo, "
                 "almacenada dentro del trimestre operativo activo."
             ),
         }
@@ -1455,13 +1798,13 @@ def main() -> int:
             return 3
 
         print("=" * 100)
-        print("✅ Cierre diario local V3 generado correctamente.")
+        print("✅ Cierre diario local V5 generado correctamente.")
         print("Siguiente paso: subir/validar en OneDrive con el uploader trimestral-compatible.")
         print("=" * 100)
         return 0
 
     except Exception as exc:
-        print(f"❌ Error generando cierre diario local V3: {type(exc).__name__}: {exc}")
+        print(f"❌ Error generando cierre diario local V5: {type(exc).__name__}: {exc}")
         print("⚠️ No subas ni archives nada hasta revisar el error.")
         return 1
     finally:

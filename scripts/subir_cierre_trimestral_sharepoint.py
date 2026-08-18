@@ -57,6 +57,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional, Tuple
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import requests
 from dotenv import load_dotenv
@@ -81,9 +82,11 @@ CIERRES_DIR = DATA_DIR / "cierres_diarios"
 TMP_VERIFY_DIR = DATA_DIR / "_tmp_verificacion_jerarquia_trimestral"
 
 VERSION_UPLOAD = (
-    "2026-08-06-UPLOAD-CIERRE-TRIMESTRAL-V6-UN-DESTINO-JERARQUIA-COMPLETA"
+    "2026-08-13-UPLOAD-CIERRE-TRIMESTRAL-V7-RETENCION-30D"
 )
 GRAPH = "https://graph.microsoft.com/v1.0"
+RETENCION_LOCAL_DIAS = 30
+ZONA_HORARIA = ZoneInfo("America/Bogota")
 CONFIRMACION_UPLOAD = "SINCRONIZAR_TRIMESTRE_COMPLETO"
 ESTADO_PREPARADO = "PREPARADO_PENDIENTE_VALIDACION_REMOTA"
 ROOT_OFICIAL = "Backups_Facturas_Produccion"
@@ -111,6 +114,7 @@ EXCEL_EXT = {".xlsx", ".xlsm"}
 PREFIJO_VALIDACION_REMOTA = "validacion_remota_cierre_trimestral_"
 PREFIJOS_CONTROL_NO_PUBLICAR = (
     PREFIJO_VALIDACION_REMOTA,
+    "estado_retencion_trimestral_",
     "estado_finalizacion_cierre_trimestral_",
     "RESUMEN_FINALIZACION_CIERRE_TRIMESTRAL_",
 )
@@ -1471,6 +1475,102 @@ def preparar_evidencia(
     return path, False
 
 
+def ruta_estado_retencion(
+    contexto: dict[str, Any],
+) -> Path:
+    periodo_seguro = re.sub(
+        r"[^A-Za-z0-9._-]+",
+        "_",
+        contexto["periodo_activo"],
+    ).strip("._-")
+
+    return contexto["carpeta_validaciones"] / (
+        f"estado_retencion_trimestral_{periodo_seguro}.json"
+    )
+
+
+def crear_estado_retencion_temporal(
+    contexto: dict[str, Any],
+    remote_base: str,
+) -> tuple[Path, Path, dict[str, Any]]:
+    estado_local = ruta_estado_retencion(contexto)
+
+    # Si ya existe un estado valido para exactamente esta misma
+    # jerarquia, se conserva su fecha original de retencion.
+    if estado_local.is_file():
+        try:
+            existente = leer_json(
+                estado_local,
+                "el estado local de retencion trimestral",
+            )
+
+            vigente = bool(
+                existente.get("tipo")
+                == "estado_retencion_local_cierre_trimestral"
+                and existente.get("ok") is True
+                and existente.get(
+                    "validacion_remota_publicada_y_verificada"
+                ) is True
+                and existente.get("remote_base") == remote_base
+                and existente.get("digest_jerarquia_completa")
+                == contexto["digest_completo"]
+                and int(existente.get("total_archivos_base") or -1)
+                == len(contexto["archivos"])
+                and int(existente.get("retencion_local_dias") or -1)
+                == RETENCION_LOCAL_DIAS
+                and bool(existente.get("validado_en"))
+                and bool(
+                    existente.get(
+                        "eliminacion_local_permitida_desde"
+                    )
+                )
+            )
+
+            if vigente:
+                TMP_VERIFY_DIR.mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
+                temporal = TMP_VERIFY_DIR / estado_local.name
+                temporal.write_bytes(estado_local.read_bytes())
+
+                return temporal, estado_local, existente
+
+        except Exception:
+            pass
+
+    ahora = datetime.datetime.now(ZONA_HORARIA)
+
+    payload = {
+        "tipo": "estado_retencion_local_cierre_trimestral",
+        "version": VERSION_UPLOAD,
+        "periodo": contexto["periodo"],
+        "periodo_activo": contexto["periodo_activo"],
+        "fecha_inicio": contexto["fecha_inicio"],
+        "fecha_fin": contexto["fecha_fin"],
+        "validacion_remota_publicada_y_verificada": True,
+        "validado_en": ahora.isoformat(timespec="seconds"),
+        "retencion_local_dias": RETENCION_LOCAL_DIAS,
+        "eliminacion_local_permitida_desde": (
+            ahora + datetime.timedelta(days=RETENCION_LOCAL_DIAS)
+        ).isoformat(timespec="seconds"),
+        "remote_base": remote_base,
+        "digest_jerarquia_completa": contexto["digest_completo"],
+        "total_archivos_base": len(contexto["archivos"]),
+        "ok": True,
+    }
+
+    TMP_VERIFY_DIR.mkdir(parents=True, exist_ok=True)
+    temporal = TMP_VERIFY_DIR / estado_local.name
+
+    temporal.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    return temporal, estado_local, payload
+
+
 def limpiar_temporales() -> None:
     try:
         if TMP_VERIFY_DIR.exists():
@@ -1653,6 +1753,93 @@ def ejecutar_sincronizacion(
         ):
             return 1
 
+    try:
+        (
+            estado_tmp,
+            estado_local,
+            estado_payload,
+        ) = crear_estado_retencion_temporal(
+            contexto,
+            remote_base,
+        )
+
+        relativa_estado = estado_local.relative_to(
+            contexto["carpeta_periodo"]
+        ).as_posix()
+
+        remote_estado = (
+            f"{remote_base}/{relativa_estado}"
+        ).strip("/")
+
+        print("-" * 100)
+        print("Publicando estado de retencion trimestral:")
+        print(f"   Local temporal: {estado_tmp}")
+        print(f"   Remoto:         {remote_estado}")
+
+        item_estado = obtener_item_por_path(
+            BACKUP_DRIVE_ID,
+            remote_estado,
+        )
+
+        if item_estado is not None:
+            iguales, _ = comparar_local_remoto(
+                estado_tmp,
+                relativa_estado,
+                item_estado,
+            )
+
+            if iguales:
+                print(
+                    "Estado remoto de retencion ya era "
+                    "identico; no se volvio a subir."
+                )
+            elif not subir_y_verificar(
+                remote_estado,
+                estado_tmp,
+                relativa_estado,
+            ):
+                raise RuntimeError(
+                    "No se pudo publicar/verificar el estado "
+                    "remoto de retencion trimestral."
+                )
+
+        elif not subir_y_verificar(
+            remote_estado,
+            estado_tmp,
+            relativa_estado,
+        ):
+            raise RuntimeError(
+                "No se pudo publicar/verificar el estado "
+                "remoto de retencion trimestral."
+            )
+
+        estado_local.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        temporal_local = estado_local.with_suffix(
+            estado_local.suffix + ".tmp"
+        )
+        temporal_local.write_bytes(
+            estado_tmp.read_bytes()
+        )
+        temporal_local.replace(estado_local)
+
+        estado_tmp.unlink(missing_ok=True)
+
+        print(
+            "Retencion local trimestral habilitada hasta: "
+            f"{estado_payload['eliminacion_local_permitida_desde']}"
+        )
+
+    except Exception as exc:
+        print(
+            "ERROR registrando retencion trimestral: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return 1
+
     print("-" * 100)
     print("✅ JERARQUÍA TRIMESTRAL COMPLETA SINCRONIZADA Y VERIFICADA.")
     print(f"Archivos creados: {creados}")
@@ -1661,6 +1848,11 @@ def ejecutar_sincronizacion(
     print(f"Extras remotos conservados sin eliminación: {len(plan['extras'])}")
     print("Destino utilizado: uno solo.")
     print("El Excel activo y el estado trimestral permanecen intactos.")
+    print(
+        f"Retencion local trimestral: politica de "
+        f"{RETENCION_LOCAL_DIAS} dias; el vencimiento original "
+        "se conserva si la jerarquia no cambia."
+    )
     print("Las autoeliminaciones siguen pendientes y bloqueadas.")
     return 0
 

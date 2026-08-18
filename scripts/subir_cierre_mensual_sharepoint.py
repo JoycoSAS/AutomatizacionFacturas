@@ -60,7 +60,7 @@ except Exception:
 from services.m365.token import get_access_token
 from trimestre_activo import cargar_trimestre_activo
 
-VERSION_UPLOAD = "2026-08-05-UPLOAD-CIERRE-MENSUAL-V4-SIN-DUPLICAR-SEMANAS-NI-ZIP"
+VERSION_UPLOAD = "2026-08-14-UPLOAD-CIERRE-MENSUAL-V5-RETENCION-IDEMPOTENTE"
 GRAPH = "https://graph.microsoft.com/v1.0"
 
 HTTP_REINTENTABLES_SUBIDA = {408, 429, 500, 502, 503, 504}
@@ -888,14 +888,200 @@ def escribir_validacion_remota(
     return path
 
 
+def digest_publicacion_desde_resultados(
+    resultados: list[dict[str, Any]],
+) -> str:
+    normalizados: list[dict[str, str]] = []
+
+    for resultado in resultados:
+        if not isinstance(resultado, dict):
+            raise RuntimeError(
+                "Resultado de publicacion mensual invalido."
+            )
+
+        if resultado.get("ok") is not True:
+            raise RuntimeError(
+                "No se puede calcular digest mensual "
+                "con resultados no OK."
+            )
+
+        archivo = str(
+            resultado.get("archivo") or ""
+        ).strip()
+
+        if not archivo:
+            raise RuntimeError(
+                "Resultado mensual sin ruta de archivo."
+            )
+
+        tipo = str(
+            resultado.get("tipo") or ""
+        ).strip()
+
+        if tipo == "excel_datos_hoja_celda":
+            digest = resultado.get("local_digest")
+
+            if not isinstance(digest, dict):
+                raise RuntimeError(
+                    f"Excel mensual sin local_digest: {archivo}"
+                )
+
+            huella = str(
+                digest.get("sha256_datos") or ""
+            ).strip().lower()
+
+            if not huella:
+                raise RuntimeError(
+                    f"Excel mensual sin sha256_datos: {archivo}"
+                )
+
+        else:
+            huella = str(
+                resultado.get("sha256_local") or ""
+            ).strip().lower()
+
+            if not huella:
+                raise RuntimeError(
+                    f"Archivo mensual sin SHA256 local: {archivo}"
+                )
+
+        normalizados.append(
+            {
+                "archivo": archivo,
+                "tipo": tipo,
+                "huella": huella,
+            }
+        )
+
+    normalizados.sort(
+        key=lambda x: x["archivo"]
+    )
+
+    serializado = json.dumps(
+        normalizados,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    return sha256_bytes(serializado)
+
+
+def digest_publicacion_desde_validacion(
+    validacion_path: Path,
+) -> str:
+    data = json.loads(
+        validacion_path.read_text(encoding="utf-8")
+    )
+
+    if data.get("ok") is not True:
+        raise RuntimeError(
+            "La validacion remota mensual anterior no esta OK."
+        )
+
+    resultados = data.get("resultados")
+
+    if not isinstance(resultados, list) or not resultados:
+        raise RuntimeError(
+            "La validacion remota mensual anterior "
+            "no tiene resultados."
+        )
+
+    return digest_publicacion_desde_resultados(
+        resultados
+    )
+
+
 def crear_estado_retencion_temporal(
     inicio: _dt.date,
     fin: _dt.date,
     remote_base: str,
     trimestre: dict[str, Any],
+    estado_local: Path,
+    digest_publicacion: str,
+    total_archivos_publicacion: int,
+    digest_publicacion_previo: str | None = None,
 ) -> tuple[Path, dict[str, Any]]:
-    ahora = _dt.datetime.now(ZONA_HORARIA)
     periodo = periodo_nombre(inicio, fin)
+
+    if estado_local.is_file():
+        try:
+            existente = json.loads(
+                estado_local.read_text(encoding="utf-8")
+            )
+
+            digest_existente = str(
+                existente.get("digest_publicacion") or ""
+            ).strip().lower()
+
+            mismo_contenido = (
+                digest_existente == digest_publicacion
+                if digest_existente
+                else (
+                    bool(digest_publicacion_previo)
+                    and digest_publicacion_previo
+                    == digest_publicacion
+                )
+            )
+
+            vigente = bool(
+                existente.get("tipo")
+                == "estado_retencion_local_cierre_mensual"
+                and existente.get("ok") is True
+                and existente.get(
+                    "validacion_remota_publicada_y_verificada"
+                ) is True
+                and existente.get("periodo") == periodo
+                and existente.get("remote_base")
+                == remote_base
+                and int(
+                    existente.get("retencion_local_dias") or -1
+                ) == RETENCION_LOCAL_DIAS
+                and bool(existente.get("validado_en"))
+                and bool(
+                    existente.get(
+                        "eliminacion_local_permitida_desde"
+                    )
+                )
+                and mismo_contenido
+            )
+
+            if vigente:
+                payload = dict(existente)
+
+                payload["digest_publicacion"] = (
+                    digest_publicacion
+                )
+                payload["total_archivos_publicacion"] = (
+                    total_archivos_publicacion
+                )
+
+                TMP_VERIFY_DIR.mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
+
+                path_tmp = (
+                    TMP_VERIFY_DIR
+                    / f"estado_retencion_mensual_{periodo}.json"
+                )
+
+                path_tmp.write_text(
+                    json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+
+                return path_tmp, payload
+
+        except Exception:
+            pass
+
+    ahora = _dt.datetime.now(ZONA_HORARIA)
+
     payload = {
         "tipo": "estado_retencion_local_cierre_mensual",
         "version": VERSION_UPLOAD,
@@ -911,25 +1097,40 @@ def crear_estado_retencion_temporal(
         "validado_en": ahora.isoformat(timespec="seconds"),
         "retencion_local_dias": RETENCION_LOCAL_DIAS,
         "eliminacion_local_permitida_desde": (
-            ahora + _dt.timedelta(days=RETENCION_LOCAL_DIAS)
+            ahora + _dt.timedelta(
+                days=RETENCION_LOCAL_DIAS
+            )
         ).isoformat(timespec="seconds"),
         "remote_base": remote_base,
+        "digest_publicacion": digest_publicacion,
+        "total_archivos_publicacion": total_archivos_publicacion,
         "ok": True,
     }
-    TMP_VERIFY_DIR.mkdir(parents=True, exist_ok=True)
-    path = (
+
+    TMP_VERIFY_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    path_tmp = (
         TMP_VERIFY_DIR
         / f"estado_retencion_mensual_{periodo}.json"
     )
-    path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
+
+    path_tmp.write_text(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            indent=2,
+        ),
         encoding="utf-8",
     )
-    return path, payload
+
+    return path_tmp, payload
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Sube cierre mensual V4 al repositorio remoto unico de backups.")
+    parser = argparse.ArgumentParser(description="Sube cierre mensual V5 al repositorio remoto unico de backups.")
     parser.add_argument("--fecha", default="", help="Fecha dentro del mes cerrado. Default: mes anterior.")
     parser.add_argument("--inicio", default="", help="Primer dia del mes, formato YYYY-MM-DD.")
     parser.add_argument("--fin", default="", help="Ultimo dia del mismo mes, formato YYYY-MM-DD.")
@@ -971,7 +1172,7 @@ def main() -> int:
     trimestre = trimestre_inicio
 
     print("=" * 100)
-    print("SUBIDA CIERRE MENSUAL V4 A REPOSITORIO DE BACKUPS - FACTURAS JOYCO")
+    print("SUBIDA CIERRE MENSUAL V5 A REPOSITORIO DE BACKUPS - FACTURAS JOYCO")
     print("=" * 100)
     print(f"Version: {VERSION_UPLOAD}")
     print(f"Root: {ROOT}")
@@ -1068,7 +1269,6 @@ def main() -> int:
     estado_local = (
         cierre_dir / "05_Validaciones" / f"estado_retencion_mensual_{periodo}.json"
     )
-    estado_local.unlink(missing_ok=True)
     try:
         if TMP_VERIFY_DIR.exists():
             shutil.rmtree(TMP_VERIFY_DIR, ignore_errors=True)
@@ -1114,12 +1314,43 @@ def main() -> int:
         for rel_path in rutas_esperadas
         if rel_path in resultados_por_ruta
     ]
+
+    digest_publicacion_previo = None
+
+    if estado_local.is_file() and validacion_anterior.is_file():
+        try:
+            digest_publicacion_previo = (
+                digest_publicacion_desde_validacion(
+                    validacion_anterior
+                )
+            )
+        except Exception as exc:
+            print(
+                "No se pudo calcular digest historico "
+                f"de publicacion mensual: {exc}"
+            )
     if len(resultados) != len(todos_los_archivos):
         ok_todos = False
         print(
             "ERROR: no se obtuvo un resultado para cada archivo del cierre "
             f"({len(resultados)}/{len(todos_los_archivos)})."
         )
+
+    digest_publicacion_actual = None
+
+    if ok_todos and len(resultados) == len(todos_los_archivos):
+        try:
+            digest_publicacion_actual = (
+                digest_publicacion_desde_resultados(
+                    resultados
+                )
+            )
+        except Exception as exc:
+            ok_todos = False
+            print(
+                "ERROR calculando digest estable "
+                f"de publicacion mensual: {exc}"
+            )
 
     validacion_remota = escribir_validacion_remota(
         cierre_dir,
@@ -1154,11 +1385,20 @@ def main() -> int:
 
     if ok_todos and validacion_publicada:
         try:
+            if not digest_publicacion_actual:
+                raise RuntimeError(
+                    "No existe digest de publicacion mensual validado."
+                )
+
             estado_tmp, estado_payload = crear_estado_retencion_temporal(
                 inicio,
                 fin,
                 remote_base,
                 trimestre,
+                estado_local,
+                digest_publicacion_actual,
+                len(resultados),
+                digest_publicacion_previo,
             )
             rel_estado = f"05_Validaciones/{estado_tmp.name}"
             remote_estado = f"{remote_base}/{rel_estado}".strip("/")
@@ -1170,27 +1410,43 @@ def main() -> int:
             )
             if not ok_estado:
                 raise RuntimeError("No se pudo verificar el estado remoto de retencion.")
-            estado_local.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(estado_tmp, estado_local)
+            estado_local.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            temporal_local = estado_local.with_suffix(
+                estado_local.suffix + ".tmp"
+            )
+
+            temporal_local.write_bytes(
+                estado_tmp.read_bytes()
+            )
+
+            temporal_local.replace(
+                estado_local
+            )
             print(
                 "Retencion local habilitada hasta: "
                 f"{estado_payload['eliminacion_local_permitida_desde']}"
             )
         except Exception as exc:
             ok_todos = False
-            estado_local.unlink(missing_ok=True)
             print(f"ERROR registrando retencion mensual: {type(exc).__name__}: {exc}")
 
     shutil.rmtree(TMP_VERIFY_DIR, ignore_errors=True)
     print("-" * 100)
     print(f"Validacion remota local: {validacion_remota}")
     if ok_todos:
-        print("Subida de cierre mensual V4 terminada correctamente en el repositorio unico de backups.")
+        print("Subida de cierre mensual V5 terminada correctamente en el repositorio unico de backups.")
         print("Verificacion aplicada archivo por archivo despues de descargar desde Graph.")
-        print(f"Retencion local: {RETENCION_LOCAL_DIAS} dias desde la validacion remota.")
+        print(
+            f"Retencion local: politica de {RETENCION_LOCAL_DIAS} dias; "
+            "el vencimiento original se conserva si el contenido no cambia."
+        )
         print("=" * 100)
         return 0
-    print("Subida de cierre mensual V4 termino con errores.")
+    print("Subida de cierre mensual V5 termino con errores.")
     print("No borres ni archives localmente hasta revisar el error.")
     print("=" * 100)
     return 1

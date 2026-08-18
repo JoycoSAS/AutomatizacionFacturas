@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 JOYCO - Facturas Procesador
-Cierre semanal local seguro V3
+Cierre semanal local seguro V4
 
 Politica:
-- El cierre semanal NO se construye desde los Excel diarios.
-- Genera un Excel semanal cruzando el Excel operativo principal contra las auditorias de la semana.
+- El cierre semanal soporta modo normal y modo de reconstruccion controlada.
+- En modo normal usa Excel operativo + auditorias; en reconstruccion concatena cierres diarios fisicos validados.
 - Los cierres diarios permanecen como carpetas hermanas de Semanal y no se copian dentro del cierre semanal.
 - Incluye logs de producción local y VPS correspondientes al rango semanal.
 - No sube a OneDrive/SharePoint. La subida se hace con scripts/subir_cierre_semanal_sharepoint.py.
@@ -54,7 +54,7 @@ except Exception:
 
 from trimestre_activo import cargar_trimestre_activo
 
-VERSION_CIERRE = "2026-08-05-CIERRE-SEMANAL-V3-SIN-DUPLICAR-DIARIOS"
+VERSION_CIERRE = "2026-08-13-CIERRE-SEMANAL-V4-DESDE-DIARIOS-RECONSTRUCCION"
 
 DATA_DIR = ROOT / "data"
 AUDIT_DIR = DATA_DIR / "audit"
@@ -76,6 +76,13 @@ LOCKS_DIR = DATA_DIR / "locks"
 FACTURAS_PATH = Path(os.getenv("ARCHIVO_EXCEL_LOCAL", str(DATA_DIR / "facturas.xlsx")))
 if not FACTURAS_PATH.is_absolute():
     FACTURAS_PATH = ROOT / FACTURAS_PATH
+
+CIERRE_SEMANAL_DESDE_DIARIOS = (
+    str(os.getenv("CIERRE_SEMANAL_DESDE_DIARIOS") or "")
+    .strip()
+    .lower()
+    in {"1", "true", "si", "sí", "yes", "on"}
+)
 
 LOCK_FILE = LOCKS_DIR / "cierre_semanal_facturas.lock"
 LOCK_TTL_SECONDS = int(os.getenv("LOCK_TTL_SECONDS", "3600") or "3600")
@@ -172,7 +179,7 @@ EXCEL_TABLE_NAME = "TblFacturasSemanal"
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Genera cierre semanal local seguro V3.")
+    parser = argparse.ArgumentParser(description="Genera cierre semanal local seguro V4.")
     parser.add_argument(
         "--fecha",
         default=_dt.date.today().isoformat(),
@@ -668,6 +675,144 @@ def fila_match_candidatos(row_values: Sequence[Any], headers: Sequence[Any], can
     return False
 
 
+
+def obtener_filas_semanales_desde_diarios(
+    inicio: _dt.date,
+    fin: _dt.date,
+) -> tuple[list[Any], list[list[Any]], dict[str, Any]]:
+    """
+    Reconstruye el Excel semanal concatenando únicamente los Excel
+    diarios físicos existentes dentro del rango solicitado.
+
+    Este modo se usa para reconstrucción histórica controlada.
+    No vuelve a inferir fechas desde auditorías ni desde facturas.xlsx.
+    """
+    headers_base: Optional[list[Any]] = None
+    rows_semana: list[list[Any]] = []
+    diarios_usados: list[dict[str, Any]] = []
+
+    fecha = inicio
+
+    while fecha <= fin:
+        fecha_str = fecha.isoformat()
+
+        patron = (
+            f"**/Diario_{fecha_str}/"
+            f"01_Excel_Diario/"
+            f"facturas_diario_{fecha_str}.xlsx"
+        )
+
+        encontrados = sorted(
+            p for p in CIERRES_DIR.glob(patron)
+            if p.is_file()
+        )
+
+        if len(encontrados) > 1:
+            raise RuntimeError(
+                "Se encontraron varios cierres diarios para "
+                f"{fecha_str}: {[rel(x) for x in encontrados]}"
+            )
+
+        if not encontrados:
+            fecha += _dt.timedelta(days=1)
+            continue
+
+        excel_diario = encontrados[0]
+
+        wb = load_workbook(
+            excel_diario,
+            data_only=True,
+            read_only=True,
+        )
+
+        try:
+            ws = (
+                wb[EXCEL_SHEET_NAME]
+                if EXCEL_SHEET_NAME in wb.sheetnames
+                else wb[wb.sheetnames[0]]
+            )
+
+            rows_iter = ws.iter_rows(values_only=True)
+
+            try:
+                raw_headers = next(rows_iter)
+            except StopIteration:
+                raise RuntimeError(
+                    f"Excel diario vacío/sin encabezados: {excel_diario}"
+                )
+
+            headers = list(raw_headers or [])
+
+            if headers_base is None:
+                headers_base = headers
+            elif headers != headers_base:
+                raise RuntimeError(
+                    "Encabezados incompatibles entre cierres diarios. "
+                    f"Fecha problemática: {fecha_str}"
+                )
+
+            filas_dia = 0
+
+            for values in rows_iter:
+                row = list(values or [])
+
+                if len(row) < len(headers):
+                    row.extend(
+                        [None] * (len(headers) - len(row))
+                    )
+                elif len(row) > len(headers):
+                    row = row[:len(headers)]
+
+                if any(v not in (None, "") for v in row):
+                    rows_semana.append(row)
+                    filas_dia += 1
+
+            diarios_usados.append(
+                {
+                    "fecha": fecha_str,
+                    "excel": rel(excel_diario),
+                    "filas": filas_dia,
+                }
+            )
+
+        finally:
+            wb.close()
+
+        fecha += _dt.timedelta(days=1)
+
+    if headers_base is None:
+        raise RuntimeError(
+            "No se encontró ningún cierre diario físico dentro "
+            f"del rango {inicio.isoformat()} a {fin.isoformat()}."
+        )
+
+    meta: dict[str, Any] = {
+        "metodo_seleccion": "cierres_diarios_v5_concatenados",
+        "fuente": "cierres_diarios_fisicos",
+        "rango_inicio": inicio.isoformat(),
+        "rango_fin": fin.isoformat(),
+        "diarios_usados": diarios_usados,
+        "cantidad_diarios_usados": len(diarios_usados),
+        "filas_semanales": len(rows_semana),
+        "advertencias": [],
+    }
+
+    print(
+        "Reconstruccion semanal desde diarios: "
+        f"diarios={len(diarios_usados)} | "
+        f"filas={len(rows_semana)}"
+    )
+
+    for item in diarios_usados:
+        print(
+            f"   {item['fecha']} | "
+            f"filas={item['filas']} | "
+            f"{item['excel']}"
+        )
+
+    return headers_base, rows_semana, meta
+
+
 def obtener_filas_semanales_desde_excel(
     inicio: _dt.date,
     fin: _dt.date,
@@ -917,7 +1062,7 @@ def validar_excel_generado(path: Path, expected_columns: int) -> dict[str, Any]:
 
 def generar_resumen_txt(path: Path, manifest: dict[str, Any]) -> None:
     lines = [
-        "CIERRE SEMANAL LOCAL SEGURO V3 - FACTURAS JOYCO",
+        "CIERRE SEMANAL LOCAL SEGURO V4 - FACTURAS JOYCO",
         "=" * 90,
         f"Version: {manifest['version']}",
         f"Rango semana: {manifest['semana_inicio']} a {manifest['semana_fin']}",
@@ -935,8 +1080,9 @@ def generar_resumen_txt(path: Path, manifest: dict[str, Any]) -> None:
         f"- Total bytes evidencia: {manifest['total_bytes']}",
         "",
         "Regla aplicada:",
-        "- Este cierre semanal se calcula desde data/facturas.xlsx + auditorias de la semana.",
-        "- No consolida desde Excel diarios para evitar arrastrar errores de cierres previos.",
+        "- La fuente utilizada por el cierre semanal queda registrada en fuente_datos segun el modo ejecutado.",
+        "- En modo reconstruccion consolida cierres diarios fisicos validados; "
+        "en modo normal usa Excel principal + auditorias.",
         "- Los cierres diarios permanecen en sus carpetas hermanas y no se duplican dentro de Semanal.",
         "- No se incluye .env real ni secretos.",
         "- No se sube nada desde este script; la subida remota se hace en el paso de OneDrive.",
@@ -1001,7 +1147,7 @@ def main() -> int:
     validacion_path = validaciones_dir / f"validacion_local_semanal_{rango}.json"
 
     print("=" * 100)
-    print("CIERRE SEMANAL LOCAL SEGURO V3 - FACTURAS JOYCO")
+    print("CIERRE SEMANAL LOCAL SEGURO V4 - FACTURAS JOYCO")
     print("=" * 100)
     print(f"Version: {VERSION_CIERRE}")
     print(f"Root: {ROOT}")
@@ -1025,7 +1171,21 @@ def main() -> int:
     try:
         audit_files = recolectar_audits(inicio, fin)
         log_files = recolectar_logs(inicio, fin)
-        headers, filas_semanales, meta_seleccion = obtener_filas_semanales_desde_excel(inicio, fin, audit_files)
+        if CIERRE_SEMANAL_DESDE_DIARIOS:
+            headers, filas_semanales, meta_seleccion = (
+                obtener_filas_semanales_desde_diarios(
+                    inicio,
+                    fin,
+                )
+            )
+        else:
+            headers, filas_semanales, meta_seleccion = (
+                obtener_filas_semanales_desde_excel(
+                    inicio,
+                    fin,
+                    audit_files,
+                )
+            )
 
         advertencias: list[str] = []
         advertencias.extend(meta_seleccion.get("advertencias", []))
@@ -1087,7 +1247,7 @@ def main() -> int:
         validacion_path.write_text(json.dumps(validacion, ensure_ascii=False, indent=2), encoding="utf-8")
 
         manifest = {
-            "tipo": "cierre_semanal_local_seguro_v3",
+            "tipo": "cierre_semanal_local_seguro_v4",
             "version": VERSION_CIERRE,
             "trimestre": {
                 "periodo_activo": trimestre["periodo_activo"],
@@ -1111,9 +1271,30 @@ def main() -> int:
             "excel_semanal": excel_info,
             "seleccion_filas": meta_seleccion,
             "fuente_datos": {
-                "principal": rel(FACTURAS_PATH),
+                "modo": (
+                    "cierres_diarios_fisicos"
+                    if CIERRE_SEMANAL_DESDE_DIARIOS
+                    else "excel_principal_mas_auditorias"
+                ),
+                "principal": (
+                    None
+                    if CIERRE_SEMANAL_DESDE_DIARIOS
+                    else rel(FACTURAS_PATH)
+                ),
+                "cierres_diarios": (
+                    meta_seleccion.get("diarios_usados", [])
+                    if CIERRE_SEMANAL_DESDE_DIARIOS
+                    else []
+                ),
                 "auditorias_semana": [rel(p) for p in audit_files],
-                "nota": "Los cierres diarios son carpetas hermanas independientes y no se copian dentro de Semanal.",
+                "nota": (
+                    "Reconstruccion semanal desde cierres diarios fisicos validados; "
+                    "los diarios permanecen como carpetas hermanas y no se duplican."
+                    if CIERRE_SEMANAL_DESDE_DIARIOS
+                    else
+                    "Modo normal desde Excel principal y auditorias; "
+                    "los cierres diarios no se duplican dentro de Semanal."
+                ),
             },
             "conteos": {
                 "filas_semanales": len(filas_semanales),
@@ -1123,7 +1304,7 @@ def main() -> int:
             },
             "validacion_local": rel(validacion_path),
             "advertencias": advertencias,
-            "nota": "Cierre semanal V3: fuente oficial Excel principal + auditorias de la semana, sin duplicar evidencias diarias.",
+            "nota": "Cierre semanal V4: fuente determinada por el modo de ejecucion, sin duplicar evidencias diarias.",
         }
 
         archivos_pre = listar_archivos_para_manifest(cierre_dir, excluir={manifest_path})
@@ -1159,13 +1340,13 @@ def main() -> int:
             return 3
 
         print("=" * 100)
-        print("Cierre semanal local V3 generado correctamente.")
+        print("Cierre semanal local V4 generado correctamente.")
         print("Siguiente paso: subir/validar en OneDrive con scripts\\subir_cierre_semanal_sharepoint.py")
         print("=" * 100)
         return 0
 
     except Exception as exc:
-        print(f"ERROR generando cierre semanal local V3: {type(exc).__name__}: {exc}")
+        print(f"ERROR generando cierre semanal local V4: {type(exc).__name__}: {exc}")
         print("No subas ni archives nada hasta revisar el error.")
         return 1
     finally:

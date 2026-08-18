@@ -37,6 +37,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional, Tuple
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import requests
 from openpyxl import load_workbook
@@ -53,8 +54,10 @@ except Exception:
 from services.m365.token import get_access_token
 from trimestre_activo import cargar_trimestre_activo
 
-VERSION_UPLOAD = "2026-08-04-UPLOAD-CIERRE-DIARIO-V3-JERARQUIA-TRIMESTRAL"
+VERSION_UPLOAD = "2026-08-14-UPLOAD-CIERRE-DIARIO-V5-RETENCION-IDEMPOTENTE"
 GRAPH = "https://graph.microsoft.com/v1.0"
+RETENCION_LOCAL_DIAS = 7
+ZONA_HORARIA = ZoneInfo("America/Bogota")
 
 DATA_DIR = ROOT / "data"
 CIERRES_DIR = DATA_DIR / "cierres_diarios"
@@ -453,6 +456,10 @@ def debe_subir(p: Path) -> bool:
         return False
     if p.suffix.lower() in EXCLUIR_EXT:
         return False
+    if p.name.startswith("validacion_remota_"):
+        return False
+    if p.name.startswith("estado_retencion_"):
+        return False
     return True
 
 
@@ -622,6 +629,251 @@ def escribir_validacion_remota(
     return path
 
 
+def digest_publicacion_desde_resultados(
+    resultados: list[dict[str, Any]],
+) -> str:
+    """
+    Huella estable del contenido publicado.
+
+    Excel:
+        digest lógico de datos/celdas.
+    Otros:
+        SHA256 binario local.
+
+    No usa IDs, URLs, timestamps ni datos variables de Graph.
+    """
+    normalizados: list[dict[str, str]] = []
+
+    for resultado in resultados:
+        if not isinstance(resultado, dict):
+            raise RuntimeError(
+                "Resultado de publicación inválido."
+            )
+
+        if resultado.get("ok") is not True:
+            raise RuntimeError(
+                "No se puede calcular digest con resultados no OK."
+            )
+
+        rel = str(resultado.get("rel") or "").strip()
+
+        if not rel:
+            raise RuntimeError(
+                "Resultado sin ruta relativa."
+            )
+
+        tipo = str(
+            resultado.get("tipo_verificacion") or ""
+        ).strip()
+
+        digest_excel = resultado.get("digest_local")
+        sha_binario = str(
+            resultado.get("sha256_local") or ""
+        ).strip().lower()
+
+        if tipo == "excel_datos_hoja_celda":
+            if isinstance(digest_excel, str):
+                huella = digest_excel.strip().lower()
+            elif isinstance(digest_excel, dict):
+                huella = str(
+                    digest_excel.get("sha256_datos") or ""
+                ).strip().lower()
+            else:
+                huella = ""
+
+            if not huella:
+                raise RuntimeError(
+                    f"Excel sin digest local: {rel}"
+                )
+        else:
+            huella = sha_binario
+
+            if not huella:
+                raise RuntimeError(
+                    f"Archivo sin SHA256 local: {rel}"
+                )
+
+        normalizados.append(
+            {
+                "rel": rel,
+                "tipo": tipo,
+                "huella": huella,
+            }
+        )
+
+    normalizados.sort(key=lambda x: x["rel"])
+
+    serializado = json.dumps(
+        normalizados,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    return sha256_bytes(serializado)
+
+
+def digest_publicacion_desde_validacion(
+    validacion_path: Path,
+) -> str:
+    data = json.loads(
+        validacion_path.read_text(encoding="utf-8")
+    )
+
+    if data.get("ok") is not True:
+        raise RuntimeError(
+            "La validación remota anterior no está OK."
+        )
+
+    resultados = data.get("resultados")
+
+    if not isinstance(resultados, list) or not resultados:
+        raise RuntimeError(
+            "La validación remota anterior no tiene resultados."
+        )
+
+    return digest_publicacion_desde_resultados(
+        resultados
+    )
+
+
+def crear_estado_retencion_temporal(
+    fecha: _dt.date,
+    remote_base: str,
+    trimestre: dict[str, Any],
+    digest_publicacion: str,
+    total_archivos_publicacion: int,
+    digest_publicacion_previo: str | None = None,
+) -> tuple[Path, dict[str, Any]]:
+    fecha_s = fecha.isoformat()
+
+    estado_local = (
+        buscar_cierre_local(fecha, trimestre)
+        / "05_Validaciones"
+        / f"estado_retencion_diario_{fecha_s}.json"
+    )
+
+    # Reutiliza la fecha original únicamente si el estado existente
+    # corresponde al mismo cierre y al mismo contenido publicado.
+    if estado_local.is_file():
+        try:
+            existente = json.loads(
+                estado_local.read_text(encoding="utf-8")
+            )
+
+            digest_existente = str(
+                existente.get("digest_publicacion") or ""
+            ).strip().lower()
+
+            mismo_contenido = (
+                digest_existente == digest_publicacion
+                if digest_existente
+                else (
+                    bool(digest_publicacion_previo)
+                    and digest_publicacion_previo
+                    == digest_publicacion
+                )
+            )
+
+            vigente = bool(
+                existente.get("tipo")
+                == "estado_retencion_local_cierre_diario"
+                and existente.get("ok") is True
+                and existente.get(
+                    "validacion_remota_publicada_y_verificada"
+                ) is True
+                and existente.get("fecha") == fecha_s
+                and existente.get("remote_base") == remote_base
+                and int(
+                    existente.get("retencion_local_dias") or -1
+                ) == RETENCION_LOCAL_DIAS
+                and bool(existente.get("validado_en"))
+                and bool(
+                    existente.get(
+                        "eliminacion_local_permitida_desde"
+                    )
+                )
+                and mismo_contenido
+            )
+
+            if vigente:
+                payload = dict(existente)
+
+                # Migración transparente de estados históricos que
+                # todavía no tenían digest_publicacion.
+                payload["digest_publicacion"] = digest_publicacion
+                payload["total_archivos_publicacion"] = (
+                    total_archivos_publicacion
+                )
+
+                TMP_VERIFY_DIR.mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
+
+                path_tmp = (
+                    TMP_VERIFY_DIR
+                    / f"estado_retencion_diario_{fecha_s}.json"
+                )
+
+                path_tmp.write_text(
+                    json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+
+                return path_tmp, payload
+
+        except Exception:
+            pass
+
+    ahora = _dt.datetime.now(ZONA_HORARIA)
+
+    payload = {
+        "tipo": "estado_retencion_local_cierre_diario",
+        "version": VERSION_UPLOAD,
+        "trimestre": {
+            "periodo_activo": trimestre["periodo_activo"],
+            "nombre_carpeta": trimestre["nombre_carpeta"],
+            "fecha_inicio": trimestre["fecha_inicio"],
+            "fecha_fin": trimestre["fecha_fin"],
+            "ruta_relativa": trimestre["ruta_relativa"],
+        },
+        "fecha": fecha_s,
+        "validacion_remota_publicada_y_verificada": True,
+        "validado_en": ahora.isoformat(timespec="seconds"),
+        "retencion_local_dias": RETENCION_LOCAL_DIAS,
+        "eliminacion_local_permitida_desde": (
+            ahora + _dt.timedelta(days=RETENCION_LOCAL_DIAS)
+        ).isoformat(timespec="seconds"),
+        "remote_base": remote_base,
+        "digest_publicacion": digest_publicacion,
+        "total_archivos_publicacion": total_archivos_publicacion,
+        "ok": True,
+    }
+
+    TMP_VERIFY_DIR.mkdir(parents=True, exist_ok=True)
+
+    path_tmp = (
+        TMP_VERIFY_DIR
+        / f"estado_retencion_diario_{fecha_s}.json"
+    )
+
+    path_tmp.write_text(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    return path_tmp, payload
+
+
 def limpiar_tmp() -> None:
     try:
         if TMP_VERIFY_DIR.exists():
@@ -631,7 +883,7 @@ def limpiar_tmp() -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Sube cierre diario V3 al repositorio remoto único de backups.")
+    parser = argparse.ArgumentParser(description="Sube cierre diario V5 al repositorio remoto único de backups.")
     parser.add_argument("--fecha", default="", help="Fecha del cierre en formato YYYY-MM-DD. Default: hoy.")
     parser.add_argument("--dry-run", action="store_true", help="Solo muestra qué subiría, sin llamar Graph.")
     args = parser.parse_args()
@@ -640,7 +892,7 @@ def main() -> int:
     fecha_s = fecha.isoformat()
 
     print("=" * 100)
-    print("SUBIDA CIERRE DIARIO V3 A REPOSITORIO DE BACKUPS - FACTURAS JOYCO")
+    print("SUBIDA CIERRE DIARIO V5 A REPOSITORIO DE BACKUPS - FACTURAS JOYCO")
     print("=" * 100)
     print(f"Versión: {VERSION_UPLOAD}")
     print(f"Root: {ROOT}")
@@ -662,6 +914,11 @@ def main() -> int:
         print("❌ No hay archivos válidos para subir.")
         return 1
 
+    estado_local = (
+        cierre_dir
+        / "05_Validaciones"
+        / f"estado_retencion_diario_{fecha_s}.json"
+    )
     print(f"📁 Cierre local: {cierre_dir}")
     print(f"📆 Trimestre activo: {trimestre['nombre_carpeta']}")
     print(
@@ -680,6 +937,26 @@ def main() -> int:
         print("Si la ruta remota base es correcta, ejecuta sin --dry-run.")
         print("=" * 100)
         return 0
+
+    digest_publicacion_previo = None
+    validacion_remota_previa = (
+        cierre_dir
+        / "05_Validaciones"
+        / f"validacion_remota_{fecha_s}.json"
+    )
+
+    if estado_local.is_file() and validacion_remota_previa.is_file():
+        try:
+            digest_publicacion_previo = (
+                digest_publicacion_desde_validacion(
+                    validacion_remota_previa
+                )
+            )
+        except Exception as exc:
+            print(
+                "⚠️ No se pudo calcular digest histórico "
+                f"de publicación: {exc}"
+            )
 
     try:
         drive_id, drive = resolver_drive_backup()
@@ -724,6 +1001,22 @@ def main() -> int:
                 }
             )
 
+    digest_publicacion_actual = None
+
+    if ok_todos:
+        try:
+            digest_publicacion_actual = (
+                digest_publicacion_desde_resultados(
+                    resultados
+                )
+            )
+        except Exception as exc:
+            ok_todos = False
+            print(
+                "❌ No se pudo calcular digest estable "
+                f"de publicación: {exc}"
+            )
+
     validacion_remota = escribir_validacion_remota(
         cierre_dir=cierre_dir,
         fecha=fecha,
@@ -735,6 +1028,7 @@ def main() -> int:
     )
 
     # Sube la validación remota como evidencia final.
+    validacion_publicada = False
     try:
         rel = validacion_remota.relative_to(cierre_dir).as_posix()
         remote_path = f"{remote_base}/{rel}".strip("/")
@@ -747,6 +1041,7 @@ def main() -> int:
             local=validacion_remota,
             rel=rel,
         )
+        validacion_publicada = bool(ok_validacion)
         if not ok_validacion:
             ok_todos = False
         resultados.append(resultado_validacion)
@@ -754,17 +1049,89 @@ def main() -> int:
         ok_todos = False
         print(f"❌ Error subiendo/verificando validación remota final: {exc}")
 
+    if ok_todos and validacion_publicada:
+        try:
+            if not digest_publicacion_actual:
+                raise RuntimeError(
+                    "No existe digest de publicación validado."
+                )
+
+            estado_tmp, estado_payload = crear_estado_retencion_temporal(
+                fecha,
+                remote_base,
+                trimestre,
+                digest_publicacion_actual,
+                len(
+                    json.loads(
+                        validacion_remota.read_text(
+                            encoding="utf-8"
+                        )
+                    ).get("resultados") or []
+                ),
+                digest_publicacion_previo,
+            )
+            rel_estado = f"05_Validaciones/{estado_tmp.name}"
+            remote_estado = f"{remote_base}/{rel_estado}".strip("/")
+
+            print("☁️ Subiendo estado de retención:")
+            print(f"   Local temporal: {estado_tmp}")
+            print(f"   Remoto:         {remote_estado}")
+
+            ok_estado, _resultado_estado = subir_y_verificar_con_reintentos(
+                drive_id=drive_id,
+                remote_path=remote_estado,
+                local=estado_tmp,
+                rel=rel_estado,
+            )
+
+            if not ok_estado:
+                raise RuntimeError(
+                    "No se pudo verificar el estado remoto de retención."
+                )
+
+            estado_local.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            temporal_local = estado_local.with_suffix(
+                estado_local.suffix + ".tmp"
+            )
+
+            temporal_local.write_bytes(
+                estado_tmp.read_bytes()
+            )
+
+            temporal_local.replace(
+                estado_local
+            )
+
+            print(
+                "✅ Retención local habilitada hasta: "
+                f"{estado_payload['eliminacion_local_permitida_desde']}"
+            )
+        except Exception as exc:
+            ok_todos = False
+            print(
+                "❌ Error registrando retención diaria: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
     limpiar_tmp()
 
     print("-" * 100)
     print(f"📄 Validación remota local: {validacion_remota}")
     if ok_todos:
-        print("✅ Subida de cierre diario V3 terminada correctamente en el repositorio único de backups.")
+        print("✅ Subida de cierre diario V5 terminada correctamente en el repositorio único de backups.")
         print("✅ Verificación aplicada archivo por archivo después de descargar desde Graph.")
+        print(
+            f"✅ Retención local: política de {RETENCION_LOCAL_DIAS} días; "
+            "el vencimiento original se conserva si el contenido no cambia."
+        )
         print("=" * 100)
         return 0
 
-    print("❌ Subida de cierre diario V3 terminó con errores.")
+    print("❌ Subida de cierre diario V5 terminó con errores.")
     print("⚠️ No borres ni archives localmente hasta revisar el error.")
     print("=" * 100)
     return 1
