@@ -11,7 +11,7 @@ export LC_ALL="C.UTF-8"
 export TZ="America/Bogota"
 export PYTHONUNBUFFERED="1"
 
-VERSION_WRAPPER="2026-07-28-CIERRE-MENSUAL-CRON-V1"
+VERSION_WRAPPER="2026-08-18-CIERRE-MENSUAL-CRON-V2-JERARQUIA-TRIMESTRAL"
 
 APP_DIR="/opt/joyco/facturas-procesador/app"
 PYTHON_BIN="/opt/joyco/facturas-procesador/venv/bin/python"
@@ -88,7 +88,37 @@ if ! read -r INICIO FIN PERIODO ANIO MES_DIRECTORIO < <(
   exit 70
 fi
 
-CIERRE_DIR="$CIERRE_ROOT/$ANIO/$MES_DIRECTORIO/Mensual"
+TRIMESTRE_RUTA="$(
+  "$PYTHON_BIN" - "$APP_DIR" "$FIN" <<'PY'
+import sys
+from datetime import date
+from pathlib import Path
+
+app_dir = Path(sys.argv[1])
+fecha_fin = date.fromisoformat(sys.argv[2])
+
+sys.path.insert(
+    0,
+    str(app_dir / "scripts"),
+)
+
+from trimestre_activo import cargar_trimestre_activo
+
+trimestre = cargar_trimestre_activo(
+    app_dir,
+    fecha_fin,
+)
+
+print(trimestre["ruta_relativa"])
+PY
+)"
+
+if [[ -z "$TRIMESTRE_RUTA" ]]; then
+  echo "ERROR: no fue posible resolver la ruta del trimestre activo."
+  exit 70
+fi
+
+CIERRE_DIR="$CIERRE_ROOT/$TRIMESTRE_RUTA/$MES_DIRECTORIO/Mensual"
 VALIDACION_LOCAL="$CIERRE_DIR/05_Validaciones/validacion_local_mensual_${PERIODO}.json"
 VALIDACION_REMOTA="$CIERRE_DIR/05_Validaciones/validacion_remota_mensual_${PERIODO}.json"
 ESTADO_RETENCION="$CIERRE_DIR/05_Validaciones/estado_retencion_mensual_${PERIODO}.json"
