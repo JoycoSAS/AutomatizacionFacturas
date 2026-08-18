@@ -166,6 +166,8 @@ env_file = Path(sys.argv[2])
 inicio = sys.argv[3]
 fin = sys.argv[4]
 
+sys.path.insert(0, str(script.parent))
+
 if not load_dotenv(
     dotenv_path=env_file,
     override=True,
@@ -279,6 +281,8 @@ script = Path(sys.argv[1])
 env_file = Path(sys.argv[2])
 inicio = sys.argv[3]
 fin = sys.argv[4]
+
+sys.path.insert(0, str(script.parent))
 
 if not load_dotenv(
     dotenv_path=env_file,

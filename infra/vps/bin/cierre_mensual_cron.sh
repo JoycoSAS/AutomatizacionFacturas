@@ -257,6 +257,8 @@ env_file = Path(sys.argv[2])
 inicio = sys.argv[3]
 fin = sys.argv[4]
 
+sys.path.insert(0, str(script.parent))
+
 os.environ["FACTURAS_ENV_FILE"] = str(env_file)
 
 if not load_dotenv(
@@ -375,6 +377,8 @@ env_file = Path(sys.argv[2])
 inicio = sys.argv[3]
 fin = sys.argv[4]
 modo_reintento = sys.argv[5] == "1"
+
+sys.path.insert(0, str(script.parent))
 
 os.environ["FACTURAS_ENV_FILE"] = str(env_file)
 

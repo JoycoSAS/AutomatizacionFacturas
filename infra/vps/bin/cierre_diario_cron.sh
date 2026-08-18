@@ -139,6 +139,8 @@ script = Path(sys.argv[1])
 env_file = Path(sys.argv[2])
 fecha = sys.argv[3]
 
+sys.path.insert(0, str(script.parent))
+
 if not load_dotenv(
     dotenv_path=env_file,
     override=True,
@@ -214,6 +216,8 @@ from dotenv import load_dotenv
 script = Path(sys.argv[1])
 env_file = Path(sys.argv[2])
 fecha = sys.argv[3]
+
+sys.path.insert(0, str(script.parent))
 
 if not load_dotenv(
     dotenv_path=env_file,
