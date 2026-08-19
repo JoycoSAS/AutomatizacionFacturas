@@ -40,8 +40,8 @@ FACTURAS_ENV = Path(
 )
 
 VERSION = (
-    "2026-08-13-LIMPIEZA-RETENCION-LOCAL-"
-    "V5-BORRADO-LOCAL-JERARQUIA-ESTRICTA"
+    "2026-08-19-LIMPIEZA-RETENCION-LOCAL-"
+    "V6-RUTAS-MANIFEST-PORTABLES-ESTRICTAS"
 )
 
 CONFIRMACION_EJECUCION = "ELIMINAR_SOLO_BACKUPS_LOCALES_VALIDADOS"
@@ -148,7 +148,34 @@ def resolver_archivo_manifest(
 
         candidato = Path(destino)
 
-        if not candidato.is_absolute():
+        if candidato.is_absolute():
+            if not dentro_de(candidato, cierre_dir):
+                partes = candidato.parts
+
+                indices = [
+                    i
+                    for i, parte in enumerate(partes)
+                    if parte == "cierres_diarios"
+                ]
+
+                if not indices:
+                    raise ErrorValidacion(
+                        "Ruta absoluta del manifest fuera "
+                        "de la jerarquia cierres_diarios: "
+                        f"{candidato}"
+                    )
+
+                indice = indices[-1]
+                sufijo = partes[indice + 1:]
+
+                if not sufijo:
+                    raise ErrorValidacion(
+                        "Ruta absoluta del manifest sin "
+                        "archivo relativo a cierres_diarios."
+                    )
+
+                candidato = BASE.joinpath(*sufijo)
+        else:
             candidato = ROOT / candidato
 
     if not dentro_de(candidato, cierre_dir):
