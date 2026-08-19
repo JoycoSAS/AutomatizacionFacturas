@@ -2,17 +2,23 @@
 """
 JOYCO - Limpieza segura de backups locales.
 
-FASE 1:
-- Solo diagnostico.
-- No elimina archivos.
-- No modifica OneDrive/SharePoint.
-- No realiza llamadas a Microsoft Graph.
-- Valida:
-  1. Evidencia e integridad local.
-  2. Evidencia remota almacenada.
-  3. Estado y vencimiento de retencion.
+Funciones:
+- Diagnostico de retencion local.
+- Validacion de evidencia e integridad local.
+- Validacion de evidencia remota almacenada.
+- Revalidacion viva contra Microsoft Graph mediante GET/descarga.
+- Eliminacion exclusivamente local, individual y controlada,
+  solo cuando todas las barreras de seguridad se cumplen.
+- Nunca elimina archivos de OneDrive/SharePoint.
 
-La revalidacion viva contra Graph se incorporara en la siguiente fase.
+Controles obligatorios para eliminacion:
+1. Retencion vencida.
+2. Validacion local correcta.
+3. Evidencia remota almacenada correcta.
+4. Revalidacion viva contra Graph correcta.
+5. Identidad exacta del cierre.
+6. Confirmacion explicita.
+7. Variables de habilitacion y alertas activas.
 """
 
 from __future__ import annotations
@@ -41,7 +47,7 @@ FACTURAS_ENV = Path(
 
 VERSION = (
     "2026-08-19-LIMPIEZA-RETENCION-LOCAL-"
-    "V6-RUTAS-MANIFEST-PORTABLES-ESTRICTAS"
+    "V7-EJECUCION-LOCAL-CONTROLADA"
 )
 
 CONFIRMACION_EJECUCION = "ELIMINAR_SOLO_BACKUPS_LOCALES_VALIDADOS"
@@ -1308,16 +1314,17 @@ def main() -> int:
         "--ejecutar",
         action="store_true",
         help=(
-            "Solicita una futura eliminacion local. "
-            "En esta version sigue BLOQUEADA."
+            "Ejecuta la eliminacion exclusivamente local "
+            "despues de superar todas las validaciones y "
+            "barreras de seguridad."
         ),
     )
 
     parser.add_argument(
         "--confirmar",
         help=(
-            "Confirmacion explicita requerida para una "
-            "futura eliminacion local."
+            "Confirmacion explicita requerida para la "
+            "eliminacion local."
         ),
     )
 
@@ -1387,7 +1394,7 @@ def main() -> int:
 
         if args.nivel == "TODOS":
             parser.error(
-                "La V5 no permite ejecucion masiva con "
+                "La ejecucion no permite modo masivo con "
                 "--nivel TODOS."
             )
 
@@ -1395,12 +1402,6 @@ def main() -> int:
             parser.error(
                 "--ejecutar requiere una --identidad exacta."
             )
-
-        parser.error(
-            "La V5 contiene la funcion de borrado local, "
-            "pero --ejecutar todavia NO esta conectado a ella. "
-            "Solicitud detenida de forma segura."
-        )
 
     ahora = (
         parse_datetime(args.ahora)
@@ -1422,7 +1423,14 @@ def main() -> int:
     drive_graph = None
 
     print("=" * 100)
-    print("LIMPIEZA LOCAL DE BACKUPS - FASE 1 SOLO DIAGNOSTICO")
+    print(
+        "LIMPIEZA LOCAL DE BACKUPS - "
+        + (
+            "EJECUCION CONTROLADA"
+            if args.ejecutar
+            else "SOLO DIAGNOSTICO"
+        )
+    )
     print("=" * 100)
     print(f"Version: {VERSION}")
     print(f"Root: {ROOT}")
@@ -1435,7 +1443,14 @@ def main() -> int:
             else "NO"
         )
     )
-    print("Eliminaciones locales: NO")
+    print(
+        "Eliminaciones locales: "
+        + (
+            "HABILITADAS PARA UN CIERRE VALIDADO"
+            if args.ejecutar
+            else "NO"
+        )
+    )
     print("Eliminaciones remotas: IMPOSIBLES EN ESTA VERSION")
     print("-" * 100)
 
@@ -1606,10 +1621,55 @@ def main() -> int:
         f"VALIDACIONES_VIVAS_OK             = "
         f"{len(validaciones_vivas_ok)}"
     )
+    etiqueta_aprobados = (
+        "APROBADOS_PARA_ELIMINACION"
+        if args.ejecutar
+        else "APROBADOS_SIN_ELIMINAR"
+    )
+
     print(
-        f"APROBADOS_SIN_ELIMINAR            = "
+        f"{etiqueta_aprobados:<36} = "
         f"{len(aprobados_sin_eliminar)}"
     )
+
+    if args.ejecutar:
+        aprobados = [
+            x
+            for x in resultados
+            if x.get("aprobado_para_eliminacion") is True
+        ]
+
+        if len(resultados) != 1:
+            parser.error(
+                "--ejecutar requiere que la identidad exacta "
+                "resuelva un unico cierre."
+            )
+
+        if len(aprobados) != 1:
+            parser.error(
+                "El cierre solicitado NO supero todas las "
+                "validaciones. No se elimino nada."
+            )
+
+        aprobado = aprobados[0]
+
+        eliminar_directorio_local_seguro(
+            Path(aprobado["cierre_dir"]),
+            aprobado["nivel"],
+        )
+
+        aprobado["eliminado_localmente"] = True
+
+        print()
+        print(
+            "ELIMINACION_LOCAL_COMPLETADA = "
+            f"{aprobado['nivel']} "
+            f"{aprobado['identidad']}"
+        )
+        print(
+            "RUTA_ELIMINADA = "
+            f"{aprobado['cierre_dir']}"
+        )
 
     if con_errores:
         print()
@@ -1628,13 +1688,14 @@ def main() -> int:
     print()
     print(
         "RESULTADO = "
-        "DIAGNOSTICO_RETENCION_LOCAL_COMPLETADO"
+        + (
+            "LIMPIEZA_RETENCION_LOCAL_COMPLETADA"
+            if args.ejecutar
+            else "DIAGNOSTICO_RETENCION_LOCAL_COMPLETADO"
+        )
     )
     print("=" * 100)
 
-    # Esta version nunca elimina.
-    # Incluso APROBADOS_SIN_ELIMINAR son solo candidatos
-    # que superaron las tres validaciones.
     return 0
 
 
