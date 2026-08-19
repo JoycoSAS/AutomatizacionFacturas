@@ -57,7 +57,7 @@ FACTURAS_PATH = DATA_DIR / "facturas.xlsx"
 CIERRES_DIR = DATA_DIR / "cierres_diarios"
 PREPARACIONES_DIR = DATA_DIR / "state" / "preparaciones_trimestrales"
 
-VERSION = "2026-08-06-CIERRE-TRIMESTRAL-V8-STAGING-CORTO-WINDOWS"
+VERSION = "2026-08-19-CIERRE-TRIMESTRAL-V9-MENSUALES-COMPLETOS"
 CONFIRMACION_PREPARAR = "PREPARAR_CIERRE_TRIMESTRAL"
 ESTADO_PREPARADO = "PREPARADO_PENDIENTE_VALIDACION_REMOTA"
 
@@ -465,6 +465,31 @@ def inventariar_jerarquia_trimestral(periodo: dict) -> dict:
             "verificacion": "ruta relativa + bytes + SHA256 por archivo",
         },
     }
+
+
+def validar_cierres_mensuales_completos(inventario: dict) -> None:
+    meses_sin_carpeta = list(inventario.get("meses_sin_carpeta") or [])
+    meses_sin_mensual = [
+        item["mes"]
+        for item in inventario.get("meses", [])
+        if not item.get("cierre_mensual_presente")
+    ]
+
+    if meses_sin_carpeta or meses_sin_mensual:
+        detalles = []
+        if meses_sin_carpeta:
+            detalles.append(
+                "meses sin carpeta: " + ", ".join(meses_sin_carpeta)
+            )
+        if meses_sin_mensual:
+            detalles.append(
+                "meses sin cierre Mensual: " + ", ".join(meses_sin_mensual)
+            )
+
+        raise ErrorCierreTrimestral(
+            "Preparación trimestral bloqueada; el periodo todavía no está "
+            "completo. " + " | ".join(detalles)
+        )
 
 
 def validar_fecha_preparacion(estado: dict, confirmar: Optional[str]) -> None:
@@ -1012,6 +1037,8 @@ def main() -> int:
             validar_fecha_preparacion(estado, args.confirmar)
         periodo = datos_periodo(estado)
         inventario = inventariar_jerarquia_trimestral(periodo)
+        if args.preparar:
+            validar_cierres_mensuales_completos(inventario)
         info_excel = diagnosticar_excel()
         imprimir_plan(periodo, info_excel, inventario, modo)
 
