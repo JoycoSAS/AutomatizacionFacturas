@@ -7755,3 +7755,180 @@ def _h9_es_cens(texto: str) -> bool:
     )
 
 print("🔥 PDF_UTILS PATCH 2026-05-22-H9B ACTIVO: CENS-DETECTOR")
+
+# =====================================================================
+# MEJORA 2026-08-26 - Total final explícito por semántica del PDF
+# =====================================================================
+# Objetivo:
+# - Extraer únicamente valores expresamente rotulados como
+#   "Total a Pagar" / "Valor a Pagar" / "Valor Total a Pagar".
+# - Soportar tablas verticales donde pdfminer entrega primero etiquetas
+#   y después porcentajes/valores.
+# - No calcular totales.
+# - No interpretar "Neto Factura" como "Total".
+# - No depende de proveedor, número de factura ni valores específicos.
+# =====================================================================
+
+def _money_explicito_pdf_20260826(valor: str) -> float:
+    s = str(valor or "").strip()
+    s = s.replace("$", "").replace("COP", "").replace(" ", "")
+    s = re.sub(r"[^0-9,.\-]", "", s)
+
+    if not s or s in {"-", ".", ","}:
+        return 0.0
+
+    if "." in s and "," in s:
+        # 3.183.732,09
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        # 2,756,478.00
+        else:
+            s = s.replace(",", "")
+
+    elif "," in s:
+        partes = s.split(",")
+        if len(partes[-1]) == 2:
+            s = "".join(partes[:-1]) + "." + partes[-1]
+        else:
+            s = "".join(partes)
+
+    elif "." in s:
+        partes = s.split(".")
+        if len(partes) > 2:
+            if len(partes[-1]) == 2:
+                s = "".join(partes[:-1]) + "." + partes[-1]
+            else:
+                s = "".join(partes)
+        elif len(partes) == 2 and len(partes[-1]) == 3:
+            s = "".join(partes)
+
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
+
+
+def extraer_total_pagar_explicito_pdf_20260826(texto: str) -> float:
+    """
+    Extrae un total final que esté explícitamente identificado en el PDF.
+
+    Reconoce:
+    - Total a Pagar
+    - Valor a Pagar
+    - Valor Total a Pagar
+
+    No reconoce deliberadamente:
+    - Neto Factura
+    - Total Bruto
+    - resultados calculados
+
+    Retorna 0.0 si no existe evidencia explícita suficiente.
+    """
+    lineas = [
+        re.sub(r"\s+", " ", str(x or "")).strip()
+        for x in (texto or "").replace("\r", "\n").split("\n")
+    ]
+    lineas = [x for x in lineas if x]
+
+    patron_total_final = re.compile(
+        r"(?:Total\s+a\s+Pagar|Valor\s+a\s+Pagar|Valor\s+Total\s+a\s+Pagar)",
+        flags=re.IGNORECASE,
+    )
+
+    patron_etiqueta = re.compile(
+        r"(?:"
+        r"Subtotal|"
+        r"Total\s+Bruto|"
+        r"RTE\s*FUENTE|"
+        r"RETE\s*FUENTE|"
+        r"\d+(?:[.,]\d+)?%\s*(?:RteFte|ReteFuente|Rete\s*Fuente)|"
+        r"Retenci[oó]n\s+en\s+la\s+Fuente|"
+        r"ReteFuente|"
+        r"ReteICA(?:\s*\d+(?:[.,]\d+)?%)?|"
+        r"ReteIVA(?:\s*\d+(?:[.,]\d+)?%)?|"
+        r"IVA(?:\s*\d+(?:[.,]\d+)?%)?|"
+        r"Total\s+a\s+Pagar|"
+        r"Valor\s+a\s+Pagar|"
+        r"Valor\s+Total\s+a\s+Pagar"
+        r")",
+        flags=re.IGNORECASE,
+    )
+
+    patron_porcentaje = re.compile(
+        r"^\s*\d+(?:[.,]\d+)?\s*%\s*$",
+        flags=re.IGNORECASE,
+    )
+
+    patron_dinero = re.compile(
+        r"^\s*(?:COP\s*)?\$?\s*-?\s*\d[\d.,]*\s*$",
+        flags=re.IGNORECASE,
+    )
+
+    # 1. Caso directo: etiqueta y valor en la misma línea.
+    for linea in lineas:
+        m_label = patron_total_final.search(linea)
+        if not m_label:
+            continue
+
+        resto = linea[m_label.end():]
+        candidatos = re.findall(
+            r"(?:COP\s*)?\$?\s*-?\d[\d.,]*",
+            resto,
+            flags=re.IGNORECASE,
+        )
+
+        for candidato in reversed(candidatos):
+            if "%" in candidato:
+                continue
+            valor = _money_explicito_pdf_20260826(candidato)
+            if valor > 0:
+                return valor
+
+    # 2. Caso vertical:
+    #    etiquetas primero -> porcentajes opcionales -> valores.
+    for i, linea in enumerate(lineas):
+        if not re.fullmatch(
+            r"(?:Total\s+a\s+Pagar|Valor\s+a\s+Pagar|Valor\s+Total\s+a\s+Pagar)",
+            linea,
+            flags=re.IGNORECASE,
+        ):
+            continue
+
+        inicio = i
+        while inicio > 0 and patron_etiqueta.fullmatch(lineas[inicio - 1]):
+            inicio -= 1
+
+        etiquetas = lineas[inicio:i + 1]
+
+        if not etiquetas:
+            continue
+
+        indice_total = len(etiquetas) - 1
+        valores = []
+
+        for candidata in lineas[i + 1:i + 40]:
+            if patron_porcentaje.fullmatch(candidata):
+                continue
+
+            if patron_dinero.fullmatch(candidata):
+                valor = _money_explicito_pdf_20260826(candidata)
+                if valor >= 0:
+                    valores.append(valor)
+                continue
+
+            elif valores:
+                # Una vez iniciado el bloque numérico, el primer texto
+                # posterior marca su final.
+                break
+
+        # Algunos formatos imprimen primero ceros/valores de las líneas
+        # de factura y dejan el resumen al final. Si existen más valores
+        # que etiquetas, asociamos las últimas N posiciones del bloque.
+        if len(valores) >= len(etiquetas):
+            valores_resumen = valores[-len(etiquetas):]
+            total = valores_resumen[indice_total]
+
+            if total > 0:
+                return float(total)
+
+    return 0.0
