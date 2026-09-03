@@ -31,10 +31,13 @@ except Exception:
 
 try:
     from utils.pdf_utils import (
+        extraer_conceptos_pago_explicitos_pdf_20260903
+        as _extraer_conceptos_pago_explicitos_pdf_20260903,
         extraer_total_pagar_explicito_pdf_20260826
-        as _extraer_total_pagar_explicito_pdf_20260826
+        as _extraer_total_pagar_explicito_pdf_20260826,
     )
 except Exception:
+    _extraer_conceptos_pago_explicitos_pdf_20260903 = None
     _extraer_total_pagar_explicito_pdf_20260826 = None
 
 from utils.logger import errores
@@ -686,30 +689,26 @@ def _normalizar_identidad_documento_20260826(valor: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", str(valor or "").upper())
 
 
-def _extraer_total_pdf_asociado_20260826(
+def _extraer_texto_pdf_asociado_20260903(
     xml_path: str,
     numero: str = "",
     cufe: str = "",
-) -> float:
+) -> str:
     """
-    Busca un PDF asociado al XML y extrae únicamente un total final
-    expresamente rotulado en el PDF.
+    Devuelve el texto del PDF asociado al XML.
 
     Prioridad de asociación:
     - número de factura;
     - CUFE/CUDE;
     - si solo existe un PDF en la carpeta, ese PDF.
 
-    No calcula valores.
+    No interpreta ni calcula valores.
     """
     if not PDF_FALLBACK_ENABLED:
-        return 0.0
+        return ""
 
     if _extraer_texto_pdf_pdfminer is None:
-        return 0.0
-
-    if _extraer_total_pagar_explicito_pdf_20260826 is None:
-        return 0.0
+        return ""
 
     carpeta = os.path.dirname(xml_path)
 
@@ -719,10 +718,10 @@ def _extraer_total_pdf_asociado_20260826(
             if fn.lower().endswith(".pdf")
         )
     except Exception:
-        return 0.0
+        return ""
 
     if not pdfs:
-        return 0.0
+        return ""
 
     numero_norm = _normalizar_identidad_documento_20260826(numero)
     cufe_norm = _normalizar_identidad_documento_20260826(cufe)
@@ -750,22 +749,174 @@ def _extraer_total_pdf_asociado_20260826(
             and cufe_norm in texto_norm
         )
 
-        # Si hay varios PDFs exigimos evidencia de asociación.
         if len(pdfs) > 1 and not (coincide_numero or coincide_cufe):
             continue
 
+        return texto_pdf
+
+    return ""
+
+
+def _extraer_total_pdf_asociado_20260826(
+    xml_path: str,
+    numero: str = "",
+    cufe: str = "",
+) -> float:
+    """
+    Extrae únicamente un Total a pagar explícito del PDF asociado.
+    No calcula valores.
+    """
+    if _extraer_total_pagar_explicito_pdf_20260826 is None:
+        return 0.0
+
+    texto_pdf = _extraer_texto_pdf_asociado_20260903(
+        xml_path,
+        numero=numero,
+        cufe=cufe,
+    )
+
+    if not texto_pdf:
+        return 0.0
+
+    try:
+        return float(
+            _extraer_total_pagar_explicito_pdf_20260826(texto_pdf)
+            or 0.0
+        )
+    except Exception:
+        return 0.0
+
+
+def _extraer_conceptos_pdf_asociado_20260903(
+    xml_path: str,
+    numero: str = "",
+    cufe: str = "",
+) -> Dict[str, float]:
+    """
+    Extrae conceptos explícitos del PDF correctamente asociado al XML.
+
+    El PDF se usa únicamente como complemento semántico.
+    No calcula valores ni sustituye información XML por sí solo.
+    """
+    if _extraer_conceptos_pago_explicitos_pdf_20260903 is None:
+        return {}
+
+    texto_pdf = _extraer_texto_pdf_asociado_20260903(
+        xml_path,
+        numero=numero,
+        cufe=cufe,
+    )
+
+    if not texto_pdf:
+        return {}
+
+    try:
+        conceptos = _extraer_conceptos_pago_explicitos_pdf_20260903(
+            texto_pdf
+        ) or {}
+    except Exception:
+        return {}
+
+    resultado: Dict[str, float] = {}
+
+    for clave in (
+        "ReteFuente",
+        "ReteICA",
+        "ReteIVA",
+        "Total a pagar",
+    ):
         try:
-            total_pdf = float(
-                _extraer_total_pagar_explicito_pdf_20260826(texto_pdf)
-                or 0.0
+            if clave in conceptos:
+                resultado[clave] = float(conceptos[clave])
+        except Exception:
+            continue
+
+    return resultado
+
+
+def _clasificar_retencion_total_xml_con_pdf_20260903(
+    totales_xml: Dict[str, float],
+    xml_text_for_regex: str,
+    xml_path: str,
+    numero: str = "",
+    cufe: str = "",
+) -> Dict[str, float]:
+    """
+    Clasifica una retención total informada por el XML cuando el propio
+    XML no identifica su tipo.
+
+    Reglas:
+    - XML sigue siendo la fuente principal del monto.
+    - No interviene si el XML UBL ya trae retenciones clasificadas.
+    - El PDF solo se usa para identificar semánticamente el tipo.
+    - El monto explícito del PDF debe coincidir con TotalRetencion del XML.
+    - No calcula retenciones a partir de porcentajes.
+    """
+    out = dict(totales_xml or {})
+
+    try:
+        total_retencion_txt = _find_customfieldextension_20260903(
+            xml_text_for_regex,
+            "TotalRetencion",
+        )
+        total_retencion = abs(
+            float(_money_xml_20260513(total_retencion_txt) or 0.0)
+        )
+    except Exception:
+        return out
+
+    if total_retencion <= 0:
+        return out
+
+    # Si el XML estándar ya clasificó alguna retención, conservarlo.
+    retenciones_xml = (
+        abs(float(out.get("Retención en la fuente", 0.0) or 0.0))
+        + abs(float(out.get("Retención de ICA", 0.0) or 0.0))
+        + abs(float(out.get("Retención de IVA", 0.0) or 0.0))
+    )
+
+    if retenciones_xml > 0:
+        return out
+
+    conceptos_pdf = _extraer_conceptos_pdf_asociado_20260903(
+        xml_path,
+        numero=numero,
+        cufe=cufe,
+    )
+
+    if not conceptos_pdf:
+        return out
+
+    mapa = {
+        "ReteFuente": "Retención en la fuente",
+        "ReteICA": "Retención de ICA",
+        "ReteIVA": "Retención de IVA",
+    }
+
+    coincidencias = []
+
+    for concepto_pdf, campo_excel in mapa.items():
+        try:
+            valor_pdf = abs(
+                float(conceptos_pdf.get(concepto_pdf, 0.0) or 0.0)
             )
         except Exception:
-            total_pdf = 0.0
+            continue
 
-        if total_pdf > 0:
-            return total_pdf
+        if (
+            valor_pdf > 0
+            and abs(valor_pdf - total_retencion) <= 0.01
+        ):
+            coincidencias.append((campo_excel, valor_pdf))
 
-    return 0.0
+    # Debe existir una única clasificación inequívoca.
+    if len(coincidencias) != 1:
+        return out
+
+    campo_excel, valor = coincidencias[0]
+    out[campo_excel] = -abs(valor)
+
+    return out
 
 
 def _conciliar_total_xml_pdf_20260826(
@@ -851,6 +1002,43 @@ def _find_customfield(xml_text: str, name: str) -> Optional[str]:
         flags=re.IGNORECASE,
     )
     return m.group(1).strip() if m else None
+
+
+def _find_customfieldextension_20260903(xml_text: str, name: str) -> Optional[str]:
+    """
+    Busca un CustomFieldExtension por Name sin alterar el soporte legado
+    de CustomField. Se usa como segunda fuente dentro del propio XML.
+    """
+    if not xml_text or not name:
+        return None
+
+    for match in re.finditer(
+        r"<CustomFieldExtension\b([^>]*)/?>",
+        xml_text,
+        flags=re.IGNORECASE,
+    ):
+        atributos = match.group(1) or ""
+
+        name_match = re.search(
+            r'\bName\s*=\s*"([^"]*)"',
+            atributos,
+            flags=re.IGNORECASE,
+        )
+        if not name_match:
+            continue
+
+        if name_match.group(1).strip().lower() != name.strip().lower():
+            continue
+
+        value_match = re.search(
+            r'\bValue\s*=\s*"([^"]*)"',
+            atributos,
+            flags=re.IGNORECASE,
+        )
+        if value_match:
+            return value_match.group(1).strip()
+
+    return None
 
 
 def _find_customfieldrow_valor_por_desc(xml_text: str, contains_text: str) -> Optional[str]:
@@ -2661,6 +2849,10 @@ def _extraer_totales_xml_20260513(root: ET.Element, ns: dict, xml_text_for_regex
         ajuste = ajuste_retefuente or ajuste_notas
 
         valor_total_pagar = _find_customfield(xml_text_for_regex, "Valor_Total_Pagar")
+        valor_total_documento_ext = _find_customfieldextension_20260903(
+            xml_text_for_regex,
+            "ValorTotalDocumento",
+        )
 
         if ajuste:
             rete_fuente = _money_xml_20260513(ajuste)
@@ -2669,6 +2861,10 @@ def _extraer_totales_xml_20260513(root: ET.Element, ns: dict, xml_text_for_regex
 
         if valor_total_pagar:
             total_calc = _money_xml_20260513(valor_total_pagar)
+        elif valor_total_documento_ext:
+            valor_ext = _money_xml_20260513(valor_total_documento_ext)
+            if valor_ext > 0:
+                total_calc = valor_ext
 
     except Exception as e:
         errores.append(f"Error aplicando CustomFields 20260513 en {os.path.basename(path)}: {e}")
@@ -2743,6 +2939,13 @@ def leer_datos_xml(path: str) -> Optional[dict]:
 
     descs = _descripciones_por_iva_20260513(root)
     totales = _extraer_totales_xml_20260513(root, ns, xml_text_for_regex, path)
+    totales = _clasificar_retencion_total_xml_con_pdf_20260903(
+        totales,
+        xml_text_for_regex,
+        path,
+        numero=numero,
+        cufe=cufe,
+    )
     totales = _conciliar_total_xml_pdf_20260826(
         totales,
         path,
@@ -2862,4 +3065,3 @@ def procesar_xml_en_carpeta(ruta_carpeta: str) -> tuple[list[dict], int]:
             errores_zip += 1
 
     return registros, errores_zip
-
