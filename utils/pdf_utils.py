@@ -7709,8 +7709,177 @@ def extraer_campos_basicos_pdf(texto: str) -> Dict[str, str]:
     return out
 
 
+
+def _totales_resumen_vertical_explicito_20260903(
+    texto: str,
+) -> Dict[str, float]:
+    """
+    Extrae un resumen fiscal vertical cuando las etiquetas y los importes
+    están explícitamente separados en bloques.
+
+    No calcula valores y solo acepta importes con símbolo monetario o
+    moneda explícita, evitando confundir cantidades, unidades o códigos
+    de una tabla con valores fiscales.
+    """
+    lineas = [
+        re.sub(r"\s+", " ", str(x or "")).strip()
+        for x in (texto or "").replace("\r", "\n").split("\n")
+    ]
+    lineas = [x for x in lineas if x]
+
+    def limpio(s: str) -> str:
+        return re.sub(r"\s*:\s*$", "", str(s or "")).strip()
+
+    for inicio, linea in enumerate(lineas):
+        if limpio(linea).lower() != "subtotal":
+            continue
+
+        fin = None
+
+        for i in range(inicio + 1, min(len(lineas), inicio + 30)):
+            if limpio(lineas[i]).lower() == "anticipos":
+                fin = i
+                break
+
+        if fin is None:
+            continue
+
+        etiquetas = []
+        i = inicio
+
+        while i <= fin:
+            s = limpio(lineas[i]).lower()
+
+            if s == "subtotal":
+                etiquetas.append("Subtotal")
+
+            elif s == "descuento":
+                if (
+                    i + 1 <= fin
+                    and limpio(lineas[i + 1]).lower() == "detalle"
+                ):
+                    etiquetas.append("Descuento Detalle")
+                    i += 1
+                elif (
+                    i + 1 <= fin
+                    and limpio(lineas[i + 1]).lower() == "global"
+                ):
+                    etiquetas.append("Descuento Global")
+                    i += 1
+
+            elif s == "recargo detalle":
+                etiquetas.append("Recargo Detalle")
+
+            elif s == "total bruto":
+                if (
+                    i + 1 <= fin
+                    and limpio(lineas[i + 1]).lower() == "factura"
+                ):
+                    etiquetas.append("Total Bruto Factura")
+                    i += 1
+
+            elif s == "iva":
+                etiquetas.append("IVA")
+
+            elif s == "total impuestos":
+                etiquetas.append("Total Impuestos")
+
+            elif s == "total neto":
+                etiquetas.append("Total Neto")
+
+            elif s == "recargo global":
+                etiquetas.append("Recargo Global")
+
+            elif s == "anticipos":
+                etiquetas.append("Anticipos")
+
+            i += 1
+
+        requeridas = {
+            "Subtotal",
+            "IVA",
+            "Total Impuestos",
+            "Total Neto",
+            "Anticipos",
+        }
+
+        if not requeridas.issubset(set(etiquetas)):
+            continue
+
+        valores = []
+        pos_total_final = None
+
+        for j in range(fin + 1, min(len(lineas), fin + 35)):
+            candidata = lineas[j]
+
+            if limpio(candidata).lower() == "total":
+                pos_total_final = j
+                break
+
+            if "$" not in candidata and "COP" not in candidata.upper():
+                continue
+
+            valor = _money_explicito_pdf_20260826(candidata)
+
+            if valor >= 0:
+                valores.append(float(valor))
+
+        if len(valores) < len(etiquetas):
+            continue
+
+        valores_resumen = valores[-len(etiquetas):]
+        resumen = dict(zip(etiquetas, valores_resumen))
+
+        total_final = 0.0
+
+        if pos_total_final is not None:
+            for candidata in lineas[
+                pos_total_final + 1:pos_total_final + 5
+            ]:
+                if "$" not in candidata and "COP" not in candidata.upper():
+                    continue
+
+                valor = _money_explicito_pdf_20260826(candidata)
+
+                if valor >= 0:
+                    total_final = float(valor)
+                    break
+
+        subtotal = float(resumen.get("Subtotal", 0.0) or 0.0)
+        iva = float(resumen.get("IVA", 0.0) or 0.0)
+        total_neto = float(resumen.get("Total Neto", 0.0) or 0.0)
+
+        if subtotal <= 0 or total_neto <= 0:
+            continue
+
+        # Si existe un TOTAL final explícito, debe coincidir con el
+        # Total Neto del mismo resumen para considerar el bloque inequívoco.
+        if total_final > 0 and abs(total_final - total_neto) > 0.01:
+            continue
+
+        return {
+            "Subtotal": subtotal,
+            "IVA 5%": 0.0,
+            "IVA 19%": iva,
+            "Retención de IVA": 0.0,
+            "Retención de ICA": 0.0,
+            "Retención en la fuente": 0.0,
+            "Total": total_final if total_final > 0 else total_neto,
+        }
+
+    return {}
+
+
 def extraer_totales_basicos_pdf(texto: str) -> Dict[str, float]:
     t = _h9_text(texto)
+
+    resumen_vertical = _totales_resumen_vertical_explicito_20260903(
+        texto
+    )
+
+    if resumen_vertical:
+        return resumen_vertical
+
     try:
         if _h9_es_laurel_posw1158(t):
             return _h9_totales_laurel(t)
