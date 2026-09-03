@@ -29,6 +29,14 @@ try:
 except Exception:
     _extraer_texto_pdf_pdfminer = None
 
+try:
+    from utils.pdf_utils import (
+        extraer_total_pagar_explicito_pdf_20260826
+        as _extraer_total_pagar_explicito_pdf_20260826
+    )
+except Exception:
+    _extraer_total_pagar_explicito_pdf_20260826 = None
+
 from utils.logger import errores
 
 
@@ -667,6 +675,153 @@ def _extraer_actividad_de_pdf(xml_path: str) -> str:
             return m.group(1)
 
     return ""
+
+
+
+# ============================================================
+# Total explícito desde PDF asociado - 2026-08-26
+# ============================================================
+
+def _normalizar_identidad_documento_20260826(valor: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", str(valor or "").upper())
+
+
+def _extraer_total_pdf_asociado_20260826(
+    xml_path: str,
+    numero: str = "",
+    cufe: str = "",
+) -> float:
+    """
+    Busca un PDF asociado al XML y extrae únicamente un total final
+    expresamente rotulado en el PDF.
+
+    Prioridad de asociación:
+    - número de factura;
+    - CUFE/CUDE;
+    - si solo existe un PDF en la carpeta, ese PDF.
+
+    No calcula valores.
+    """
+    if not PDF_FALLBACK_ENABLED:
+        return 0.0
+
+    if _extraer_texto_pdf_pdfminer is None:
+        return 0.0
+
+    if _extraer_total_pagar_explicito_pdf_20260826 is None:
+        return 0.0
+
+    carpeta = os.path.dirname(xml_path)
+
+    try:
+        pdfs = sorted(
+            fn for fn in os.listdir(carpeta)
+            if fn.lower().endswith(".pdf")
+        )
+    except Exception:
+        return 0.0
+
+    if not pdfs:
+        return 0.0
+
+    numero_norm = _normalizar_identidad_documento_20260826(numero)
+    cufe_norm = _normalizar_identidad_documento_20260826(cufe)
+
+    for fn in pdfs:
+        pdf_path = os.path.join(carpeta, fn)
+
+        try:
+            texto_pdf = _extraer_texto_pdf_pdfminer(pdf_path) or ""
+        except Exception:
+            continue
+
+        if not texto_pdf:
+            continue
+
+        texto_norm = _normalizar_identidad_documento_20260826(texto_pdf)
+
+        coincide_numero = (
+            len(numero_norm) >= 4
+            and numero_norm in texto_norm
+        )
+
+        coincide_cufe = (
+            len(cufe_norm) >= 32
+            and cufe_norm in texto_norm
+        )
+
+        # Si hay varios PDFs exigimos evidencia de asociación.
+        if len(pdfs) > 1 and not (coincide_numero or coincide_cufe):
+            continue
+
+        try:
+            total_pdf = float(
+                _extraer_total_pagar_explicito_pdf_20260826(texto_pdf)
+                or 0.0
+            )
+        except Exception:
+            total_pdf = 0.0
+
+        if total_pdf > 0:
+            return total_pdf
+
+    return 0.0
+
+
+def _conciliar_total_xml_pdf_20260826(
+    totales_xml: Dict[str, float],
+    xml_path: str,
+    numero: str = "",
+    cufe: str = "",
+) -> Dict[str, float]:
+    """
+    Corrección conservadora del Total.
+
+    Solo reemplaza el Total XML cuando:
+    - existe un Total a Pagar explícito en el PDF asociado;
+    - existen retenciones explícitas en el XML;
+    - la diferencia entre ambos totales coincide con esas retenciones.
+
+    La aritmética se usa únicamente como validación de consistencia.
+    Nunca se utiliza para fabricar el valor que se guarda.
+    """
+    out = dict(totales_xml or {})
+
+    try:
+        total_xml = float(out.get("Total", 0.0) or 0.0)
+
+        rete_total = (
+            abs(float(out.get("Retención de IVA", 0.0) or 0.0))
+            + abs(float(out.get("Retención de ICA", 0.0) or 0.0))
+            + abs(float(out.get("Retención en la fuente", 0.0) or 0.0))
+        )
+    except Exception:
+        return out
+
+    # Esta primera corrección solo cubre XML con retenciones explícitas.
+    if total_xml <= 0 or rete_total <= 0:
+        return out
+
+    total_pdf = _extraer_total_pdf_asociado_20260826(
+        xml_path,
+        numero=numero,
+        cufe=cufe,
+    )
+
+    if total_pdf <= 0:
+        return out
+
+    # Si ya coinciden, no hay nada que corregir.
+    if abs(total_xml - total_pdf) <= 1.0:
+        return out
+
+    diferencia = total_xml - total_pdf
+
+    # El PDF solo gana cuando las retenciones explican la diferencia.
+    if diferencia > 0 and abs(diferencia - rete_total) <= 1.0:
+        out["Total"] = float(total_pdf)
+
+    return out
 
 
 # ============================================================
@@ -2342,49 +2497,115 @@ def _sumar_iva_porcentaje_20260513(root: ET.Element, ns: dict, pct_obj: float) -
 
 
 def _extraer_retenciones_20260513(root: ET.Element, ns: dict) -> Tuple[float, float, float]:
+    """
+    Extrae las retenciones UBL sin duplicar cabecera + líneas.
+
+    Regla:
+    - Si existen WithholdingTaxTotal directos en la cabecera del documento,
+      esos valores representan el total de la retención y se usan exclusivamente.
+    - Solo cuando NO existen retenciones de cabecera se buscan retenciones
+      dentro de InvoiceLine / CreditNoteLine / DebitNoteLine.
+    - Las retenciones se mantienen negativas por compatibilidad con el Excel.
+    """
     reteiva = 0.0
     reteica = 0.0
     rete_fuente = 0.0
 
-    subtotales: List[ET.Element] = []
+    def _buscar_primero(paths):
+        for xp, usa_ns in paths:
+            try:
+                if usa_ns:
+                    encontrados = root.findall(xp, ns)
+                else:
+                    encontrados = root.findall(xp)
+            except Exception:
+                encontrados = []
 
-    for xp in (
-        "./cac:WithholdingTaxTotal/cac:TaxSubtotal",
-        "./{*}WithholdingTaxTotal/{*}TaxSubtotal",
-        ".//{*}WithholdingTaxTotal/{*}TaxSubtotal",
-    ):
-        try:
-            if "cac:" in xp:
-                subtotales.extend(root.findall(xp, ns))
-            else:
-                subtotales.extend(root.findall(xp))
-        except Exception:
-            pass
+            if encontrados:
+                return encontrados
 
-    vistos = set()
+        return []
+
+    # ---------------------------------------------------------
+    # 1. PRIORIDAD: retenciones de CABECERA.
+    # ---------------------------------------------------------
+    subtotales = _buscar_primero([
+        (
+            "./cac:WithholdingTaxTotal/cac:TaxSubtotal",
+            True,
+        ),
+        (
+            "./{*}WithholdingTaxTotal/{*}TaxSubtotal",
+            False,
+        ),
+    ])
+
+    # ---------------------------------------------------------
+    # 2. FALLBACK: retenciones a nivel de LÍNEA.
+    #
+    # Nunca se mezclan con las de cabecera.
+    # ---------------------------------------------------------
+    if not subtotales:
+        tipo_documento = _local_name(root.tag).lower()
+
+        if tipo_documento == "invoice":
+            linea = "InvoiceLine"
+        elif tipo_documento == "creditnote":
+            linea = "CreditNoteLine"
+        elif tipo_documento == "debitnote":
+            linea = "DebitNoteLine"
+        else:
+            linea = ""
+
+        if linea:
+            subtotales = _buscar_primero([
+                (
+                    f"./cac:{linea}/cac:WithholdingTaxTotal/cac:TaxSubtotal",
+                    True,
+                ),
+                (
+                    f"./{{*}}{linea}/{{*}}WithholdingTaxTotal/{{*}}TaxSubtotal",
+                    False,
+                ),
+            ])
+
+    # ---------------------------------------------------------
+    # 3. Clasificar retenciones encontradas.
+    # ---------------------------------------------------------
     for tax in subtotales:
-        marker = id(tax)
-        if marker in vistos:
-            continue
-        vistos.add(marker)
+        amt = _find_money_20260513(
+            tax,
+            [
+                "./cbc:TaxAmount",
+                "./{*}TaxAmount",
+            ],
+            ns,
+        )
 
-        amt = _find_money_20260513(tax, [
-            "./cbc:TaxAmount",
-            "./{*}TaxAmount",
-        ], ns)
+        tax_id = _find_text_20260513(
+            tax,
+            [
+                "./cac:TaxCategory/cac:TaxScheme/cbc:ID",
+                "./{*}TaxCategory/{*}TaxScheme/{*}ID",
+                ".//{*}TaxScheme/{*}ID",
+            ],
+            ns,
+        ).strip().lower()
 
-        tax_id = _find_text_20260513(tax, [
-            "./cac:TaxCategory/cac:TaxScheme/cbc:ID",
-            "./{*}TaxCategory/{*}TaxScheme/{*}ID",
-            ".//{*}TaxScheme/{*}ID",
-        ], ns).strip().lower()
+        tax_name = _find_text_20260513(
+            tax,
+            [
+                "./cac:TaxCategory/cac:TaxScheme/cbc:Name",
+                "./{*}TaxCategory/{*}TaxScheme/{*}Name",
+                ".//{*}TaxScheme/{*}Name",
+            ],
+            ns,
+        ).strip().lower()
 
-        tax_name = _find_text_20260513(tax, [
-            "./cac:TaxCategory/cac:TaxScheme/cbc:Name",
-            "./{*}TaxCategory/{*}TaxScheme/{*}Name",
-            ".//{*}TaxScheme/{*}Name",
-        ], ns).strip().lower()
-
+        # DIAN frecuente:
+        # 05 = ReteIVA
+        # 06 = ReteFuente / Renta
+        # 07 = ReteICA
         if tax_id == "05" or "iva" in tax_name:
             reteiva += amt
         elif tax_id == "07" or "ica" in tax_name:
@@ -2392,7 +2613,11 @@ def _extraer_retenciones_20260513(root: ET.Element, ns: dict) -> Tuple[float, fl
         elif tax_id == "06" or "fuente" in tax_name or "renta" in tax_name:
             rete_fuente += amt
 
-    return -abs(reteiva), -abs(reteica), -abs(rete_fuente)
+    return (
+        -abs(reteiva),
+        -abs(reteica),
+        -abs(rete_fuente),
+    )
 
 
 def _extraer_totales_xml_20260513(root: ET.Element, ns: dict, xml_text_for_regex: str, path: str) -> Dict[str, float]:
@@ -2518,6 +2743,12 @@ def leer_datos_xml(path: str) -> Optional[dict]:
 
     descs = _descripciones_por_iva_20260513(root)
     totales = _extraer_totales_xml_20260513(root, ns, xml_text_for_regex, path)
+    totales = _conciliar_total_xml_pdf_20260826(
+        totales,
+        path,
+        numero=numero,
+        cufe=cufe,
+    )
 
     return {
         "Archivo": os.path.basename(path),
