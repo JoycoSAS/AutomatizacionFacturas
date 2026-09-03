@@ -7839,6 +7839,7 @@ def extraer_conceptos_pago_explicitos_pdf_20260903(texto: str) -> Dict[str, floa
 
     def clasificar_etiqueta(linea: str):
         s = re.sub(r"\s+", " ", str(linea or "")).strip()
+        s = re.sub(r"\s*:\s*$", "", s).strip()
 
         if re.fullmatch(
             r"(?:Total\s+a\s+Pagar|Valor\s+a\s+Pagar|Valor\s+Total\s+a\s+Pagar)",
@@ -7852,6 +7853,7 @@ def extraer_conceptos_pago_explicitos_pdf_20260903(texto: str) -> Dict[str, floa
             r"RTE\s*FUENTE|"
             r"RETE\s*FUENTE|"
             r"ReteFuente(?:\s*\d+(?:[.,]\d+)?\s*%)?|"
+            r"ReteFTE(?:\s*\d+(?:[.,]\d+)?\s*%)?|"
             r"\d+(?:[.,]\d+)?%\s*(?:RteFte|ReteFuente|Rete\s*Fuente)|"
             r"Retenci[oó]n\s+en\s+la\s+Fuente"
             r")",
@@ -7861,14 +7863,14 @@ def extraer_conceptos_pago_explicitos_pdf_20260903(texto: str) -> Dict[str, floa
             return "ReteFuente"
 
         if re.fullmatch(
-            r"ReteICA(?:\s*(?:\d+(?:[.,]\d+)?)?\s*%)?",
+            r"Rete\s*ICA(?:\s*(?:\d+(?:[.,]\d+)?)?\s*%)?",
             s,
             flags=re.IGNORECASE,
         ):
             return "ReteICA"
 
         if re.fullmatch(
-            r"ReteIVA(?:\s*(?:\d+(?:[.,]\d+)?)?\s*%)?",
+            r"Rete\s*IVA(?:\s*(?:\d+(?:[.,]\d+)?)?\s*%)?",
             s,
             flags=re.IGNORECASE,
         ):
@@ -7906,8 +7908,8 @@ def extraer_conceptos_pago_explicitos_pdf_20260903(texto: str) -> Dict[str, floa
                 "ReteFuente",
                 r"(?:RTE\s*FUENTE|RETE\s*FUENTE|ReteFuente|RteFte|Retenci[oó]n\s+en\s+la\s+Fuente)",
             ),
-            ("ReteICA", r"ReteICA"),
-            ("ReteIVA", r"ReteIVA"),
+            ("ReteICA", r"Rete\s*ICA"),
+            ("ReteIVA", r"Rete\s*IVA"),
         )
 
         for concepto, patron_label in patrones_directos:
@@ -7935,6 +7937,68 @@ def extraer_conceptos_pago_explicitos_pdf_20260903(texto: str) -> Dict[str, floa
                 if valor >= 0:
                     resultado[concepto] = float(valor)
                     break
+
+    # TOTAL genérico solo puede representar el total final cuando:
+    # - forma parte de un bloque vertical de resumen;
+    # - antes de TOTAL aparece al menos una retención explícita;
+    # - también existen etiquetas auxiliares del resumen.
+    #
+    # Así no se interpreta cualquier "TOTAL" del documento como Total a pagar.
+    for i, linea in enumerate(lineas):
+        if not re.fullmatch(
+            r"Total\s*:?",
+            linea,
+            flags=re.IGNORECASE,
+        ):
+            continue
+
+        etiquetas_previas = []
+        j = i - 1
+
+        while j >= 0:
+            concepto = clasificar_etiqueta(lineas[j])
+
+            if concepto is None:
+                break
+
+            etiquetas_previas.append(concepto)
+            j -= 1
+
+        tiene_retencion = any(
+            concepto in {
+                "ReteFuente",
+                "ReteICA",
+                "ReteIVA",
+            }
+            for concepto in etiquetas_previas
+        )
+
+        tiene_auxiliar = "_AUXILIAR" in etiquetas_previas
+
+        if not tiene_retencion or not tiene_auxiliar:
+            continue
+
+        valores = []
+
+        for candidata in lineas[i + 1:i + 40]:
+            if patron_porcentaje.fullmatch(candidata):
+                continue
+
+            if patron_dinero.fullmatch(candidata):
+                valor = _money_explicito_pdf_20260826(candidata)
+
+                if valor >= 0:
+                    valores.append(float(valor))
+
+                continue
+
+            if valores:
+                break
+
+        if valores:
+            # El valor asociado a TOTAL es el último valor monetario
+            # explícito del bloque. No se calcula a partir de los demás.
+            resultado["Total a pagar"] = float(valores[-1])
 
     for i, linea in enumerate(lineas):
         if clasificar_etiqueta(linea) != "Total a pagar":
