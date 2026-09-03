@@ -7808,21 +7808,18 @@ def _money_explicito_pdf_20260826(valor: str) -> float:
         return 0.0
 
 
-def extraer_total_pagar_explicito_pdf_20260826(texto: str) -> float:
+def extraer_conceptos_pago_explicitos_pdf_20260903(texto: str) -> Dict[str, float]:
     """
-    Extrae un total final que esté explícitamente identificado en el PDF.
+    Extrae únicamente conceptos monetarios explícitamente identificados
+    en el PDF.
 
-    Reconoce:
-    - Total a Pagar
-    - Valor a Pagar
-    - Valor Total a Pagar
+    Puede devolver:
+    - ReteFuente
+    - ReteICA
+    - ReteIVA
+    - Total a pagar
 
-    No reconoce deliberadamente:
-    - Neto Factura
-    - Total Bruto
-    - resultados calculados
-
-    Retorna 0.0 si no existe evidencia explícita suficiente.
+    No calcula valores ni interpreta Neto Factura como Total.
     """
     lineas = [
         re.sub(r"\s+", " ", str(x or "")).strip()
@@ -7830,27 +7827,8 @@ def extraer_total_pagar_explicito_pdf_20260826(texto: str) -> float:
     ]
     lineas = [x for x in lineas if x]
 
-    patron_total_final = re.compile(
-        r"(?:Total\s+a\s+Pagar|Valor\s+a\s+Pagar|Valor\s+Total\s+a\s+Pagar)",
-        flags=re.IGNORECASE,
-    )
-
-    patron_etiqueta = re.compile(
-        r"(?:"
-        r"Subtotal|"
-        r"Total\s+Bruto|"
-        r"RTE\s*FUENTE|"
-        r"RETE\s*FUENTE|"
-        r"\d+(?:[.,]\d+)?%\s*(?:RteFte|ReteFuente|Rete\s*Fuente)|"
-        r"Retenci[oó]n\s+en\s+la\s+Fuente|"
-        r"ReteFuente|"
-        r"ReteICA(?:\s*\d+(?:[.,]\d+)?%)?|"
-        r"ReteIVA(?:\s*\d+(?:[.,]\d+)?%)?|"
-        r"IVA(?:\s*\d+(?:[.,]\d+)?%)?|"
-        r"Total\s+a\s+Pagar|"
-        r"Valor\s+a\s+Pagar|"
-        r"Valor\s+Total\s+a\s+Pagar"
-        r")",
+    patron_dinero = re.compile(
+        r"^\s*(?:COP\s*)?\$?\s*-?\s*\d[\d.,]*\s*$",
         flags=re.IGNORECASE,
     )
 
@@ -7859,51 +7837,120 @@ def extraer_total_pagar_explicito_pdf_20260826(texto: str) -> float:
         flags=re.IGNORECASE,
     )
 
-    patron_dinero = re.compile(
-        r"^\s*(?:COP\s*)?\$?\s*-?\s*\d[\d.,]*\s*$",
-        flags=re.IGNORECASE,
-    )
+    def clasificar_etiqueta(linea: str):
+        s = re.sub(r"\s+", " ", str(linea or "")).strip()
 
-    # 1. Caso directo: etiqueta y valor en la misma línea.
-    for linea in lineas:
-        m_label = patron_total_final.search(linea)
-        if not m_label:
-            continue
-
-        resto = linea[m_label.end():]
-        candidatos = re.findall(
-            r"(?:COP\s*)?\$?\s*-?\d[\d.,]*",
-            resto,
-            flags=re.IGNORECASE,
-        )
-
-        for candidato in reversed(candidatos):
-            if "%" in candidato:
-                continue
-            valor = _money_explicito_pdf_20260826(candidato)
-            if valor > 0:
-                return valor
-
-    # 2. Caso vertical:
-    #    etiquetas primero -> porcentajes opcionales -> valores.
-    for i, linea in enumerate(lineas):
-        if not re.fullmatch(
+        if re.fullmatch(
             r"(?:Total\s+a\s+Pagar|Valor\s+a\s+Pagar|Valor\s+Total\s+a\s+Pagar)",
-            linea,
+            s,
             flags=re.IGNORECASE,
         ):
+            return "Total a pagar"
+
+        if re.fullmatch(
+            r"(?:"
+            r"RTE\s*FUENTE|"
+            r"RETE\s*FUENTE|"
+            r"ReteFuente(?:\s*\d+(?:[.,]\d+)?\s*%)?|"
+            r"\d+(?:[.,]\d+)?%\s*(?:RteFte|ReteFuente|Rete\s*Fuente)|"
+            r"Retenci[oó]n\s+en\s+la\s+Fuente"
+            r")",
+            s,
+            flags=re.IGNORECASE,
+        ):
+            return "ReteFuente"
+
+        if re.fullmatch(
+            r"ReteICA(?:\s*(?:\d+(?:[.,]\d+)?)?\s*%)?",
+            s,
+            flags=re.IGNORECASE,
+        ):
+            return "ReteICA"
+
+        if re.fullmatch(
+            r"ReteIVA(?:\s*(?:\d+(?:[.,]\d+)?)?\s*%)?",
+            s,
+            flags=re.IGNORECASE,
+        ):
+            return "ReteIVA"
+
+        if re.fullmatch(
+            r"(?:"
+            r"Subtotal|"
+            r"Subtotal\s+sin\s+IVA|"
+            r"Total\s+Bruto|"
+            r"Total\s+Venta|"
+            r"Descuento|"
+            r"Total\s+Venta\s+Neta|"
+            r"IVA(?:\s*\d+(?:[.,]\d+)?\s*%)?|"
+            r"Total\s+IVA|"
+            r"Total\s+Factura|"
+            r"Anticipo"
+            r")",
+            s,
+            flags=re.IGNORECASE,
+        ):
+            return "_AUXILIAR"
+
+        return None
+
+    resultado: Dict[str, float] = {}
+
+    for linea in lineas:
+        patrones_directos = (
+            (
+                "Total a pagar",
+                r"(?:Total\s+a\s+Pagar|Valor\s+a\s+Pagar|Valor\s+Total\s+a\s+Pagar)",
+            ),
+            (
+                "ReteFuente",
+                r"(?:RTE\s*FUENTE|RETE\s*FUENTE|ReteFuente|RteFte|Retenci[oó]n\s+en\s+la\s+Fuente)",
+            ),
+            ("ReteICA", r"ReteICA"),
+            ("ReteIVA", r"ReteIVA"),
+        )
+
+        for concepto, patron_label in patrones_directos:
+            m = re.search(patron_label, linea, flags=re.IGNORECASE)
+            if not m:
+                continue
+
+            resto = linea[m.end():]
+
+            resto = re.sub(
+                r"\b\d+(?:[.,]\d+)?\s*%",
+                " ",
+                resto,
+                flags=re.IGNORECASE,
+            )
+
+            candidatos = re.findall(
+                r"(?:COP\s*)?\$?\s*-?\d[\d.,]*",
+                resto,
+                flags=re.IGNORECASE,
+            )
+
+            for candidato in reversed(candidatos):
+                valor = _money_explicito_pdf_20260826(candidato)
+                if valor >= 0:
+                    resultado[concepto] = float(valor)
+                    break
+
+    for i, linea in enumerate(lineas):
+        if clasificar_etiqueta(linea) != "Total a pagar":
             continue
 
         inicio = i
-        while inicio > 0 and patron_etiqueta.fullmatch(lineas[inicio - 1]):
+
+        while inicio > 0 and clasificar_etiqueta(lineas[inicio - 1]) is not None:
             inicio -= 1
 
-        etiquetas = lineas[inicio:i + 1]
+        etiquetas_linea = lineas[inicio:i + 1]
+        etiquetas = [clasificar_etiqueta(x) for x in etiquetas_linea]
 
         if not etiquetas:
             continue
 
-        indice_total = len(etiquetas) - 1
         valores = []
 
         for candidata in lineas[i + 1:i + 40]:
@@ -7913,22 +7960,33 @@ def extraer_total_pagar_explicito_pdf_20260826(texto: str) -> float:
             if patron_dinero.fullmatch(candidata):
                 valor = _money_explicito_pdf_20260826(candidata)
                 if valor >= 0:
-                    valores.append(valor)
+                    valores.append(float(valor))
                 continue
 
-            elif valores:
-                # Una vez iniciado el bloque numérico, el primer texto
-                # posterior marca su final.
+            if valores:
                 break
 
-        # Algunos formatos imprimen primero ceros/valores de las líneas
-        # de factura y dejan el resumen al final. Si existen más valores
-        # que etiquetas, asociamos las últimas N posiciones del bloque.
-        if len(valores) >= len(etiquetas):
-            valores_resumen = valores[-len(etiquetas):]
-            total = valores_resumen[indice_total]
+        if len(valores) < len(etiquetas):
+            continue
 
-            if total > 0:
-                return float(total)
+        valores_resumen = valores[-len(etiquetas):]
 
-    return 0.0
+        for concepto, valor in zip(etiquetas, valores_resumen):
+            if concepto in {
+                "ReteFuente",
+                "ReteICA",
+                "ReteIVA",
+                "Total a pagar",
+            }:
+                resultado[concepto] = float(valor)
+
+    return resultado
+
+
+def extraer_total_pagar_explicito_pdf_20260826(texto: str) -> float:
+    """
+    Compatibilidad con el helper existente.
+    Devuelve únicamente Total a pagar explícito.
+    """
+    conceptos = extraer_conceptos_pago_explicitos_pdf_20260903(texto)
+    return float(conceptos.get("Total a pagar", 0.0) or 0.0)
