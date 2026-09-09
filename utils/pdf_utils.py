@@ -849,7 +849,7 @@ def extraer_campos_basicos_pdf(texto: str) -> Dict[str, str]:
 # --------------------------------------------------------
 # Totales
 # --------------------------------------------------------
-_MONEY = r"(\d{1,3}(?:[.\s]\d{3})*(?:[.,]\d{2})|\d+(?:[.,]\d{2})?)"
+_MONEY = r"(\d{1,3}(?:\.\d{3})+,\d{2}|\d{1,3}(?:,\d{3})+\.\d{2}|\d{1,3}(?:\s\d{3})+(?:[.,]\d{2})|\d+(?:[.,]\d{2})?)"
 
 def _to_float_money(s: str) -> float:
     s = (s or "").strip()
@@ -7984,6 +7984,115 @@ def _totales_resumen_vertical_explicito_20260903(
     return {}
 
 
+
+def _totales_resumen_cargos_explicito_20260909(
+    texto: str,
+) -> Dict[str, float]:
+    """
+    Lee resúmenes donde el PDF presenta explícitamente:
+
+        ($) Subtotal
+        <valor>
+
+        ($) IVA
+        <valor>
+
+        Valor total a pagar:
+        <valor>
+
+    El importe de IVA siempre proviene del documento.
+
+    Cuando el PDF no escribe la tarifa, la relación matemática se usa
+    únicamente como validación para clasificar el IVA explícito como
+    IVA 19 %. Nunca se calcula el importe a partir del porcentaje.
+    """
+    t = texto or ""
+
+    if not re.search(
+        r"Tu\s+factura\s+de\s+este\s+mes",
+        t,
+        flags=re.IGNORECASE,
+    ):
+        return {}
+
+    bloque = re.search(
+        r"Tu\s+factura\s+de\s+este\s+mes"
+        r"(.*?)"
+        r"Detalle\s+de\s+su\s+factura",
+        t,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    if not bloque:
+        return {}
+
+    seg = bloque.group(1)
+
+    money = (
+        r"(?:"
+        r"\d{1,3}(?:,\d{3})+\.\d{2}"
+        r"|"
+        r"\d{1,3}(?:\.\d{3})+,\d{2}"
+        r"|"
+        r"\d+(?:[.,]\d{2})?"
+        r")"
+    )
+
+    m_sub = re.search(
+        r"\(\$\)\s*Subtotal\s*(" + money + r")",
+        seg,
+        flags=re.IGNORECASE,
+    )
+
+    m_iva = re.search(
+        r"\(\$\)\s*IVA\s*(" + money + r")",
+        seg,
+        flags=re.IGNORECASE,
+    )
+
+    m_total = re.search(
+        r"Valor\s+total\s+a\s+pagar\s*:\s*"
+        r"\$?\s*(" + money + r")",
+        t,
+        flags=re.IGNORECASE,
+    )
+
+    if not (m_sub and m_iva and m_total):
+        return {}
+
+    subtotal = _money_explicito_pdf_20260826(
+        m_sub.group(1)
+    )
+    iva_explicito = _money_explicito_pdf_20260826(
+        m_iva.group(1)
+    )
+    total = _money_explicito_pdf_20260826(
+        m_total.group(1)
+    )
+
+    if subtotal <= 0 or iva_explicito <= 0 or total <= 0:
+        return {}
+
+    # Solo valida la clasificación.
+    # El IVA retornado sigue siendo exactamente el escrito en el PDF.
+    if abs(iva_explicito - subtotal * 0.19) > 0.02:
+        return {}
+
+    # Permite ajustes explícitos menores, por ejemplo ajuste al peso.
+    if abs(total - (subtotal + iva_explicito)) > 1.00:
+        return {}
+
+    return {
+        "Subtotal": subtotal,
+        "IVA 5%": 0.0,
+        "IVA 19%": iva_explicito,
+        "Retención de IVA": 0.0,
+        "Retención de ICA": 0.0,
+        "Retención en la fuente": 0.0,
+        "Total": total,
+    }
+
+
 def extraer_totales_basicos_pdf(texto: str) -> Dict[str, float]:
     t = _h9_text(texto)
 
@@ -7993,6 +8102,13 @@ def extraer_totales_basicos_pdf(texto: str) -> Dict[str, float]:
 
     if resumen_vertical:
         return resumen_vertical
+
+    resumen_cargos = _totales_resumen_cargos_explicito_20260909(
+        texto
+    )
+
+    if resumen_cargos:
+        return resumen_cargos
 
     try:
         if _h9_es_laurel_posw1158(t):
