@@ -7730,6 +7730,74 @@ def _totales_resumen_vertical_explicito_20260903(
     def limpio(s: str) -> str:
         return re.sub(r"\s*:\s*$", "", str(s or "")).strip()
 
+    # Formato vertical compacto:
+    #
+    #   Total Bruto
+    #   IVA generado 19%
+    #   Total a Pagar
+    #   ...
+    #   204,033.61
+    #   38,766.39
+    #   242,800.00
+    #
+    # Los tres importes deben estar escritos explícitamente.
+    # La relación aritmética solo valida el bloque; nunca genera valores.
+    for inicio in range(max(0, len(lineas) - 2)):
+        etiquetas = [
+            limpio(lineas[inicio]).lower(),
+            limpio(lineas[inicio + 1]).lower(),
+            limpio(lineas[inicio + 2]).lower(),
+        ]
+
+        if etiquetas != [
+            "total bruto",
+            "iva generado 19%",
+            "total a pagar",
+        ]:
+            continue
+
+        valores = []
+
+        for candidata in lineas[
+            inicio + 3:min(len(lineas), inicio + 25)
+        ]:
+            s = candidata.strip()
+
+            if not re.fullmatch(
+                r"\$?\s*\d{1,3}(?:,\d{3})+(?:\.\d{2})?",
+                s,
+            ):
+                continue
+
+            valor = _money_explicito_pdf_20260826(s)
+
+            if valor >= 0:
+                valores.append(float(valor))
+
+            if len(valores) == 3:
+                break
+
+        if len(valores) != 3:
+            continue
+
+        total_bruto, iva19, total_pagar = valores
+
+        if total_bruto <= 0 or total_pagar <= 0:
+            continue
+
+        if abs((total_bruto + iva19) - total_pagar) > 0.02:
+            continue
+
+        return {
+            "Subtotal": total_bruto,
+            "IVA 5%": 0.0,
+            "IVA 19%": iva19,
+            "Retención de IVA": 0.0,
+            "Retención de ICA": 0.0,
+            "Retención en la fuente": 0.0,
+            "Total": total_pagar,
+        }
+
     for inicio, linea in enumerate(lineas):
         if limpio(linea).lower() != "subtotal":
             continue
