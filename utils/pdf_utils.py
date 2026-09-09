@@ -5096,7 +5096,12 @@ def _h6_es_cable_exito(texto: str) -> bool:
 
 def _h6_es_sodimac_tanque(texto: str) -> bool:
     t = _h6_norm(texto).upper()
-    return "SODIMAC COLOMBIA" in t or "TANQUE BAJITO 250L" in t
+    return (
+        "SODIMAC COLOMBIA" in t
+        and "VALOR BRUTO" in t
+        and "SUB.TOTAL" in t
+        and "SUB. TOTAL CON IMPTO." in t
+    )
 
 
 def _h6_es_colmedicos(texto: str) -> bool:
@@ -5560,24 +5565,65 @@ def _h6_totales_innova(texto: str) -> Dict[str, float]:
 def _h6_totales_sodimac(texto: str) -> Dict[str, float]:
     t = _h6_norm(texto)
     subtotal = iva = total = 0.0
+
     start = t.find("VALOR BRUTO")
     end = t.find("SON:", start) if start >= 0 else -1
-    seg = t[start:end if end > start else start + 900] if start >= 0 else t
-    vals = re.findall(r"\b\d{1,3}(?:\.\d{3})*,\d{2}\b", seg)
+
+    seg = (
+        t[start:end if end > start else start + 900]
+        if start >= 0
+        else ""
+    )
+
+    vals = re.findall(
+        r"\b\d{1,3}(?:\.\d{3})*,\d{2}\b",
+        seg,
+    )
     nums = [_h6_money(v) for v in vals]
-    # Orden observado: 284900(total con imp), 239411.76(bruto), 0, 239411.76(subtotal), 45488.24(iva), 284900(total)
-    if len(nums) >= 6:
-        subtotal = nums[3]
-        iva = nums[4]
-        total = nums[5]
+
+    # El bloque termina con los valores explícitos asociados a:
+    # SUB.TOTAL / IVA / SUB. TOTAL CON IMPTO.
+    #
+    # Se toman los tres últimos importes escritos en el bloque.
+    # Esto soporta tanto la variante histórica de 6 importes
+    # como la variante encontrada de 5 importes.
+    if len(nums) >= 5:
+        subtotal = nums[-3]
+        iva = nums[-2]
+        total = nums[-1]
     else:
-        m_sub = re.search(r"SUB\.TOTAL\s*\$?\s*([\d\.,]+)", t, flags=re.IGNORECASE)
-        m_iva = re.search(r"\bIVA\s*\$?\s*([\d\.,]+)", t, flags=re.IGNORECASE)
-        m_tot = re.search(r"TOTAL\s+A\s+PAGAR\s*\$\s*([\d\.,]+)", t, flags=re.IGNORECASE)
-        if m_sub: subtotal = _h6_money(m_sub.group(1))
-        if m_iva: iva = _h6_money(m_iva.group(1))
-        if m_tot: total = _h6_money(m_tot.group(1))
-    return {"Subtotal": subtotal, "IVA 5%": 0.0, "IVA 19%": iva, "Retención de IVA": 0.0, "Retención de ICA": 0.0, "Retención en la fuente": 0.0, "Total": total}
+        m_sub = re.search(
+            r"SUB\.TOTAL\s*\$?\s*([\d\.,]+)",
+            t,
+            flags=re.IGNORECASE,
+        )
+        m_iva = re.search(
+            r"\bIVA\s*\$?\s*([\d\.,]+)",
+            t,
+            flags=re.IGNORECASE,
+        )
+        m_tot = re.search(
+            r"TOTAL\s+A\s+PAGAR\s*\$\s*([\d\.,]+)",
+            t,
+            flags=re.IGNORECASE,
+        )
+
+        if m_sub:
+            subtotal = _h6_money(m_sub.group(1))
+        if m_iva:
+            iva = _h6_money(m_iva.group(1))
+        if m_tot:
+            total = _h6_money(m_tot.group(1))
+
+    return {
+        "Subtotal": subtotal,
+        "IVA 5%": 0.0,
+        "IVA 19%": iva,
+        "Retención de IVA": 0.0,
+        "Retención de ICA": 0.0,
+        "Retención en la fuente": 0.0,
+        "Total": total,
+    }
 
 
 def _h6_totales_colmedicos(texto: str) -> Dict[str, float]:
