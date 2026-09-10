@@ -8453,3 +8453,619 @@ def extraer_total_pagar_explicito_pdf_20260826(texto: str) -> float:
     """
     conceptos = extraer_conceptos_pago_explicitos_pdf_20260903(texto)
     return float(conceptos.get("Total a pagar", 0.0) or 0.0)
+
+# ============================================================
+# PATCH 2026-09-09 - FAMILIAS PENDIENTES AUDITORIA
+# ============================================================
+# Solo conceptos explícitos del documento.
+# No calcula valores fiscales para hacerlos cuadrar.
+# ============================================================
+
+_parse_identificadores_pdf_pre_20260909_familias = parse_identificadores_pdf
+_extraer_totales_basicos_pdf_pre_20260909_familias = extraer_totales_basicos_pdf
+_extraer_conceptos_pago_pre_20260909_familias = (
+    extraer_conceptos_pago_explicitos_pdf_20260903
+)
+
+
+def _f16_lineas(texto):
+    return [
+        re.sub(r"\s+", " ", str(x or "")).strip()
+        for x in (texto or "").replace("\r", "\n").split("\n")
+        if str(x or "").strip()
+    ]
+
+
+def _f16_flat(texto):
+    return re.sub(r"\s+", " ", texto or "").strip()
+
+
+def _f16_money(valor):
+    s = str(valor or "").strip()
+    s = re.sub(r"(?i)\b(?:COP|USD|EUR)\b", "", s)
+    s = s.replace("$", "").replace(" ", "")
+    s = re.sub(r"[^0-9,.\-]", "", s)
+
+    if not s or not re.search(r"\d", s):
+        return 0.0
+
+    neg = s.startswith("-")
+    s = s.lstrip("-")
+
+    if "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+
+    elif "," in s:
+        partes = s.split(",")
+
+        if len(partes) == 2 and len(partes[-1]) == 2:
+            s = partes[0].replace(".", "") + "." + partes[1]
+        else:
+            s = "".join(partes)
+
+    elif "." in s:
+        partes = s.split(".")
+
+        if len(partes) == 2 and len(partes[-1]) == 2:
+            pass
+        elif len(partes) == 2 and len(partes[-1]) == 3:
+            s = "".join(partes)
+        elif len(partes) > 2 and len(partes[-1]) == 2:
+            s = "".join(partes[:-1]) + "." + partes[-1]
+        else:
+            s = "".join(partes)
+
+    try:
+        valor = float(s)
+    except Exception:
+        return 0.0
+
+    return -abs(valor) if neg else valor
+
+
+def _f16_token_money(linea):
+    if re.fullmatch(
+        r"\s*(?:COP\s*)?\$?\s*-?\d[\d.,]*\s*",
+        str(linea or ""),
+        flags=re.IGNORECASE,
+    ):
+        return float(_f16_money(linea))
+
+    return None
+
+
+def _f16_money_after(lineas, patron, max_siguientes=5):
+    rx = re.compile(patron, flags=re.IGNORECASE)
+
+    for i, linea in enumerate(lineas):
+        m = rx.search(linea)
+
+        if not m:
+            continue
+
+        resto = linea[m.end():]
+
+        nums = re.findall(
+            r"(?:COP\s*)?\$?\s*-?\d[\d.,]*",
+            resto,
+            flags=re.IGNORECASE,
+        )
+
+        if nums:
+            return float(_f16_money(nums[0]))
+
+        for candidata in lineas[i + 1:i + 1 + max_siguientes]:
+            valor = _f16_token_money(candidata)
+
+            if valor is not None:
+                return float(valor)
+
+    return None
+
+
+def _f16_identidad(texto):
+    flat = _f16_flat(texto)
+    out = {}
+
+    # Hostinger / invoice internacional.
+    m = re.search(
+        r"\bInvoice\s*#\s*([A-Z0-9][A-Z0-9_-]*(?:-[A-Z0-9_-]+)*)",
+        flat,
+        flags=re.IGNORECASE,
+    )
+
+    if m:
+        out["NUMERO"] = m.group(1)
+
+        meses = {
+            "jan": 1, "feb": 2, "mar": 3, "apr": 4,
+            "may": 5, "jun": 6, "jul": 7, "aug": 8,
+            "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+        }
+
+        f = re.search(
+            r"Invoice\s+Issued\s*#\s*"
+            r"([A-Za-z]{3,9})\s+(\d{1,2}),\s*(\d{4})",
+            flat,
+            flags=re.IGNORECASE,
+        )
+
+        if f:
+            mes = meses.get(f.group(1)[:3].lower())
+
+            if mes:
+                out["FECHA"] = (
+                    f"{int(f.group(3)):04d}-"
+                    f"{mes:02d}-"
+                    f"{int(f.group(2)):02d}"
+                )
+
+        return out
+
+    # Continente / bono.
+    if re.search(
+        r"COMPROBANTE\s+DE\s+PAGO\s+DE\s+TARJETAS.*BONOS",
+        flat,
+        flags=re.IGNORECASE,
+    ):
+        m = re.search(
+            r"\bNUMERO\s*:\s*([A-Z0-9-]+)",
+            flat,
+            flags=re.IGNORECASE,
+        )
+
+        if m:
+            out["NUMERO"] = m.group(1)
+
+        f = re.search(
+            r"\bFECHA\s*:\s*(\d{1,2})/(\d{1,2})/(\d{4})",
+            flat,
+            flags=re.IGNORECASE,
+        )
+
+        if f:
+            out["FECHA"] = (
+                f"{int(f.group(3)):04d}-"
+                f"{int(f.group(2)):02d}-"
+                f"{int(f.group(1)):02d}"
+            )
+
+        return out
+
+    # Nota débito: identidad de la NOTA, no de la factura referenciada.
+    if re.search(
+        r"(?:D[eé]bito\s+Facturaci[oó]n|Nota\s+D[eé]bito)",
+        flat,
+        flags=re.IGNORECASE,
+    ):
+        m = re.search(
+            r"D[eé]bito\s+Facturaci[oó]n\s+No\.?\s*([A-Z0-9-]+)",
+            flat,
+            flags=re.IGNORECASE,
+        )
+
+        if m:
+            out["NUMERO"] = m.group(1)
+
+        f = re.search(
+            r"Fecha\s+Nota\s+D[eé]bito\s*"
+            r"(\d{4})-(\d{1,2})-(\d{1,2})",
+            flat,
+            flags=re.IGNORECASE,
+        )
+
+        if f:
+            out["FECHA"] = (
+                f"{int(f.group(1)):04d}-"
+                f"{int(f.group(2)):02d}-"
+                f"{int(f.group(3)):02d}"
+            )
+
+        cude = re.search(
+            r"\bCUDE\s*:\s*([0-9A-Fa-f]{64,})",
+            flat,
+        )
+
+        if cude:
+            out["CUFE"] = cude.group(1)
+
+        return out
+
+    # Seguros Bolívar.
+    if "SEGUROS BOLIVAR" in flat.upper():
+        m = re.search(
+            r"FACTURA\s+ELECTR[ÓO]NICA\s+DE\s+VENTA\s+"
+            r"No\.\s+No\.?\s*([A-Z0-9-]+)",
+            flat,
+            flags=re.IGNORECASE,
+        )
+
+        if m:
+            out["NUMERO"] = m.group(1)
+
+        f = re.search(
+            r"Fecha\s+de\s+expedici[oó]n\s+AA\s+MM\s+"
+            r"(\d{4})\s+(\d{1,2})\s+DD\s+(\d{1,2})",
+            flat,
+            flags=re.IGNORECASE,
+        )
+
+        if f:
+            out["FECHA"] = (
+                f"{int(f.group(1)):04d}-"
+                f"{int(f.group(2)):02d}-"
+                f"{int(f.group(3)):02d}"
+            )
+
+    # World Office: evita tomar vencimiento de autorización como
+    # fecha de factura.
+    f = re.search(
+        r"\bCUF[ED]\s*:\s*[0-9A-Fa-f]{64,}"
+        r".{0,120}?"
+        r"(?:Expedici[oó]n|Fecha\s+y\s+Hora\s+de\s+Expedici[oó]n)"
+        r"\s*:?\s*"
+        r"(\d{1,2})/(\d{1,2})/(\d{4})",
+        flat,
+        flags=re.IGNORECASE,
+    )
+
+    if f:
+        out["FECHA"] = (
+            f"{int(f.group(3)):04d}-"
+            f"{int(f.group(2)):02d}-"
+            f"{int(f.group(1)):02d}"
+        )
+
+    return out
+
+
+def parse_identificadores_pdf(texto):
+    out = dict(
+        _parse_identificadores_pdf_pre_20260909_familias(texto)
+        or {}
+    )
+
+    for clave, valor in _f16_identidad(texto).items():
+        if valor not in (None, ""):
+            out[clave] = valor
+
+    return out
+
+
+def _f16_worldoffice(texto):
+    lineas = _f16_lineas(texto)
+
+    def concepto(linea):
+        s = re.sub(r"\s+", "", linea.upper())
+
+        mapa = {
+            "SUBTOTAL": "Subtotal",
+            "DESCUENTO": "Descuento",
+            "IVA19%": "IVA 19%",
+            "IVA": "IVA 19%",
+            "RETEFUENTE": "ReteFuente",
+            "RTEFUENTE": "ReteFuente",
+            "RETEIVA": "ReteIVA",
+            "RETEICA": "ReteICA",
+        }
+
+        return mapa.get(s)
+
+    for i, linea in enumerate(lineas):
+
+        if concepto(linea) != "Subtotal":
+            continue
+
+        etiquetas = []
+        j = i
+
+        while j < min(len(lineas), i + 10):
+            c = concepto(lineas[j])
+
+            if c:
+                etiquetas.append(c)
+            elif etiquetas and len(etiquetas) >= 4:
+                break
+
+            j += 1
+
+        if (
+            len(etiquetas) < 5
+            or "ReteFuente" not in etiquetas
+        ):
+            continue
+
+        idx_total = None
+
+        for k in range(j, min(len(lineas), j + 35)):
+            if re.fullmatch(
+                r"TOTAL\s+A\s+PAGAR(?:\s*►)?",
+                lineas[k],
+                flags=re.IGNORECASE,
+            ):
+                idx_total = k
+                break
+
+        if idx_total is None:
+            continue
+
+        valores = []
+
+        for k in range(j, idx_total):
+            valor = _f16_token_money(lineas[k])
+
+            if valor is not None:
+                valores.append(float(valor))
+
+        if len(valores) < len(etiquetas):
+            continue
+
+        valores = valores[-len(etiquetas):]
+
+        out = dict(zip(etiquetas, valores))
+
+        total = _f16_money_after(
+            lineas[idx_total:],
+            r"^TOTAL\s+A\s+PAGAR(?:\s*►)?$",
+            5,
+        )
+
+        if total is not None:
+            out["Total a pagar"] = float(total)
+
+        return out
+
+    return {}
+
+
+def _f16_totales(texto):
+    lineas = _f16_lineas(texto)
+    flat = _f16_flat(texto)
+
+    cero = {
+        "Subtotal": 0.0,
+        "IVA 5%": 0.0,
+        "IVA 19%": 0.0,
+        "Retención de IVA": 0.0,
+        "Retención de ICA": 0.0,
+        "Retención en la fuente": 0.0,
+        "Total": 0.0,
+    }
+
+    # Hostinger.
+    if re.search(r"\bInvoice\s*#", flat, flags=re.IGNORECASE):
+        subtotal = _f16_money_after(
+            lineas,
+            r"^Total\s+excl\.\s+VAT$",
+            3,
+        )
+
+        total = _f16_money_after(
+            lineas,
+            r"^Total$",
+            3,
+        )
+
+        if subtotal is not None and total is not None:
+            out = dict(cero)
+            out["Subtotal"] = subtotal
+            out["Total"] = total
+            return out
+
+    # Continente.
+    if re.search(
+        r"COMPROBANTE\s+DE\s+PAGO\s+DE\s+TARJETAS.*BONOS",
+        flat,
+        flags=re.IGNORECASE,
+    ):
+        subtotal = _f16_money_after(
+            lineas,
+            r"^Subtotal$",
+            3,
+        )
+
+        total = _f16_money_after(
+            lineas,
+            r"^Valor\s+Total$",
+            3,
+        )
+
+        if subtotal is not None and total is not None:
+            out = dict(cero)
+            out["Subtotal"] = subtotal
+            out["Total"] = total
+            return out
+
+    # Seguros Bolívar.
+    if "SEGUROS BOLIVAR" in flat.upper():
+        subtotal = _f16_money_after(
+            lineas,
+            r"^SUBTOTAL$",
+            3,
+        )
+
+        total = _f16_money_after(
+            lineas,
+            r"^VALOR\s+A\s+PAGAR$",
+            3,
+        )
+
+        if subtotal is not None and total is not None:
+            out = dict(cero)
+            out["Subtotal"] = subtotal
+            out["Total"] = total
+            return out
+
+    # Nota débito.
+    if re.search(
+        r"(?:D[eé]bito\s+Facturaci[oó]n|Nota\s+D[eé]bito)",
+        flat,
+        flags=re.IGNORECASE,
+    ):
+        subtotal = _f16_money_after(
+            lineas,
+            r"^Total\s+Bruto$",
+            5,
+        )
+
+        total = _f16_money_after(
+            lineas,
+            r"^Total$",
+            3,
+        )
+
+        if subtotal is not None and total is not None:
+            out = dict(cero)
+            out["Subtotal"] = subtotal
+            out["Total"] = total
+            return out
+
+    # Compensar - Estado de cuenta de créditos.
+    #
+    # El estado de cuenta puede perder encabezados/columnas durante
+    # la extracción de texto. Se aceptan dos representaciones
+    # explícitas del MISMO valor:
+    #
+    # 1. fila resumen:
+    #      cuenta -> $total -> $0 -> $0 -> $total
+    #
+    # 2. campo de importe del código de recaudo:
+    #      (3900)00000003541848
+    #
+    # En ninguno de los dos casos se calcula el total.
+    if (
+        "9006764331" in flat
+        and (
+            "FINANCIAMIENTO.COMPENSAR.COM" in flat.upper()
+            or "6310007658" in flat
+        )
+    ):
+        limpio = re.sub(
+            r"[\x00-\x1f\x7f-\x9f]+",
+            " ",
+            flat,
+        )
+
+        limpio = re.sub(
+            r"\s+",
+            " ",
+            limpio,
+        )
+
+        m = re.search(
+            r"9006764331"
+            r".{0,100}?"
+            r"\$\s*([\d.,]+)"
+            r"\s+\$\s*0(?:[.,]0+)?"
+            r"\s+\$\s*0(?:[.,]0+)?"
+            r"\s+\$\s*([\d.,]+)",
+            limpio,
+            flags=re.IGNORECASE,
+        )
+
+        if m:
+            a = _f16_money(m.group(1))
+            b = _f16_money(m.group(2))
+
+            if (
+                a > 0
+                and b > 0
+                and abs(a - b) < 0.01
+            ):
+                out = dict(cero)
+                out["Total"] = float(b)
+                return out
+
+        # Fallback semántico:
+        # el identificador 3900 del código de recaudo contiene
+        # explícitamente el importe a pagar.
+        m = re.search(
+            r"\(3900\)\s*0*(\d{1,12})\s*\(96\)",
+            limpio,
+            flags=re.IGNORECASE,
+        )
+
+        if m:
+            total_explicito = float(
+                int(m.group(1))
+            )
+
+            if total_explicito > 0:
+                out = dict(cero)
+                out["Total"] = total_explicito
+                return out
+
+    # World Office.
+    grid = _f16_worldoffice(texto)
+
+    if grid and "Total a pagar" in grid:
+        out = dict(cero)
+
+        out["Subtotal"] = float(
+            grid.get("Subtotal", 0.0) or 0.0
+        )
+
+        out["IVA 19%"] = float(
+            grid.get("IVA 19%", 0.0) or 0.0
+        )
+
+        out["Retención en la fuente"] = -abs(
+            float(grid.get("ReteFuente", 0.0) or 0.0)
+        )
+
+        out["Retención de IVA"] = -abs(
+            float(grid.get("ReteIVA", 0.0) or 0.0)
+        )
+
+        out["Retención de ICA"] = -abs(
+            float(grid.get("ReteICA", 0.0) or 0.0)
+        )
+
+        out["Total"] = float(
+            grid["Total a pagar"]
+        )
+
+        return out
+
+    return {}
+
+
+def extraer_totales_basicos_pdf(texto):
+    especial = _f16_totales(texto)
+
+    if especial:
+        return especial
+
+    return (
+        _extraer_totales_basicos_pdf_pre_20260909_familias(texto)
+        or {}
+    )
+
+
+def extraer_conceptos_pago_explicitos_pdf_20260903(texto):
+    out = dict(
+        _extraer_conceptos_pago_pre_20260909_familias(texto)
+        or {}
+    )
+
+    grid = _f16_worldoffice(texto)
+
+    for origen, destino in (
+        ("ReteFuente", "ReteFuente"),
+        ("ReteIVA", "ReteIVA"),
+        ("ReteICA", "ReteICA"),
+        ("Total a pagar", "Total a pagar"),
+    ):
+        if origen in grid:
+            out[destino] = float(grid[origen])
+
+    return out
+
+
+print(
+    "🔥 PDF_UTILS PATCH 2026-09-09 ACTIVO: "
+    "FAMILIAS-AUDITORIA-16"
+)

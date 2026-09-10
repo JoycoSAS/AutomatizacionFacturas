@@ -3065,3 +3065,97 @@ def procesar_xml_en_carpeta(ruta_carpeta: str) -> tuple[list[dict], int]:
             errores_zip += 1
 
     return registros, errores_zip
+
+# ============================================================
+# PATCH 2026-09-09 - DEDUPLICACION XML LOGICA
+# ============================================================
+
+_procesar_xml_en_carpeta_pre_dedupe_20260909 = (
+    procesar_xml_en_carpeta
+)
+
+
+def _clave_xml_20260909(reg):
+    def norm(valor):
+        return re.sub(
+            r"[^A-Z0-9]",
+            "",
+            str(valor or "").upper(),
+        )
+
+    cufe = norm(reg.get("CUFE"))
+
+    if cufe:
+        return ("CUFE", cufe)
+
+    numero = norm(
+        reg.get("Número de factura")
+    )
+
+    nit = norm(
+        reg.get("NIT")
+    )
+
+    fecha = (
+        str(reg.get("Año") or ""),
+        str(reg.get("Mes") or ""),
+        str(reg.get("Día") or ""),
+    )
+
+    if numero and nit and all(fecha):
+        return (
+            "FALLBACK",
+            numero,
+            nit,
+            *fecha,
+            round(
+                float(reg.get("Subtotal") or 0.0),
+                2,
+            ),
+            round(
+                float(reg.get("Total") or 0.0),
+                2,
+            ),
+        )
+
+    return None
+
+
+def procesar_xml_en_carpeta(ruta_carpeta):
+    registros, errores_zip = (
+        _procesar_xml_en_carpeta_pre_dedupe_20260909(
+            ruta_carpeta
+        )
+    )
+
+    unicos = []
+    vistos = set()
+
+    for reg in registros or []:
+
+        clave = _clave_xml_20260909(reg)
+
+        if (
+            clave is not None
+            and clave in vistos
+        ):
+            print(
+                "↪️ XML duplicado omitido:",
+                reg.get("Archivo"),
+                "|",
+                reg.get("Número de factura"),
+            )
+            continue
+
+        if clave is not None:
+            vistos.add(clave)
+
+        unicos.append(reg)
+
+    return unicos, errores_zip
+
+
+print(
+    "🔥 FACTURA_SERVICE PATCH 2026-09-09 ACTIVO: "
+    "DEDUPE-XML"
+)
