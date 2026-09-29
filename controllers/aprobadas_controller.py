@@ -9310,3 +9310,557 @@ def run_notas_credito_inbox_prueba(
 
 
 print("🔥 CONTROLLER VERSION ACTIVA: 2026-06-12-AUDIT-ITERROWS-AIDX-FAST-FALLBACK")
+
+
+# =====================================================================
+# PATCH 2026-09-24 SELECCION-DOCUMENTO-PRINCIPAL
+# =====================================================================
+# Cuando un correo trae varios PDF:
+#
+# - cuenta de cobro / factura / documento equivalente = principal
+# - acta / planilla / aportes / seguridad social = soporte
+#
+# No modifica el flujo XML.
+# Si no puede clasificar con suficiente confianza,
+# conserva exactamente la selección previa.
+# =====================================================================
+
+_seleccionar_mejor_pdf_pre_20260924 = _seleccionar_mejor_pdf
+
+
+def _norm_rol_pdf_20260924(
+    valor: str,
+) -> str:
+
+    import re
+    import unicodedata
+
+    s = str(valor or "")
+
+    try:
+        s = unicodedata.normalize(
+            "NFKD",
+            s,
+        )
+
+        s = "".join(
+            ch
+            for ch in s
+            if not unicodedata.combining(ch)
+        )
+
+    except Exception:
+        pass
+
+    return re.sub(
+        r"\s+",
+        " ",
+        s.upper(),
+    ).strip()
+
+
+def _puntuar_pdf_principal_20260924(
+    nombre: str,
+    texto: str,
+    subject: str = "",
+) -> int:
+
+    n_nombre = _norm_rol_pdf_20260924(
+        nombre
+    )
+
+    n = _norm_rol_pdf_20260924(
+        texto
+    )
+
+    inicio = n[:4000]
+
+    n_subject = _norm_rol_pdf_20260924(
+        subject
+    )
+
+    score = 0
+
+    # ---------------------------------------------------------
+    # DOCUMENTO PRINCIPAL
+    # ---------------------------------------------------------
+
+    if "CUENTA DE COBRO" in inicio:
+        score += 160
+
+    if "FACTURA ELECTRONICA" in inicio:
+        score += 150
+
+    if (
+        "DOCUMENTO EQUIVALENTE ELECTRONICO"
+        in n
+    ):
+        score += 150
+
+    if (
+        "FACTURA DE SERVICIO PUBLICO"
+        in n_subject
+        and (
+            "ENERGIA" in n
+            or "CONSUMO ACTIVA" in n
+            or "SERVICIOS FACTURADOS" in n
+        )
+    ):
+        score += 140
+
+    if "TOTAL A PAGAR" in n:
+        score += 20
+
+    if "PAGO TOTAL" in n:
+        score += 20
+
+    if "CUFE" in n or "CUDE" in n:
+        score += 10
+
+    if (
+        "_CC" in n_nombre
+        or "CUENTA" in n_nombre
+    ):
+        score += 25
+
+    # ---------------------------------------------------------
+    # DOCUMENTOS SOPORTE
+    # ---------------------------------------------------------
+
+    if (
+        "ACTA DE RECIBO" in inicio
+        or "ACTA RECIBO Y APROBACION" in inicio
+        or "ACTA DE RECIBO Y APROBACION" in inicio
+    ):
+        score -= 180
+
+    if any(
+        x in inicio
+        for x in (
+            "PLANILLA INTEGRADA",
+            "SEGURIDAD SOCIAL",
+            "MIPLANILLA",
+            "OPERADOR DE INFORMACION",
+            "APORTES AL SISTEMA",
+            "TOTAL A PAGAR: $754",
+        )
+    ):
+        score -= 220
+
+    if "APORTES" in n_nombre:
+        score -= 180
+
+    if "PLANILLA" in n_nombre:
+        score -= 180
+
+    if "ACTA" in n_nombre:
+        score -= 140
+
+    return score
+
+
+def _ruta_pdf_adjunto_local_20260924(
+    att,
+):
+
+    import base64
+    import os
+    from pathlib import Path
+
+    nombre = os.path.basename(
+        str(
+            att.get(
+                "name",
+                "",
+            )
+            or ""
+        )
+    )
+
+    if not nombre:
+        return ""
+
+    directa = os.path.join(
+        TMP_DIR,
+        nombre,
+    )
+
+    if os.path.isfile(
+        directa
+    ):
+        return directa
+
+    # Buscar únicamente el nombre exacto dentro de TMP_DIR.
+    try:
+
+        for p in Path(
+            TMP_DIR
+        ).rglob(
+            nombre
+        ):
+
+            if p.is_file():
+                return str(p)
+
+    except Exception:
+        pass
+
+    # Graph puede traer contentBytes directamente.
+    contenido = att.get(
+        "contentBytes"
+    )
+
+    if contenido:
+
+        try:
+
+            os.makedirs(
+                TMP_DIR,
+                exist_ok=True,
+            )
+
+            with open(
+                directa,
+                "wb",
+            ) as f:
+                f.write(
+                    base64.b64decode(
+                        contenido
+                    )
+                )
+
+            return directa
+
+        except Exception:
+            pass
+
+    return ""
+
+
+def _seleccionar_mejor_pdf(
+    msg_id,
+    subj,
+    pdf_atts,
+):
+
+    # Primero dejamos que todo el flujo histórico haga
+    # exactamente lo que hacía.
+    original = (
+        _seleccionar_mejor_pdf_pre_20260924(
+            msg_id,
+            subj,
+            pdf_atts,
+        )
+    )
+
+    if not pdf_atts or len(
+        pdf_atts
+    ) <= 1:
+        return original
+
+    candidatos = []
+
+    for att in pdf_atts:
+
+        nombre = str(
+            att.get(
+                "name",
+                "",
+            )
+            or ""
+        )
+
+        ruta = (
+            _ruta_pdf_adjunto_local_20260924(
+                att
+            )
+        )
+
+        if not ruta:
+            continue
+
+        try:
+            texto = (
+                extraer_texto_pdf(
+                    ruta
+                )
+                or ""
+            )
+        except Exception:
+            texto = ""
+
+        if not texto:
+            continue
+
+        score = (
+            _puntuar_pdf_principal_20260924(
+                nombre,
+                texto,
+                subj,
+            )
+        )
+
+        candidatos.append(
+            (
+                score,
+                att,
+                ruta,
+                texto,
+            )
+        )
+
+    if not candidatos:
+        return original
+
+    candidatos.sort(
+        key=lambda x: x[0],
+        reverse=True,
+    )
+
+    score, att, ruta, texto = (
+        candidatos[0]
+    )
+
+    # Solo intervenir cuando existe evidencia documental
+    # suficientemente fuerte.
+    if score < 60:
+        return original
+
+    try:
+        ident = (
+            parse_identificadores_pdf(
+                texto
+            )
+            or {}
+        )
+
+        subj_num = (
+            _numero_from_subject(
+                subj
+            )
+        )
+
+        best_num = (
+            _prefer_subject_numero(
+                ident.get(
+                    "NUMERO"
+                ),
+                subj_num,
+            )
+        )
+
+        if best_num:
+            ident["NUMERO"] = best_num
+
+        if (
+            subj_num
+            and subj_num
+            != str(
+                ident.get(
+                    "NUMERO",
+                    "",
+                )
+            ).strip()
+        ):
+            ident["NUMERO_APROB"] = subj_num
+
+    except Exception:
+        ident = {}
+
+    nombre = str(
+        att.get(
+            "name",
+            "",
+        )
+        or ""
+    )
+
+    print(
+        "[PDF PRINCIPAL 20260924] "
+        f"seleccionado={nombre} | score={score}"
+    )
+
+    return (
+        att,
+        ruta,
+        ident,
+    )
+
+
+print(
+    "🔥 APROBADAS PATCH 2026-09-24 ACTIVO: "
+    "SELECCION-DOCUMENTO-PRINCIPAL"
+)
+
+
+
+# =====================================================================
+# PATCH 2026-09-25-D SELECCION-PRINCIPAL-CONTEXTO
+# =====================================================================
+# Corrige clasificación de documentos que son realmente una cuenta
+# de cobro pero mencionan ACTA/APORTES dentro de la lista de anexos.
+#
+# Ejemplo real:
+#   CUENTA DE COBRO No. 27
+#   ...
+#   ANEXOS: cuenta de cobro, acta..., aportes...
+#
+# La palabra "acta" dentro de anexos NO convierte el documento
+# principal en soporte.
+# =====================================================================
+
+
+def _puntuar_pdf_principal_20260924(
+    nombre: str,
+    texto: str,
+    subject: str = "",
+) -> int:
+
+    n_nombre = _norm_rol_pdf_20260924(
+        nombre
+    )
+
+    n = _norm_rol_pdf_20260924(
+        texto
+    )
+
+    cabecera = n[:1600]
+
+    n_subject = _norm_rol_pdf_20260924(
+        subject
+    )
+
+    score = 0
+
+
+    # =========================================================
+    # MARCADORES FUERTES DE DOCUMENTO PRINCIPAL
+    # =========================================================
+
+    es_cuenta_cobro = (
+        "CUENTA DE COBRO"
+        in cabecera
+    )
+
+    es_factura = (
+        "FACTURA ELECTRONICA"
+        in cabecera
+        or
+        "FACTURA ELECTRONICA DE VENTA"
+        in cabecera
+    )
+
+    es_documento_equivalente = (
+        "DOCUMENTO EQUIVALENTE ELECTRONICO"
+        in cabecera
+    )
+
+    es_servicio_publico = (
+        "FACTURA DE SERVICIO PUBLICO"
+        in n_subject
+        and (
+            "ENERGIA" in n
+            or "CONSUMO ACTIVA" in n
+            or "SERVICIOS FACTURADOS" in n
+        )
+    )
+
+
+    if es_cuenta_cobro:
+        score += 240
+
+    if es_factura:
+        score += 220
+
+    if es_documento_equivalente:
+        score += 220
+
+    if es_servicio_publico:
+        score += 200
+
+
+    principal_fuerte = any(
+        (
+            es_cuenta_cobro,
+            es_factura,
+            es_documento_equivalente,
+            es_servicio_publico,
+        )
+    )
+
+
+    # =========================================================
+    # INDICADORES SECUNDARIOS
+    # =========================================================
+
+    if "TOTAL A PAGAR" in n:
+        score += 20
+
+    if "PAGO TOTAL" in n:
+        score += 20
+
+    if "CUFE" in n or "CUDE" in n:
+        score += 10
+
+    if (
+        "_CC" in n_nombre
+        or "CUENTA" in n_nombre
+    ):
+        score += 20
+
+
+    # =========================================================
+    # DOCUMENTOS SOPORTE
+    #
+    # Si ya existe un marcador FUERTE de documento principal,
+    # no penalizamos porque más abajo aparezca:
+    # "ANEXOS: acta, aportes..."
+    # =========================================================
+
+    if not principal_fuerte:
+
+        cabecera_soporte = n[:1800]
+
+        if (
+            "ACTA DE RECIBO"
+            in cabecera_soporte
+            or
+            "ACTA RECIBO Y APROBACION"
+            in cabecera_soporte
+            or
+            "ACTA DE RECIBO Y APROBACION"
+            in cabecera_soporte
+        ):
+            score -= 220
+
+        if any(
+            x in cabecera_soporte
+            for x in (
+                "PLANILLA INTEGRADA",
+                "SEGURIDAD SOCIAL",
+                "MIPLANILLA",
+                "OPERADOR DE INFORMACION",
+                "APORTES AL SISTEMA",
+            )
+        ):
+            score -= 260
+
+
+    # El nombre del archivo sí es un indicador fuerte de soporte.
+    if "APORTES" in n_nombre:
+        score -= 220
+
+    if "PLANILLA" in n_nombre:
+        score -= 220
+
+    if "ACTA" in n_nombre:
+        score -= 180
+
+
+    return score
+
+
+print(
+    "🔥 APROBADAS PATCH 2026-09-25-D ACTIVO: "
+    "SELECCION-PRINCIPAL-CONTEXTO"
+)
