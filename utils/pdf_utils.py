@@ -9069,3 +9069,2251 @@ print(
     "🔥 PDF_UTILS PATCH 2026-09-09 ACTIVO: "
     "FAMILIAS-AUDITORIA-16"
 )
+
+
+# =====================================================================
+# PATCH 2026-09-24 OCR-FALLBACK-DOCUMENTOS-ESPECIALES
+# =====================================================================
+# Objetivos:
+# - Mantener pdfminer como primera opción.
+# - Usar OCR SOLO cuando el PDF realmente no contiene texto útil.
+# - OCR únicamente convierte imagen -> texto.
+# - No calcular ni fabricar valores fiscales.
+# - Generalizar CENS sin números/CUDE/totales hardcodeados.
+# - Soportar AIR-E, ENEL y cuentas de cobro por etiquetas explícitas.
+# =====================================================================
+
+_extraer_texto_pdf_pre_20260924 = extraer_texto_pdf
+_parse_identificadores_pdf_pre_20260924 = parse_identificadores_pdf
+_extraer_campos_basicos_pdf_pre_20260924 = extraer_campos_basicos_pdf
+_extraer_totales_basicos_pdf_pre_20260924 = extraer_totales_basicos_pdf
+
+try:
+    _extraer_descripcion_items_pdf_pre_20260924 = extraer_descripcion_items_pdf
+except Exception:
+    _extraer_descripcion_items_pdf_pre_20260924 = None
+
+
+def _doc_norm_20260924(valor: str) -> str:
+    import re
+    import unicodedata
+
+    s = str(valor or "").replace("\xa0", " ")
+
+    try:
+        s = unicodedata.normalize("NFKD", s)
+        s = "".join(
+            ch
+            for ch in s
+            if not unicodedata.combining(ch)
+        )
+    except Exception:
+        pass
+
+    s = s.upper()
+
+    return re.sub(
+        r"\s+",
+        " ",
+        s,
+    ).strip()
+
+
+def _doc_money_20260924(valor: str) -> float:
+    import re
+
+    s = str(valor or "").strip()
+
+    s = (
+        s.replace("$", "")
+        .replace("COP", "")
+        .replace(" ", "")
+    )
+
+    s = re.sub(
+        r"[^0-9,.\-]",
+        "",
+        s,
+    )
+
+    if not s or s in {"-", ".", ","}:
+        return 0.0
+
+    negativo = s.startswith("-")
+    s = s.lstrip("-")
+
+    if "." in s and "," in s:
+
+        if s.rfind(",") > s.rfind("."):
+            # 1.468.730,00
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            # 1,468,730.00
+            s = s.replace(",", "")
+
+    elif s.count(".") > 1:
+        s = s.replace(".", "")
+
+    elif s.count(",") > 1:
+        s = s.replace(",", "")
+
+    elif "." in s:
+
+        entero, dec = s.rsplit(".", 1)
+
+        if len(dec) == 3:
+            s = entero + dec
+
+    elif "," in s:
+
+        entero, dec = s.rsplit(",", 1)
+
+        if len(dec) == 3:
+            s = entero + dec
+        elif len(dec) in {1, 2}:
+            s = entero + "." + dec
+
+    try:
+        valor_num = float(s)
+    except Exception:
+        return 0.0
+
+    return (
+        -valor_num
+        if negativo
+        else valor_num
+    )
+
+
+def _texto_pdf_util_20260924(texto: str) -> bool:
+    import re
+
+    t = str(texto or "")
+
+    alfanumericos = len(
+        re.findall(
+            r"[A-Za-zÁÉÍÓÚÑáéíóúñ0-9]",
+            t,
+        )
+    )
+
+    # Muy conservador:
+    # solo OCR cuando prácticamente no existe capa de texto.
+    return alfanumericos >= 40
+
+
+def _puntaje_ocr_20260924(texto: str) -> int:
+    import re
+
+    t = str(texto or "")
+
+    alfa = len(
+        re.findall(
+            r"[A-Za-zÁÉÍÓÚÑáéíóúñ0-9]",
+            t,
+        )
+    )
+
+    claves = len(
+        re.findall(
+            r"""
+            factura|
+            documento|
+            total|
+            pagar|
+            nit|
+            cude|
+            cufe|
+            energia|
+            energ[ií]a|
+            servicio|
+            consumo|
+            valor|
+            cuenta
+            """,
+            t,
+            flags=(
+                re.IGNORECASE
+                | re.VERBOSE
+            ),
+        )
+    )
+
+    return alfa + (claves * 80)
+
+
+def _ocr_pdf_20260924(local_pdf_path: str) -> str:
+    """
+    OCR local seguro.
+
+    No interpreta valores.
+    Solo devuelve texto para que continúe el mismo parser del sistema.
+    """
+
+    import os
+    import shutil
+    import subprocess
+    import tempfile
+
+    try:
+        import pypdfium2 as pdfium
+    except Exception as e:
+        print(
+            "[PDF OCR] pypdfium2 no disponible. "
+            f"Se mantiene fallback anterior: {e}"
+        )
+        return ""
+
+    tesseract = shutil.which("tesseract")
+
+    if not tesseract:
+        print(
+            "[PDF OCR] Tesseract no disponible. "
+            "Se mantiene fallback anterior."
+        )
+        return ""
+
+    try:
+        langs_proc = subprocess.run(
+            [
+                tesseract,
+                "--list-langs",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+        )
+
+        langs = {
+            x.strip()
+            for x in langs_proc.stdout.splitlines()
+            if x.strip()
+            and not x.lower().startswith(
+                "list of available languages"
+            )
+        }
+
+    except Exception:
+        langs = set()
+
+    if "spa" in langs and "eng" in langs:
+        lang = "spa+eng"
+    elif "spa" in langs:
+        lang = "spa"
+    elif "eng" in langs:
+        lang = "eng"
+    else:
+        print(
+            "[PDF OCR] No existe idioma spa/eng en Tesseract."
+        )
+        return ""
+
+    try:
+        pdf = pdfium.PdfDocument(
+            str(local_pdf_path)
+        )
+    except Exception as e:
+        print(
+            f"[PDF OCR] No se pudo abrir PDF: {e}"
+        )
+        return ""
+
+    textos_psm6 = []
+    textos_psm11 = []
+
+    try:
+
+        paginas = min(
+            len(pdf),
+            10,
+        )
+
+        with tempfile.TemporaryDirectory(
+            prefix="joyco_ocr_"
+        ) as tmp:
+
+            for i in range(paginas):
+
+                page = pdf[i]
+
+                try:
+                    bitmap = page.render(
+                        scale=300 / 72
+                    )
+
+                    imagen = bitmap.to_pil()
+
+                    ruta_img = os.path.join(
+                        tmp,
+                        f"pagina_{i + 1:02d}.png",
+                    )
+
+                    imagen.save(
+                        ruta_img,
+                        format="PNG",
+                    )
+
+                    cmd = [
+                        tesseract,
+                        ruta_img,
+                        "stdout",
+                        "-l",
+                        lang,
+                        "--psm",
+                        "6",
+                    ]
+
+                    r = subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=120,
+                    )
+
+                    texto6 = (
+                        r.stdout
+                        if r.returncode == 0
+                        else ""
+                    )
+
+                    textos_psm6.append(
+                        texto6
+                    )
+
+                    # Solo probamos PSM 11 si la página quedó pobre.
+                    if _puntaje_ocr_20260924(texto6) < 350:
+
+                        cmd[-1] = "11"
+
+                        r11 = subprocess.run(
+                            cmd,
+                            capture_output=True,
+                            text=True,
+                            encoding="utf-8",
+                            errors="replace",
+                            timeout=120,
+                        )
+
+                        texto11 = (
+                            r11.stdout
+                            if r11.returncode == 0
+                            else ""
+                        )
+
+                    else:
+                        texto11 = ""
+
+                    textos_psm11.append(
+                        texto11
+                    )
+
+                except Exception as e:
+                    print(
+                        f"[PDF OCR] Página {i + 1} falló: {e}"
+                    )
+
+                    textos_psm6.append("")
+                    textos_psm11.append("")
+
+                finally:
+                    try:
+                        bitmap.close()
+                    except Exception:
+                        pass
+
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
+
+    finally:
+        try:
+            pdf.close()
+        except Exception:
+            pass
+
+    texto6 = "\n\n".join(
+        textos_psm6
+    ).strip()
+
+    texto11 = "\n\n".join(
+        textos_psm11
+    ).strip()
+
+    if (
+        _puntaje_ocr_20260924(texto11)
+        >
+        _puntaje_ocr_20260924(texto6)
+    ):
+        final = texto11
+        psm = 11
+    else:
+        final = texto6
+        psm = 6
+
+    if final:
+        print(
+            "[PDF OCR] OCR aplicado | "
+            f"archivo={os.path.basename(local_pdf_path)} | "
+            f"chars={len(final)} | "
+            f"psm={psm} | "
+            f"lang={lang}"
+        )
+
+    return final
+
+
+def extraer_texto_pdf(local_pdf_path: str) -> str:
+    """
+    Flujo único:
+        pdfminer
+            ↓
+        texto útil -> retornar
+            ↓ no
+        OCR fallback
+            ↓
+        retornar texto OCR
+
+    OCR nunca se ejecuta sobre PDFs normales que ya tengan
+    una capa de texto utilizable.
+    """
+
+    try:
+        texto = (
+            _extraer_texto_pdf_pre_20260924(
+                local_pdf_path
+            )
+            or ""
+        )
+    except Exception:
+        texto = ""
+
+    if _texto_pdf_util_20260924(
+        texto
+    ):
+        return texto
+
+    texto_ocr = _ocr_pdf_20260924(
+        local_pdf_path
+    )
+
+    return texto_ocr or texto
+
+
+# =====================================================================
+# DETECTORES DOCUMENTALES
+# =====================================================================
+
+
+def _es_cens_20260924(texto: str) -> bool:
+
+    n = _doc_norm_20260924(
+        texto
+    )
+
+    return (
+        "CENS" in n
+        and (
+            "DOCUMENTO EQUIVALENTE ELECTR" in n
+            or "890500514" in n
+        )
+        and (
+            "ENERGIA" in n
+            or "SERVICIOS FACTURADOS" in n
+        )
+    )
+
+
+def _es_aire_20260924(texto: str) -> bool:
+
+    n = _doc_norm_20260924(
+        texto
+    )
+
+    return (
+        "DETALLE FACTURACION" in n
+        and "CONSUMO ACTIVA" in n
+        and "FIUG" in n
+        and "NIU" in n
+        and "CIRCUITO / TRANSFORMADOR" in n
+    )
+
+
+def _es_enel_20260924(texto: str) -> bool:
+
+    n = _doc_norm_20260924(
+        texto
+    )
+
+    return (
+        "WWW.ENEL.COM.CO" in n
+        or (
+            "DOCUMENTO EQUIVALENTE ELECTRONICO" in n
+            and "COMERCIALIZACION DE ENERGIA ELECTRICA" in n
+        )
+    )
+
+
+def _es_cuenta_cobro_20260924(
+    texto: str,
+) -> bool:
+
+    n = _doc_norm_20260924(
+        str(texto or "")[:3500]
+    )
+
+    return (
+        "CUENTA DE COBRO" in n
+        and (
+            "DEBE A" in n
+            or "POR CONCEPTO DE" in n
+            or "LA SUMA DE" in n
+        )
+    )
+
+
+# =====================================================================
+# HELPERS IDENTIFICADORES
+# =====================================================================
+
+
+def _fecha_espanol_20260924(
+    dia: str,
+    mes: str,
+    anio: str,
+) -> str:
+
+    meses = {
+        "ENERO": 1,
+        "FEBRERO": 2,
+        "MARZO": 3,
+        "ABRIL": 4,
+        "MAYO": 5,
+        "JUNIO": 6,
+        "JULIO": 7,
+        "AGOSTO": 8,
+        "SEPTIEMBRE": 9,
+        "SETIEMBRE": 9,
+        "OCTUBRE": 10,
+        "NOVIEMBRE": 11,
+        "DICIEMBRE": 12,
+    }
+
+    m = meses.get(
+        _doc_norm_20260924(mes)
+    )
+
+    if not m:
+        return ""
+
+    try:
+        return (
+            f"{int(anio):04d}-"
+            f"{int(m):02d}-"
+            f"{int(dia):02d}"
+        )
+    except Exception:
+        return ""
+
+
+def _numero_aire_20260924(
+    texto: str,
+) -> str:
+
+    import re
+
+    flat = re.sub(
+        r"\s+",
+        " ",
+        str(texto or ""),
+    )
+
+    m = re.search(
+        r"FIUG\s*:\s*"
+        r"\d{1,4}[,.]\d{2}\s*"
+        r"(\d{8})(?!\d)",
+        flat,
+        flags=re.IGNORECASE,
+    )
+
+    if m:
+        return m.group(1)
+
+    return ""
+
+
+def _numero_enel_20260924(
+    texto: str,
+) -> str:
+
+    import re
+
+    flat = re.sub(
+        r"\s+",
+        " ",
+        str(texto or ""),
+    )
+
+    m = re.search(
+        r"DOCUMENTO\s+EQUIVALENTE\s+"
+        r"ELECTR[ÓO]NICO\s+"
+        r"(?:No\.?\s*)?"
+        r"([0-9]+(?:-[0-9]+)?)",
+        flat,
+        flags=re.IGNORECASE,
+    )
+
+    if m:
+        return m.group(1)
+
+    return ""
+
+
+def _numero_cuenta_cobro_20260924(
+    texto: str,
+) -> str:
+
+    import re
+
+    m = re.search(
+        r"CUENTA\s+DE\s+COBRO"
+        r"\s*(?:No\.?|N[°º]|#)?\s*"
+        r"([A-Z0-9-]{1,30})",
+        str(texto or ""),
+        flags=re.IGNORECASE,
+    )
+
+    if not m:
+        return ""
+
+    valor = (
+        m.group(1)
+        .strip()
+        .upper()
+    )
+
+    # Evita capturar palabras como "DEL".
+    if valor in {
+        "DEL",
+        "DE",
+        "NO",
+    }:
+        return ""
+
+    return valor
+
+
+def _fecha_cuenta_cobro_20260924(
+    texto: str,
+) -> str:
+
+    import re
+
+    t = str(texto or "")
+
+    for pat in [
+        r"CUENTA\s+DE\s+COBRO"
+        r"[\s\S]{0,80}?"
+        r"(\d{1,2})\s+de\s+"
+        r"([A-Za-zÁÉÍÓÚÑáéíóúñ]+)"
+        r"\s+de\s+(20\d{2})",
+
+        r"(\d{1,2})\s+de\s+"
+        r"([A-Za-zÁÉÍÓÚÑáéíóúñ]+)"
+        r"\s+(20\d{2})",
+    ]:
+
+        m = re.search(
+            pat,
+            t,
+            flags=re.IGNORECASE,
+        )
+
+        if m:
+            f = _fecha_espanol_20260924(
+                m.group(1),
+                m.group(2),
+                m.group(3),
+            )
+
+            if f:
+                return f
+
+    return ""
+
+
+def _cude_explicito_20260924(
+    texto: str,
+) -> str:
+
+    import re
+
+    m = re.search(
+        r"\bCUDE\s*:\s*([^\n\r]{80,180})",
+        str(texto or ""),
+        flags=re.IGNORECASE,
+    )
+
+    if not m:
+        return ""
+
+    candidato = re.sub(
+        r"[^0-9a-fA-F]",
+        "",
+        m.group(1),
+    ).lower()
+
+    # CUFE/CUDE DIAN normal: 96 caracteres hex.
+    if len(candidato) == 96:
+        return candidato
+
+    return ""
+
+
+# =====================================================================
+# IDENTIFICADORES
+# =====================================================================
+
+
+def parse_identificadores_pdf(
+    texto: str,
+):
+
+    try:
+        base = dict(
+            _parse_identificadores_pdf_pre_20260924(
+                texto
+            )
+            or {}
+        )
+    except Exception:
+        base = {}
+
+    import re
+
+    if _es_cens_20260924(
+        texto
+    ):
+
+        # El parser genérico puede confundir teléfonos/emergencias
+        # y ruido OCR con número/CUFE. No se conserva eso.
+        base.pop(
+            "NUMERO",
+            None,
+        )
+
+        base.pop(
+            "CUFE",
+            None,
+        )
+
+        numero = ""
+
+        flat = re.sub(
+            r"\s+",
+            " ",
+            str(texto or ""),
+        )
+
+        m = re.search(
+            r"DOCUMENTO\s+EQUIVALENTE\s+"
+            r"ELECTR[ÓOÉE]NICO"
+            r"\s*(?:No\.?\s*)?"
+            r"([0-9]{6,20})",
+            flat,
+            flags=re.IGNORECASE,
+        )
+
+        if m:
+            numero = m.group(1)
+
+        if numero:
+            base["NUMERO"] = numero
+
+        fecha = ""
+
+        m = re.search(
+            r"Fecha\s+y\s+hora\s+de\s+"
+            r"(?:expedici[oó]n|generaci[oó]n)"
+            r"\s*:\s*"
+            r"(20\d{2}-\d{1,2}-\d{1,2})",
+            str(texto or ""),
+            flags=re.IGNORECASE,
+        )
+
+        if m:
+            fecha = m.group(1)
+
+        if fecha:
+            base["FECHA"] = fecha
+
+        cude = _cude_explicito_20260924(
+            texto
+        )
+
+        if cude:
+            base["CUFE"] = cude
+
+        return base
+
+    if _es_aire_20260924(
+        texto
+    ):
+
+        numero = _numero_aire_20260924(
+            texto
+        )
+
+        if numero:
+            base["NUMERO"] = numero
+
+        # No conservar CUFE inventado si el documento no tiene
+        # etiqueta CUFE/CUDE explícita.
+        n = _doc_norm_20260924(
+            texto
+        )
+
+        if (
+            "CUFE" not in n
+            and "CUDE" not in n
+        ):
+            base.pop(
+                "CUFE",
+                None,
+            )
+
+        return base
+
+    if _es_enel_20260924(
+        texto
+    ):
+
+        numero = _numero_enel_20260924(
+            texto
+        )
+
+        if numero:
+            base["NUMERO"] = numero
+
+        n = _doc_norm_20260924(
+            texto
+        )
+
+        if (
+            "CUFE" not in n
+            and "CUDE" not in n
+        ):
+            base.pop(
+                "CUFE",
+                None,
+            )
+
+        return base
+
+    if _es_cuenta_cobro_20260924(
+        texto
+    ):
+
+        numero = (
+            _numero_cuenta_cobro_20260924(
+                texto
+            )
+        )
+
+        fecha = (
+            _fecha_cuenta_cobro_20260924(
+                texto
+            )
+        )
+
+        base.pop(
+            "CUFE",
+            None,
+        )
+
+        if numero:
+            base["NUMERO"] = numero
+
+        if fecha:
+            base["FECHA"] = fecha
+
+        return base
+
+    return base
+
+
+# =====================================================================
+# CAMPOS BÁSICOS
+# =====================================================================
+
+
+def extraer_campos_basicos_pdf(
+    texto: str,
+):
+
+    import re
+
+    try:
+        base = dict(
+            _extraer_campos_basicos_pdf_pre_20260924(
+                texto
+            )
+            or {}
+        )
+    except Exception:
+        base = {}
+
+    if _es_cens_20260924(
+        texto
+    ):
+
+        base["Empresa emisora"] = (
+            "CENTRALES ELÉCTRICAS DEL NORTE "
+            "DE SANTANDER S.A. E.S.P."
+        )
+
+        m = re.search(
+            r"NIT\s*:\s*([0-9.\-]+)",
+            str(texto or ""),
+            flags=re.IGNORECASE,
+        )
+
+        if m:
+            base["NIT"] = re.sub(
+                r"\D",
+                "",
+                m.group(1),
+            )[:9]
+
+        # El parche antiguo tenía "GILPA" fijo.
+        # Solo se conserva si realmente aparece en el documento.
+        if (
+            str(
+                base.get(
+                    "Cliente",
+                    "",
+                )
+            ).strip().upper()
+            == "GILPA"
+            and "GILPA"
+            not in _doc_norm_20260924(
+                texto
+            )
+        ):
+            base["Cliente"] = ""
+
+        base["DescripcionLineas"] = (
+            "SERVICIO PÚBLICO DE ENERGÍA, "
+            "ASEO Y ALUMBRADO PÚBLICO"
+        )
+
+        return base
+
+    if _es_aire_20260924(
+        texto
+    ):
+
+        base["Empresa emisora"] = (
+            "AIR-E S.A.S. E.S.P."
+        )
+
+        if not str(
+            base.get(
+                "DescripcionLineas",
+                "",
+            )
+        ).strip():
+
+            base["DescripcionLineas"] = (
+                "SERVICIO PÚBLICO DE ENERGÍA"
+            )
+
+        return base
+
+    if _es_enel_20260924(
+        texto
+    ):
+
+        base["Empresa emisora"] = (
+            "ENEL COLOMBIA S.A. E.S.P."
+        )
+
+        if not str(
+            base.get(
+                "DescripcionLineas",
+                "",
+            )
+        ).strip():
+
+            base["DescripcionLineas"] = (
+                "SERVICIO PÚBLICO DE ENERGÍA"
+            )
+
+        return base
+
+    if _es_cuenta_cobro_20260924(
+        texto
+    ):
+
+        m = re.search(
+            r"DEBE\s+A\s*:\s*"
+            r"([^\n\r]{3,120})",
+            str(texto or ""),
+            flags=re.IGNORECASE,
+        )
+
+        if m:
+            proveedor = (
+                m.group(1)
+                .strip()
+                .strip("-:")
+            )
+
+            if proveedor:
+                base["Empresa emisora"] = proveedor
+
+        m = re.search(
+            r"POR\s+CONCEPTO\s+DE\s*:\s*"
+            r"([\s\S]{1,450})",
+            str(texto or ""),
+            flags=re.IGNORECASE,
+        )
+
+        if m:
+            desc = re.sub(
+                r"\s+",
+                " ",
+                m.group(1),
+            ).strip()
+
+            # Cortar antes de bloques administrativos si aparecen.
+            desc = re.split(
+                r"\b(?:ANEXOS?|FIRMA|ATENTAMENTE)\b",
+                desc,
+                maxsplit=1,
+                flags=re.IGNORECASE,
+            )[0].strip()
+
+            if desc:
+                base["DescripcionLineas"] = (
+                    desc[:800]
+                )
+
+        return base
+
+    return base
+
+
+# =====================================================================
+# TOTALES EXPLÍCITOS
+# =====================================================================
+
+
+def _totales_vacios_20260924():
+    return {
+        "Subtotal": 0.0,
+        "IVA 5%": 0.0,
+        "IVA 19%": 0.0,
+        "Retención de IVA": 0.0,
+        "Retención de ICA": 0.0,
+        "Retención en la fuente": 0.0,
+        "Total": 0.0,
+    }
+
+
+def _total_cens_explicito_20260924(
+    texto: str,
+) -> float:
+
+    import re
+
+    t = str(texto or "")
+
+    # OCR CENS puede dejar:
+    #
+    # Servicios Facturados
+    # Pago total
+    # ... $55,040 $489,433
+    #
+    # Tomamos el ÚLTIMO valor monetario cercano a
+    # la etiqueta explícita "Pago total".
+    m = re.search(
+        r"PAGO\s+TOTAL([\s\S]{0,240})",
+        t,
+        flags=re.IGNORECASE,
+    )
+
+    if m:
+
+        montos = re.findall(
+            r"\$\s*([0-9][0-9.,]*)",
+            m.group(1),
+        )
+
+        if montos:
+            return _doc_money_20260924(
+                montos[-1]
+            )
+
+    # Variante cuando el monto queda directamente
+    # con el rótulo.
+    for pat in [
+        r"PAGO\s+TOTAL\s*[:\-]?\s*\$?\s*([0-9][0-9.,]*)",
+        r"TOTAL\s+A\s+PAGAR\s*[:\-]?\s*\$?\s*([0-9][0-9.,]*)",
+        r"VALOR\s+A\s+PAGAR\s*[:\-]?\s*\$?\s*([0-9][0-9.,]*)",
+    ]:
+
+        m = re.search(
+            pat,
+            t,
+            flags=re.IGNORECASE,
+        )
+
+        if m:
+            v = _doc_money_20260924(
+                m.group(1)
+            )
+
+            if v > 0:
+                return v
+
+    return 0.0
+
+
+def _total_aire_explicito_20260924(
+    texto: str,
+) -> float:
+
+    import re
+
+    candidatos = []
+
+    for linea in str(
+        texto or ""
+    ).splitlines():
+
+        n = _doc_norm_20260924(
+            linea
+        )
+
+        if (
+            "TOTAL MES" not in n
+            or not re.search(
+                r"\d{1,2}/\d{1,2}/20\d{2}",
+                linea,
+            )
+        ):
+            continue
+
+        montos = re.findall(
+            r"\$\s*([0-9][0-9.,]*)",
+            linea,
+        )
+
+        if len(montos) >= 2:
+
+            valor = _doc_money_20260924(
+                montos[-1]
+            )
+
+            if valor > 0:
+                candidatos.append(
+                    valor
+                )
+
+    return (
+        candidatos[-1]
+        if candidatos
+        else 0.0
+    )
+
+
+def _total_enel_explicito_20260924(
+    texto: str,
+) -> float:
+
+    import re
+
+    # Solo rótulos inequívocos.
+    # No sumamos energía + aseo ni inferimos el monto
+    # que aparece visualmente sin etiqueta.
+    patrones = [
+        r"TOTAL\s+A\s+PAGAR\s*[:\-]?\s*\$?\s*([0-9][0-9.,]*)",
+        r"PAGO\s+TOTAL\s*[:\-]?\s*\$?\s*([0-9][0-9.,]*)",
+        r"VALOR\s+A\s+PAGAR\s*[:\-]?\s*\$?\s*([0-9][0-9.,]*)",
+    ]
+
+    for pat in patrones:
+
+        m = re.search(
+            pat,
+            str(texto or ""),
+            flags=re.IGNORECASE,
+        )
+
+        if m:
+            v = _doc_money_20260924(
+                m.group(1)
+            )
+
+            if v > 0:
+                return v
+
+    return 0.0
+
+
+def _total_cuenta_cobro_20260924(
+    texto: str,
+) -> float:
+
+    import re
+
+    t = str(texto or "")
+
+    patrones = [
+        r"LA\s+SUMA\s+DE\s*:?"
+        r"[\s\S]{0,320}?"
+        r"\(\s*\$?\s*([0-9][0-9.,]+)\s*\)",
+
+        r"LA\s+SUMA\s+DE\s*:?"
+        r"[\s\S]{0,250}?"
+        r"\$\s*([0-9][0-9.,]+)",
+
+        r"VALOR\s+TOTAL\s*[:\-]?\s*"
+        r"\$\s*([0-9][0-9.,]+)",
+    ]
+
+    for pat in patrones:
+
+        m = re.search(
+            pat,
+            t,
+            flags=re.IGNORECASE,
+        )
+
+        if m:
+            v = _doc_money_20260924(
+                m.group(1)
+            )
+
+            if v > 0:
+                return v
+
+    return 0.0
+
+
+def extraer_totales_basicos_pdf(
+    texto: str,
+):
+
+    if _es_cens_20260924(
+        texto
+    ):
+
+        out = _totales_vacios_20260924()
+
+        out["Total"] = (
+            _total_cens_explicito_20260924(
+                texto
+            )
+        )
+
+        return out
+
+    if _es_aire_20260924(
+        texto
+    ):
+
+        out = _totales_vacios_20260924()
+
+        out["Total"] = (
+            _total_aire_explicito_20260924(
+                texto
+            )
+        )
+
+        return out
+
+    if _es_enel_20260924(
+        texto
+    ):
+
+        out = _totales_vacios_20260924()
+
+        out["Total"] = (
+            _total_enel_explicito_20260924(
+                texto
+            )
+        )
+
+        return out
+
+    if _es_cuenta_cobro_20260924(
+        texto
+    ):
+
+        out = _totales_vacios_20260924()
+
+        out["Total"] = (
+            _total_cuenta_cobro_20260924(
+                texto
+            )
+        )
+
+        return out
+
+    try:
+        return (
+            _extraer_totales_basicos_pdf_pre_20260924(
+                texto
+            )
+            or {}
+        )
+    except Exception:
+        return _totales_vacios_20260924()
+
+
+def extraer_descripcion_items_pdf(
+    texto: str,
+) -> str:
+
+    if _es_cuenta_cobro_20260924(
+        texto
+    ):
+
+        campos = extraer_campos_basicos_pdf(
+            texto
+        )
+
+        return str(
+            campos.get(
+                "DescripcionLineas",
+                "",
+            )
+            or ""
+        ).strip()
+
+    try:
+        if (
+            _extraer_descripcion_items_pdf_pre_20260924
+            is not None
+        ):
+            return (
+                _extraer_descripcion_items_pdf_pre_20260924(
+                    texto
+                )
+                or ""
+            )
+    except Exception:
+        pass
+
+    return ""
+
+
+print(
+    "🔥 PDF_UTILS PATCH 2026-09-24 ACTIVO: "
+    "OCR-FALLBACK-DOCUMENTOS-ESPECIALES"
+)
+
+
+
+# =====================================================================
+# PATCH 2026-09-24-B ESPECIALES-CORRECCION
+# =====================================================================
+# Corrige:
+# - recursión en descripción de cuentas de cobro
+# - AIR-E número / total explícito
+# - cuenta de cobro con número separado: "2 7"
+# - CENS total explícito "Pago total"
+# - CENS NIT: evitar tomar el NIT de empresa de aseo
+# =====================================================================
+
+_parse_identificadores_pdf_pre_20260924B = parse_identificadores_pdf
+_extraer_campos_basicos_pdf_pre_20260924B = extraer_campos_basicos_pdf
+_extraer_totales_basicos_pdf_pre_20260924B = extraer_totales_basicos_pdf
+
+
+def _es_aire_20260924(texto: str) -> bool:
+    n = _doc_norm_20260924(texto)
+
+    return (
+        "DETALLE FACTURACION" in n
+        and "CONSUMO ACTIVA" in n
+        and "FIUG" in n
+        and "NIU" in n
+    )
+
+
+def _numero_aire_20260924(texto: str) -> str:
+    import re
+
+    flat = re.sub(
+        r"\s+",
+        " ",
+        str(texto or ""),
+    )
+
+    # Ejemplo real:
+    # FIUG: 130,0066390494
+    #            ^^^^^^^^ número aprobado
+    m = re.search(
+        r"FIUG\s*:\s*"
+        r"\d{1,4}[,.]\d{2}"
+        r"\s*([0-9]{8})(?![0-9])",
+        flat,
+        flags=re.IGNORECASE,
+    )
+
+    return m.group(1) if m else ""
+
+
+def _total_aire_explicito_20260924(texto: str) -> float:
+    import re
+
+    flat = re.sub(
+        r"\s+",
+        " ",
+        str(texto or ""),
+    )
+
+    # Ejemplo:
+    # TOTAL MES: $07540381 28/06/2026 $1.468.730
+    #
+    # No suma energía + aseo + alumbrado:
+    # usa únicamente el total final rotulado.
+    matches = re.findall(
+        r"TOTAL\s+MES\s*:\s*"
+        r"\$?\s*0?[0-9]{6,10}\s+"
+        r"\d{1,2}/\d{1,2}/20\d{2}\s*"
+        r"\$\s*([0-9][0-9.,]*)",
+        flat,
+        flags=re.IGNORECASE,
+    )
+
+    if not matches:
+        return 0.0
+
+    return _doc_money_20260924(
+        matches[-1]
+    )
+
+
+def _numero_cuenta_cobro_20260924(texto: str) -> str:
+    import re
+
+    # Soporta:
+    # CUENTA DE COBRO No. 27
+    # CUENTA DE COBRO No. 2 7- JUNIO 2026
+    # CUENTA DE COBRO # 27
+
+    m = re.search(
+        r"CUENTA\s+DE\s+COBRO\s*"
+        r"(?:No\.?|N[°º]|#)\s*"
+        r"((?:\d[\s]*){1,8})",
+        str(texto or ""),
+        flags=re.IGNORECASE,
+    )
+
+    if not m:
+        return ""
+
+    numero = re.sub(
+        r"\D",
+        "",
+        m.group(1),
+    )
+
+    return numero
+
+
+def _descripcion_cuenta_cobro_20260924(texto: str) -> str:
+    import re
+
+    t = str(texto or "")
+
+    m = re.search(
+        r"POR\s+CONCEPTO\s+DE\s*:?\s*"
+        r"([\s\S]{1,700})",
+        t,
+        flags=re.IGNORECASE,
+    )
+
+    if not m:
+        return ""
+
+    desc = re.sub(
+        r"\s+",
+        " ",
+        m.group(1),
+    ).strip()
+
+    desc = re.split(
+        r"\b(?:"
+        r"ANEXOS?|"
+        r"DECLARO|"
+        r"ATENTAMENTE|"
+        r"FIRMA|"
+        r"CUENTA\s+BANCARIA"
+        r")\b",
+        desc,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0].strip()
+
+    return desc[:800]
+
+
+def extraer_descripcion_items_pdf(texto: str) -> str:
+    """
+    Importante:
+    esta función NO llama extraer_campos_basicos_pdf().
+    Así se elimina la recursión encontrada con 192849.
+    """
+
+    if _es_cuenta_cobro_20260924(texto):
+        return _descripcion_cuenta_cobro_20260924(
+            texto
+        )
+
+    try:
+        anterior = globals().get(
+            "_extraer_descripcion_items_pdf_pre_20260924"
+        )
+
+        if anterior:
+            return anterior(texto) or ""
+
+    except Exception:
+        pass
+
+    return ""
+
+
+def _total_cens_explicito_20260924(texto: str) -> float:
+    import re
+
+    t = str(texto or "")
+
+    # OCR real:
+    #
+    # Servicios Facturados
+    # Pago total
+    # ... $55,040 $489,433
+    #
+    # El último monto pertenece al rótulo Pago total.
+    m = re.search(
+        r"PAGO\s+TOTAL([\s\S]{0,700})",
+        t,
+        flags=re.IGNORECASE,
+    )
+
+    if m:
+        montos = re.findall(
+            r"\$\s*([0-9][0-9.,]*)",
+            m.group(1),
+        )
+
+        if montos:
+            return _doc_money_20260924(
+                montos[-1]
+            )
+
+    for pat in (
+        r"TOTAL\s+A\s+PAGAR\s*[:\-]?\s*\$?\s*([0-9][0-9.,]*)",
+        r"VALOR\s+A\s+PAGAR\s*[:\-]?\s*\$?\s*([0-9][0-9.,]*)",
+    ):
+        m = re.search(
+            pat,
+            t,
+            flags=re.IGNORECASE,
+        )
+
+        if m:
+            valor = _doc_money_20260924(
+                m.group(1)
+            )
+
+            if valor > 0:
+                return valor
+
+    return 0.0
+
+
+def parse_identificadores_pdf(texto: str):
+    import re
+
+    try:
+        out = dict(
+            _parse_identificadores_pdf_pre_20260924B(
+                texto
+            )
+            or {}
+        )
+    except Exception:
+        out = {}
+
+    if _es_aire_20260924(texto):
+
+        numero = _numero_aire_20260924(
+            texto
+        )
+
+        if numero:
+            out["NUMERO"] = numero
+
+        # No aceptar hashes construidos por ruido de números del PDF.
+        # Solo conservar CUFE/CUDE si existe el rótulo explícito seguido
+        # de un hash hexadecimal válido.
+        m = re.search(
+            r"\b(?:CUFE|CUDE)\s*:\s*"
+            r"([0-9a-fA-F\s]{96,140})",
+            str(texto or ""),
+            flags=re.IGNORECASE,
+        )
+
+        if m:
+            candidato = re.sub(
+                r"[^0-9a-fA-F]",
+                "",
+                m.group(1),
+            ).lower()
+
+            if len(candidato) == 96:
+                out["CUFE"] = candidato
+            else:
+                out.pop("CUFE", None)
+        else:
+            out.pop("CUFE", None)
+
+    if _es_cuenta_cobro_20260924(texto):
+
+        numero = _numero_cuenta_cobro_20260924(
+            texto
+        )
+
+        if numero:
+            out["NUMERO"] = numero
+
+        out.pop(
+            "CUFE",
+            None,
+        )
+
+    return out
+
+
+def extraer_campos_basicos_pdf(texto: str):
+    import re
+
+    try:
+        out = dict(
+            _extraer_campos_basicos_pdf_pre_20260924B(
+                texto
+            )
+            or {}
+        )
+    except Exception:
+        out = {}
+
+    if _es_cens_20260924(texto):
+
+        # Solo tomar el NIT propio de CENS si realmente aparece.
+        m = re.search(
+            r"NIT\s*:\s*"
+            r"(890[\s.]?500[\s.]?514(?:-\d)?)",
+            str(texto or ""),
+            flags=re.IGNORECASE,
+        )
+
+        if m:
+            out["NIT"] = re.sub(
+                r"\D",
+                "",
+                m.group(1),
+            )[:9]
+
+        # El antiguo parser tenía GILPA fijo.
+        if (
+            str(out.get("Cliente") or "").strip().upper()
+            == "GILPA"
+            and "GILPA"
+            not in _doc_norm_20260924(texto)
+        ):
+            out["Cliente"] = ""
+
+    if _es_cuenta_cobro_20260924(texto):
+
+        desc = _descripcion_cuenta_cobro_20260924(
+            texto
+        )
+
+        if desc:
+            out["DescripcionLineas"] = desc
+
+    return out
+
+
+def extraer_totales_basicos_pdf(texto: str):
+
+    if _es_aire_20260924(texto):
+
+        out = _totales_vacios_20260924()
+
+        out["Total"] = (
+            _total_aire_explicito_20260924(
+                texto
+            )
+        )
+
+        return out
+
+    if _es_cens_20260924(texto):
+
+        out = _totales_vacios_20260924()
+
+        out["Total"] = (
+            _total_cens_explicito_20260924(
+                texto
+            )
+        )
+
+        return out
+
+    try:
+        return (
+            _extraer_totales_basicos_pdf_pre_20260924B(
+                texto
+            )
+            or {}
+        )
+
+    except Exception:
+        return _totales_vacios_20260924()
+
+
+print(
+    "🔥 PDF_UTILS PATCH 2026-09-24-B ACTIVO: "
+    "ESPECIALES-CORRECCION"
+)
+
+
+
+# =====================================================================
+# PATCH 2026-09-24-C AIRE-CENS-FINAL
+# =====================================================================
+# - AIR-E: PyPDF2 como extractor alternativo SOLO para esta familia.
+# - AIR-E: total final únicamente desde TOTAL MES + fecha + valor.
+# - CENS: Pago total según layout OCR real.
+# - CENS: número de documento equivalente según layout OCR real.
+# - No reconstruir CUDE dañado por OCR.
+# =====================================================================
+
+_extraer_texto_pdf_pre_20260924C = extraer_texto_pdf
+_parse_identificadores_pdf_pre_20260924C = parse_identificadores_pdf
+_extraer_totales_basicos_pdf_pre_20260924C = extraer_totales_basicos_pdf
+
+
+def _extraer_texto_pypdf2_20260924C(
+    local_pdf_path: str,
+) -> str:
+
+    try:
+        from PyPDF2 import PdfReader
+    except Exception as e:
+        print(
+            "[PDF AIR-E] PyPDF2 no disponible:",
+            e,
+        )
+        return ""
+
+    try:
+        reader = PdfReader(
+            str(local_pdf_path)
+        )
+
+        partes = []
+
+        for page in reader.pages:
+
+            try:
+                partes.append(
+                    page.extract_text() or ""
+                )
+            except Exception:
+                partes.append("")
+
+        return "\n".join(
+            partes
+        ).strip()
+
+    except Exception as e:
+
+        print(
+            "[PDF AIR-E] PyPDF2 falló:",
+            e,
+        )
+
+        return ""
+
+
+def _aire_tiene_total_final_20260924C(
+    texto: str,
+) -> bool:
+
+    import re
+
+    return bool(
+        re.search(
+            r"TOTAL\s+MES\s*:\s*"
+            r"\$?\s*0?[0-9]{6,10}\s+"
+            r"\d{1,2}/\d{1,2}/20\d{2}\s*"
+            r"\$\s*[0-9][0-9.,]*",
+            str(texto or ""),
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def extraer_texto_pdf(
+    local_pdf_path: str,
+) -> str:
+
+    texto = (
+        _extraer_texto_pdf_pre_20260924C(
+            local_pdf_path
+        )
+        or ""
+    )
+
+    # PDFs normales continúan exactamente igual.
+    if not _es_aire_20260924(
+        texto
+    ):
+        return texto
+
+    # AIR-E:
+    # pdfminer separa campos visualmente relacionados.
+    # PyPDF2 conserva mejor esta familia concreta.
+    alternativo = (
+        _extraer_texto_pypdf2_20260924C(
+            local_pdf_path
+        )
+        or ""
+    )
+
+    if (
+        alternativo
+        and _aire_tiene_total_final_20260924C(
+            alternativo
+        )
+    ):
+
+        print(
+            "[PDF AIR-E] "
+            "Se usa extracción PyPDF2 por conservar "
+            "el total final explícito."
+        )
+
+        return alternativo
+
+    return texto
+
+
+def _total_aire_explicito_20260924(
+    texto: str,
+) -> float:
+
+    import re
+
+    flat = re.sub(
+        r"\s+",
+        " ",
+        str(texto or ""),
+    )
+
+    # Ejemplos reales:
+    #
+    # TOTAL MES: $07540381 28/06/2026 $1.468.730
+    # TOTAL MES: $07540381 29/07/2026 $1.275.610
+    #
+    # Se exige:
+    #   TOTAL MES
+    #   identificador
+    #   fecha
+    #   monto
+    #
+    # para no confundir:
+    # TOTAL MES aseo / alumbrado.
+    matches = re.findall(
+        r"TOTAL\s+MES\s*:\s*"
+        r"\$?\s*(?:0?[0-9]{6,10})\s+"
+        r"\d{1,2}/\d{1,2}/20\d{2}\s*"
+        r"\$\s*([0-9][0-9.,]*)",
+        flat,
+        flags=re.IGNORECASE,
+    )
+
+    if not matches:
+        return 0.0
+
+    return _doc_money_20260924(
+        matches[-1]
+    )
+
+
+def _numero_aire_desde_texto_20260924C(
+    texto: str,
+) -> str:
+
+    import re
+
+    flat = re.sub(
+        r"\s+",
+        " ",
+        str(texto or ""),
+    )
+
+    # En PyPDF2 aparece concatenado al bloque FIUG.
+    m = re.search(
+        r"FIUG\s*:\s*"
+        r"\d{1,4}[,.]\d{2}"
+        r"\s*([0-9]{8})(?![0-9])",
+        flat,
+        flags=re.IGNORECASE,
+    )
+
+    if m:
+        return m.group(1)
+
+    return ""
+
+
+def _numero_cens_20260924C(
+    texto: str,
+) -> str:
+
+    import re
+
+    flat = re.sub(
+        r"\s+",
+        " ",
+        str(texto or ""),
+    )
+
+    # OCR real:
+    # "Documento equivalente electrénico ... 1092016420"
+    #
+    # Se tolera la mala lectura é/e/ó/o de Tesseract.
+    m = re.search(
+        r"DOCUMENTO\s+EQUIVALENTE\s+"
+        r"ELECTR[ÓOÉE]NICO"
+        r"[\s\S]{0,120}?"
+        r"\b([0-9]{7,20})\b",
+        flat,
+        flags=re.IGNORECASE,
+    )
+
+    if m:
+        return m.group(1)
+
+    return ""
+
+
+def _total_cens_explicito_20260924(
+    texto: str,
+) -> float:
+
+    import re
+
+    flat = re.sub(
+        r"\s+",
+        " ",
+        str(texto or ""),
+    )
+
+    # OCR real:
+    #
+    # Pago total
+    # ... $55,040 $489,433
+    #
+    # El primer importe es aseo.
+    # El segundo es el monto de Pago total.
+    m = re.search(
+        r"PAGO\s+TOTAL"
+        r"[\s\S]{0,120}?"
+        r"\$\s*([0-9][0-9.,]*)"
+        r"\s+"
+        r"\$\s*([0-9][0-9.,]*)",
+        flat,
+        flags=re.IGNORECASE,
+    )
+
+    if m:
+
+        valor = _doc_money_20260924(
+            m.group(2)
+        )
+
+        if valor > 0:
+            return valor
+
+    # Solo como variante inequívoca:
+    for pat in (
+        r"TOTAL\s+A\s+PAGAR\s*[:\-]?\s*"
+        r"\$\s*([0-9][0-9.,]*)",
+
+        r"VALOR\s+A\s+PAGAR\s*[:\-]?\s*"
+        r"\$\s*([0-9][0-9.,]*)",
+    ):
+
+        m = re.search(
+            pat,
+            flat,
+            flags=re.IGNORECASE,
+        )
+
+        if m:
+
+            valor = _doc_money_20260924(
+                m.group(1)
+            )
+
+            if valor > 0:
+                return valor
+
+    return 0.0
+
+
+def parse_identificadores_pdf(
+    texto: str,
+):
+
+    try:
+        out = dict(
+            _parse_identificadores_pdf_pre_20260924C(
+                texto
+            )
+            or {}
+        )
+    except Exception:
+        out = {}
+
+    if _es_aire_20260924(
+        texto
+    ):
+
+        numero = (
+            _numero_aire_desde_texto_20260924C(
+                texto
+            )
+        )
+
+        if numero:
+            out["NUMERO"] = numero
+
+        # AIR-E de estos casos no presenta CUFE/CUDE
+        # explícito. El parser histórico estaba creando
+        # hashes a partir de ruido numérico.
+        out.pop(
+            "CUFE",
+            None,
+        )
+
+        return out
+
+    if _es_cens_20260924(
+        texto
+    ):
+
+        numero = (
+            _numero_cens_20260924C(
+                texto
+            )
+        )
+
+        if numero:
+            out["NUMERO"] = numero
+        else:
+            out.pop(
+                "NUMERO",
+                None,
+            )
+
+        # No fabricar ni corregir manualmente un CUDE
+        # que el OCR leyó con caracteres inválidos.
+        out.pop(
+            "CUFE",
+            None,
+        )
+
+        return out
+
+    return out
+
+
+def extraer_totales_basicos_pdf(
+    texto: str,
+):
+
+    if _es_aire_20260924(
+        texto
+    ):
+
+        out = _totales_vacios_20260924()
+
+        out["Total"] = (
+            _total_aire_explicito_20260924(
+                texto
+            )
+        )
+
+        return out
+
+    if _es_cens_20260924(
+        texto
+    ):
+
+        out = _totales_vacios_20260924()
+
+        out["Total"] = (
+            _total_cens_explicito_20260924(
+                texto
+            )
+        )
+
+        return out
+
+    try:
+        return (
+            _extraer_totales_basicos_pdf_pre_20260924C(
+                texto
+            )
+            or {}
+        )
+
+    except Exception:
+        return _totales_vacios_20260924()
+
+
+print(
+    "🔥 PDF_UTILS PATCH 2026-09-24-C ACTIVO: "
+    "AIRE-CENS-FINAL"
+)
+
+
+# =====================================================================
+# PATCH 2026-09-25-E CENS-OCR-CALIDAD
+# =====================================================================
+# Algunos PDF escaneados pueden contener una capa de texto defectuosa.
+# pdfminer devuelve miles de caracteres, pero los datos semánticos
+# importantes no son recuperables.
+#
+# Para CENS:
+# - se conserva primero la extracción normal;
+# - si esa extracción NO permite obtener el "Pago total" explícito,
+#   se fuerza el OCR;
+# - OCR sigue siendo solamente extracción de texto;
+# - después continúan exactamente los mismos parsers.
+#
+# No depende de radicado ni nombre de archivo.
+# =====================================================================
+
+_extraer_texto_pdf_pre_20260925E = extraer_texto_pdf
+
+
+def _cens_texto_semanticamente_util_20260925E(
+    texto: str,
+) -> bool:
+
+    if not _es_cens_20260924(
+        texto
+    ):
+        return True
+
+    try:
+        total = float(
+            _total_cens_explicito_20260924(
+                texto
+            )
+            or 0
+        )
+    except Exception:
+        total = 0.0
+
+    # Si la propia factura permite recuperar explícitamente
+    # Pago total / Total a pagar, no hay razón para OCR.
+    return total > 0.0
+
+
+def extraer_texto_pdf(
+    local_pdf_path: str,
+) -> str:
+
+    texto = (
+        _extraer_texto_pdf_pre_20260925E(
+            local_pdf_path
+        )
+        or ""
+    )
+
+    # Flujo normal: no cambia nada.
+    if not _es_cens_20260924(
+        texto
+    ):
+        return texto
+
+    # CENS con extracción semántica suficiente:
+    # tampoco necesita OCR.
+    if _cens_texto_semanticamente_util_20260925E(
+        texto
+    ):
+        return texto
+
+    print(
+        "[PDF OCR] CENS con capa de texto insuficiente; "
+        "se fuerza OCR."
+    )
+
+    try:
+        texto_ocr = (
+            _ocr_pdf_20260924(
+                local_pdf_path
+            )
+            or ""
+        )
+    except Exception as e:
+
+        print(
+            "[PDF OCR] Error forzando OCR CENS:",
+            e,
+        )
+
+        texto_ocr = ""
+
+    if texto_ocr:
+
+        print(
+            "[PDF OCR] CENS OCR reemplaza "
+            f"texto embebido defectuoso | "
+            f"chars_antes={len(texto)} | "
+            f"chars_ocr={len(texto_ocr)}"
+        )
+
+        return texto_ocr
+
+    print(
+        "[PDF OCR] OCR CENS no produjo texto; "
+        "se conserva extracción anterior."
+    )
+
+    return texto
+
+
+print(
+    "🔥 PDF_UTILS PATCH 2026-09-25-E ACTIVO: "
+    "CENS-OCR-CALIDAD"
+)
