@@ -8,5 +8,5 @@ python-dotenv
 certifi
 pdfminer.six
 PyPDF2==3.0.1
-pypdfium2==4.30.1
+pypdfium2==5.11.0
 Pillow==11.2.1
